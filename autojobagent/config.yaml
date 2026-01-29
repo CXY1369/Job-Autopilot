@@ -1,0 +1,31 @@
+llm:
+  provider: "claude"
+  model: "claude-3.7-sonnet"
+  max_tokens: 4096
+  temperature: 0.2
+
+browser:
+  headless: false
+  slow_mo: 200
+
+browser_use:
+  max_retries_per_page: 3
+
+simplify:
+  enabled: true
+  selectors:
+    popup: ""
+    autofill_button: ""
+  text:
+    complete: "Autofill complete!"
+  timeout_seconds: 30
+
+storage:
+  resume_dir: "./autojobagent/storage/resumes"
+  uploads_dir: "./autojobagent/storage/uploads"
+  logs_dir: "./autojobagent/storage/logs"
+
+database:
+  url: "sqlite:///./autojobagent/autojobagent.db"
+
+

@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Job Autopilot - Auto Application Agent</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #050816;
+        --bg-card: rgba(15, 23, 42, 0.9);
+        --border-subtle: rgba(148, 163, 184, 0.3);
+        --accent: #38bdf8;
+        --accent-soft: rgba(56, 189, 248, 0.12);
+        --accent-strong: rgba(56, 189, 248, 0.3);
+        --text-main: #e5e7eb;
+        --text-muted: #9ca3af;
+        --danger: #f97373;
+        --success: #4ade80;
+        --shadow-soft: 0 18px 45px rgba(15, 23, 42, 0.65);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+          "Segoe UI", sans-serif;
+        color: var(--text-main);
+        background: radial-gradient(circle at top, #0f172a 0, #020617 55%);
+        display: flex;
+        align-items: stretch;
+        justify-content: center;
+        padding: 32px 16px;
+      }
+
+      .shell {
+        max-width: 1120px;
+        width: 100%;
+        display: grid;
+        grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.4fr);
+        gap: 20px;
+      }
+
+      @media (max-width: 960px) {
+        .shell {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+
+      .card {
+        background: linear-gradient(
+            135deg,
+            rgba(15, 23, 42, 0.96),
+            rgba(15, 23, 42, 0.9)
+          ),
+          radial-gradient(circle at top left, rgba(56, 189, 248, 0.35), transparent 60%);
+        border-radius: 18px;
+        border: 1px solid var(--border-subtle);
+        box-shadow: var(--shadow-soft);
+        padding: 18px 18px 16px;
+        backdrop-filter: blur(16px);
+      }
+
+      h1,
+      h2 {
+        margin: 0;
+        font-weight: 600;
+        letter-spacing: 0.03em;
+      }
+
+      h1 {
+        font-size: 22px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      h1 span.badge {
+        font-size: 11px;
+        padding: 2px 7px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        border: 1px solid var(--accent-strong);
+        color: var(--accent);
+      }
+
+      .subtitle {
+        margin-top: 6px;
+        font-size: 13px;
+        color: var(--text-muted);
+      }
+
+      .form-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 14px;
+      }
+
+      .field {
+        flex: 1 1 140px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      label {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--text-muted);
+      }
+
+      input[type="text"] {
+        width: 100%;
+        padding: 7px 9px;
+        border-radius: 9px;
+        border: 1px solid rgba(148, 163, 184, 0.5);
+        background: rgba(15, 23, 42, 0.9);
+        color: var(--text-main);
+        font-size: 13px;
+        outline: none;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+      }
+
+      input[type="text"]:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.6);
+        background: rgba(15, 23, 42, 1);
+      }
+
+      button {
+        border: none;
+        cursor: pointer;
+        font-size: 13px;
+        border-radius: 999px;
+        padding: 6px 12px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-weight: 500;
+        letter-spacing: 0.02em;
+      }
+
+      .btn-primary {
+        background: linear-gradient(135deg, #38bdf8, #22d3ee);
+        color: #020617;
+        box-shadow: 0 12px 30px rgba(56, 189, 248, 0.45);
+      }
+
+      .btn-primary:active {
+        transform: translateY(1px);
+        box-shadow: 0 6px 18px rgba(56, 189, 248, 0.4);
+      }
+
+      .btn-ghost {
+        background: transparent;
+        color: var(--text-muted);
+        padding-inline: 10px;
+      }
+
+      .btn-ghost:hover {
+        background: rgba(15, 23, 42, 0.9);
+      }
+
+      .toolbar {
+        margin-top: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .status-chip {
+        padding: 3px 9px;
+        border-radius: 999px;
+        border: 1px solid rgba(148, 163, 184, 0.6);
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+      }
+
+      .dot-idle {
+        background: #facc15;
+      }
+
+      .dot-running {
+        background: #4ade80;
+      }
+
+      .dot-paused {
+        background: #fb923c;
+      }
+
+      .lists {
+        margin-top: 10px;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .list-card {
+        border-radius: 12px;
+        border: 1px solid rgba(30, 64, 175, 0.6);
+        background: radial-gradient(
+            circle at top left,
+            rgba(37, 99, 235, 0.35),
+            transparent 55%
+          ),
+          rgba(15, 23, 42, 0.96);
+        padding: 9px 10px 8px;
+      }
+
+      .list-card h2 {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.09em;
+        color: rgba(191, 219, 254, 0.9);
+      }
+
+      .pill {
+        font-size: 11px;
+        padding: 2px 7px;
+        border-radius: 999px;
+        border: 1px solid rgba(148, 163, 184, 0.5);
+        color: var(--text-muted);
+      }
+
+      .list-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        margin-bottom: 6px;
+      }
+
+      .job-list {
+        max-height: 220px;
+        overflow: auto;
+        padding-right: 2px;
+      }
+
+      .job-item {
+        border-radius: 9px;
+        padding: 6px 7px;
+        border: 1px solid rgba(30, 64, 175, 0.55);
+        background: radial-gradient(circle at top left, rgba(30, 64, 175, 0.5), transparent 55%);
+        margin-bottom: 6px;
+        font-size: 12px;
+      }
+
+      .job-item .title {
+        font-weight: 500;
+        margin-bottom: 2px;
+        color: #e5e7eb;
+      }
+
+      .job-item .meta {
+        color: var(--text-muted);
+        font-size: 11px;
+      }
+
+      .job-item .meta span + span::before {
+        content: "•";
+        margin: 0 4px;
+        opacity: 0.6;
+      }
+
+      .job-item .link {
+        display: block;
+        margin-top: 3px;
+        color: rgba(129, 230, 217, 0.9);
+        text-decoration: none;
+        font-size: 11px;
+        word-break: break-all;
+      }
+
+      .job-item .link:hover {
+        text-decoration: underline;
+      }
+
+      .job-item {
+        position: relative;
+      }
+
+      .job-item .btn-delete {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        width: 18px;
+        height: 18px;
+        padding: 0;
+        border-radius: 50%;
+        background: rgba(248, 113, 113, 0.15);
+        border: 1px solid rgba(248, 113, 113, 0.4);
+        color: rgba(248, 113, 113, 0.8);
+        font-size: 11px;
+        line-height: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        opacity: 0;
+        transition: opacity 0.15s ease, background 0.15s ease;
+      }
+
+      .job-item:hover .btn-delete {
+        opacity: 1;
+      }
+
+      .job-item .btn-delete:hover {
+        background: rgba(248, 113, 113, 0.3);
+        color: #f87171;
+      }
+
+      .btn-clear {
+        font-size: 10px;
+        padding: 2px 6px;
+        border-radius: 999px;
+        background: rgba(248, 113, 113, 0.1);
+        border: 1px solid rgba(248, 113, 113, 0.3);
+        color: rgba(248, 113, 113, 0.8);
+        cursor: pointer;
+        transition: background 0.15s ease;
+      }
+
+      .btn-clear:hover {
+        background: rgba(248, 113, 113, 0.25);
+      }
+
+      .right-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .log-area {
+        background: rgba(15, 23, 42, 0.95);
+        border-radius: 12px;
+        border: 1px solid rgba(30, 64, 175, 0.7);
+        padding: 10px 10px 8px;
+        font-family: ui-monospace, Menlo, SFMono-Regular, Consolas, "Roboto Mono",
+          monospace;
+        font-size: 11px;
+        color: #9ca3af;
+        max-height: 260px;
+        overflow: auto;
+      }
+
+      .log-entry {
+        margin-bottom: 4px;
+      }
+
+      .log-entry span.tag {
+        padding: 1px 5px;
+        border-radius: 999px;
+        margin-right: 4px;
+        border: 1px solid rgba(148, 163, 184, 0.45);
+      }
+
+      .log-entry .tag.info {
+        border-color: rgba(56, 189, 248, 0.6);
+        color: rgba(56, 189, 248, 0.95);
+      }
+
+      .log-entry .tag.error {
+        border-color: rgba(248, 113, 113, 0.7);
+        color: rgba(248, 113, 113, 0.95);
+      }
+
+      .log-entry .tag.ok {
+        border-color: rgba(74, 222, 128, 0.7);
+        color: rgba(74, 222, 128, 0.95);
+      }
+
+      .section-title {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        margin-bottom: 4px;
+        color: rgba(191, 219, 254, 0.9);
+      }
+
+      .section-subtitle {
+        font-size: 11px;
+        color: var(--text-muted);
+        margin-bottom: 6px;
+      }
+
+      .tagline {
+        font-size: 11px;
+        color: rgba(148, 163, 184, 0.9);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="card">
+        <h1>
+          Job Autopilot
+          <span class="badge">MVP · 单机个人版</span>
+        </h1>
+        <div class="subtitle">
+          添加你感兴趣的岗位链接，点击开始后让 Agent 帮你自动投递，并在右侧实时查看状态。
+        </div>
+
+        <div class="form-row" style="margin-top: 14px">
+          <div class="field">
+            <label for="link">岗位链接 / 申请页面 URL</label>
+            <input id="link" type="text" placeholder="https://..." />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label for="title">岗位名称（可选）</label>
+            <input id="title" type="text" placeholder="Software Engineer" />
+          </div>
+          <div class="field">
+            <label for="company">公司名称（可选）</label>
+            <input id="company" type="text" placeholder="OpenAI / Anthropic / ..." />
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <div style="display: flex; align-items: center; gap: 6px">
+            <button class="btn-primary" id="btn-add">
+              + 添加到待申请列表
+            </button>
+            <button class="btn-ghost" id="btn-reload">刷新列表</button>
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px">
+            <div class="status-chip" id="status-chip">
+              <div class="dot dot-idle"></div>
+              <span id="status-text">空闲 · 未开始投递</span>
+            </div>
+            <button class="btn-ghost" id="btn-start">开始投递</button>
+            <button class="btn-ghost" id="btn-pause">暂停</button>
+          </div>
+        </div>
+
+        <div class="lists">
+          <div class="list-card">
+            <div class="list-header">
+              <div>
+                <h2>待申请</h2>
+                <div class="tagline">pending</div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 6px;">
+              <span class="pill" id="pending-count">0</span>
+                <button class="btn-clear" onclick="clearJobs('pending')">清空</button>
+              </div>
+            </div>
+            <div class="job-list" id="list-pending"></div>
+          </div>
+
+          <div class="list-card">
+            <div class="list-header">
+              <div>
+                <h2>已申请</h2>
+                <div class="tagline">applied</div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 6px;">
+              <span class="pill" id="applied-count">0</span>
+                <button class="btn-clear" onclick="clearJobs('applied')">清空</button>
+              </div>
+            </div>
+            <div class="job-list" id="list-applied"></div>
+          </div>
+
+          <div class="list-card">
+            <div class="list-header">
+              <div>
+                <h2>待处理</h2>
+                <div class="tagline">manual / failed</div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 6px;">
+              <span class="pill" id="manual-count">0</span>
+                <button class="btn-clear" onclick="clearJobs('manual_required')">清空</button>
+              </div>
+            </div>
+            <div class="job-list" id="list-manual"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="right-panel">
+        <div class="card" style="padding: 10px 12px 10px">
+          <div class="section-title">运行日志</div>
+          <div class="section-subtitle">
+            这里会显示最近的 API 调用和调度指令，方便快速排查问题。
+          </div>
+          <div class="log-area" id="log">
+            <div class="log-entry">
+              <span class="tag info">INFO</span> 等待操作…
+            </div>
+          </div>
+        </div>
+        <div class="card" style="padding: 10px 12px 10px">
+          <div class="section-title">历史已申请</div>
+          <div class="section-subtitle">最近申请的岗位及链接</div>
+          <div class="job-list" id="applied-history"></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const apiBase = "";
+
+      function log(type, message) {
+        const logEl = document.getElementById("log");
+        const div = document.createElement("div");
+        div.className = "log-entry";
+        const span = document.createElement("span");
+        span.className = "tag " + type;
+        span.textContent = type.toUpperCase();
+        div.appendChild(span);
+        div.append(" " + message);
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      async function fetchJobs() {
+        try {
+          const res = await fetch(apiBase + "/api/jobs");
+          const data = await res.json();
+          renderJobs(data);
+          log("ok", "刷新岗位列表，共 " + data.length + " 条");
+          if (data.length) {
+            const last = data[0];
+            log(
+              "info",
+              `最新岗位 job_id=${last.id}, status=${last.status}, link=${last.link}`
+            );
+          }
+        } catch (e) {
+          console.error(e);
+          log("error", "获取岗位列表失败：" + e.message);
+        }
+      }
+
+      function renderJobs(jobs) {
+        const byStatus = {
+          pending: [],
+          applied: [],
+          manual_required: [],
+          failed: [],
+        };
+        for (const job of jobs) {
+          if (byStatus[job.status]) {
+            byStatus[job.status].push(job);
+          }
+        }
+
+        const listPending = document.getElementById("list-pending");
+        const listApplied = document.getElementById("list-applied");
+        const listManual = document.getElementById("list-manual");
+        listPending.innerHTML = "";
+        listApplied.innerHTML = "";
+        listManual.innerHTML = "";
+
+        function createItem(job) {
+          const div = document.createElement("div");
+          div.className = "job-item";
+          
+          // 删除按钮
+          const deleteBtn = document.createElement("button");
+          deleteBtn.className = "btn-delete";
+          deleteBtn.textContent = "×";
+          deleteBtn.title = "删除此条记录";
+          deleteBtn.onclick = (e) => {
+            e.stopPropagation();
+            deleteJob(job.id);
+          };
+          
+          const title = document.createElement("div");
+          title.className = "title";
+          title.textContent = job.title || "未命名岗位";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          const spans = [];
+          if (job.company) spans.push(job.company);
+          if (job.status) spans.push(job.status);
+          meta.innerHTML = spans.map((t) => `<span>${t}</span>`).join("");
+          const link = document.createElement("a");
+          link.className = "link";
+          link.href = job.link;
+          link.target = "_blank";
+          link.rel = "noreferrer";
+          link.textContent = job.link;
+
+          div.appendChild(deleteBtn);
+          div.appendChild(title);
+          div.appendChild(meta);
+          div.appendChild(link);
+          return div;
+        }
+
+        byStatus.pending.forEach((j) => listPending.appendChild(createItem(j)));
+        byStatus.applied.forEach((j) => listApplied.appendChild(createItem(j)));
+        const manualAll = [...byStatus.manual_required, ...byStatus.failed];
+        manualAll.forEach((j) => listManual.appendChild(createItem(j)));
+
+        document.getElementById("pending-count").textContent =
+          byStatus.pending.length;
+        document.getElementById("applied-count").textContent =
+          byStatus.applied.length;
+        document.getElementById("manual-count").textContent = manualAll.length;
+
+        renderAppliedHistory(byStatus.applied);
+      }
+
+      function renderAppliedHistory(appliedJobs) {
+        const box = document.getElementById("applied-history");
+        box.innerHTML = "";
+        if (!appliedJobs.length) {
+          box.innerHTML =
+            '<div class="log-entry"><span class="tag info">INFO</span> 暂无已申请记录</div>';
+          return;
+        }
+        // 只展示最近 10 条
+        const recent = appliedJobs
+          .slice()
+          .sort((a, b) => new Date(b.apply_time || 0) - new Date(a.apply_time || 0))
+          .slice(0, 10);
+        for (const job of recent) {
+          const div = document.createElement("div");
+          div.className = "job-item";
+          const title = document.createElement("div");
+          title.className = "title";
+          title.textContent = job.title || "未命名岗位";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          const spans = [];
+          if (job.company) spans.push(job.company);
+          if (job.apply_time) spans.push(job.apply_time.split("T")[0]);
+          meta.innerHTML = spans.map((t) => `<span>${t}</span>`).join("");
+          const link = document.createElement("a");
+          link.className = "link";
+          link.href = job.link;
+          link.target = "_blank";
+          link.rel = "noreferrer";
+          link.textContent = job.link;
+          div.appendChild(title);
+          div.appendChild(meta);
+          div.appendChild(link);
+          box.appendChild(div);
+        }
+      }
+
+      async function addJob() {
+        const link = document.getElementById("link").value.trim();
+        const title = document.getElementById("title").value.trim();
+        const company = document.getElementById("company").value.trim();
+        if (!link) {
+          log("error", "请先填写岗位链接");
+          return;
+        }
+        try {
+          const res = await fetch(apiBase + "/api/jobs", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ link, title, company }),
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            log("error", "添加失败：" + (data.error || "未知错误"));
+            return;
+          }
+          log("ok", "已添加岗位：" + (title || link));
+          document.getElementById("link").value = "";
+          await fetchJobs();
+        } catch (e) {
+          console.error(e);
+          log("error", "添加岗位异常：" + e.message);
+        }
+      }
+
+      async function startApplying() {
+        try {
+          const res = await fetch(apiBase + "/api/control/start", {
+            method: "POST",
+          });
+          const data = await res.json();
+          log("info", data.message || "已发送开始指令");
+          const dot = document.querySelector("#status-chip .dot");
+          dot.className = "dot dot-running";
+          document.getElementById("status-text").textContent = "投递中…";
+        } catch (e) {
+          log("error", "启动调度失败：" + e.message);
+        }
+      }
+
+      async function pauseApplying() {
+        try {
+          const res = await fetch(apiBase + "/api/control/pause", {
+            method: "POST",
+          });
+          const data = await res.json();
+          log("info", data.message || "已发送暂停指令");
+          const dot = document.querySelector("#status-chip .dot");
+          dot.className = "dot dot-paused";
+          document.getElementById("status-text").textContent = "已暂停";
+        } catch (e) {
+          log("error", "暂停调度失败：" + e.message);
+        }
+      }
+
+      async function deleteJob(jobId) {
+        if (!confirm("确定要删除这条记录吗？")) return;
+        try {
+          const res = await fetch(apiBase + "/api/jobs/" + jobId, {
+            method: "DELETE",
+          });
+          const data = await res.json();
+          if (data.ok) {
+            log("ok", "已删除记录 #" + jobId);
+            await fetchJobs();
+          } else {
+            log("error", "删除失败：" + (data.error || "未知错误"));
+          }
+        } catch (e) {
+          log("error", "删除异常：" + e.message);
+        }
+      }
+
+      async function clearJobs(status) {
+        const statusNames = {
+          pending: "待申请",
+          applied: "已申请",
+          manual_required: "待处理",
+          failed: "失败"
+        };
+        const statusName = statusNames[status] || status;
+        if (!confirm(`确定要清空所有「${statusName}」的记录吗？此操作不可恢复！`)) return;
+        try {
+          const res = await fetch(apiBase + "/api/jobs?status=" + status, {
+            method: "DELETE",
+          });
+          const data = await res.json();
+          if (data.ok) {
+            log("ok", `已清空「${statusName}」列表，共删除 ${data.deleted || 0} 条`);
+            await fetchJobs();
+          } else {
+            log("error", "清空失败：" + (data.error || "未知错误"));
+          }
+        } catch (e) {
+          log("error", "清空异常：" + e.message);
+        }
+      }
+
+      document.getElementById("btn-add").addEventListener("click", addJob);
+      document.getElementById("btn-reload").addEventListener("click", fetchJobs);
+      document.getElementById("btn-start").addEventListener("click", startApplying);
+      document.getElementById("btn-pause").addEventListener("click", pauseApplying);
+
+      fetchJobs();
+    </script>
+  </body>
+</html>
+
+

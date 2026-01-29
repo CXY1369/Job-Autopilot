@@ -1,0 +1,140 @@
+# =============================================================================
+# User Profile Configuration - EXAMPLE TEMPLATE
+# =============================================================================
+# Copy this file to user_profile.yaml and fill in your personal information.
+# Keep user_profile.yaml secure and do not commit to public repositories.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Personal Information
+# -----------------------------------------------------------------------------
+personal:
+  first_name: "Your First Name"
+  last_name: "Your Last Name"
+  full_name: "Your Full Name"
+  email: "your.email@example.com"
+  email_alternate: ""  # Optional alternate email
+  phone: "+1-xxx-xxx-xxxx"
+  linkedin: "https://linkedin.com/in/your-profile/"
+  website: ""  # Optional: personal website or portfolio
+
+# -----------------------------------------------------------------------------
+# Location Information
+# -----------------------------------------------------------------------------
+location:
+  current_city: "City"
+  current_state: "State"
+  current_country: "United States"
+  full_location: "City, State, United States"
+  zip_code: "00000"
+
+# -----------------------------------------------------------------------------
+# Work Preferences
+# -----------------------------------------------------------------------------
+work_preferences:
+  preferred_locations:
+    - "San Francisco, California, United States"
+    - "New York, New York, United States"
+  
+  willing_to_relocate: true
+  remote_work_preference: "hybrid"  # Options: remote, hybrid, onsite, flexible
+  
+  salary_expectation: "$100,000+"
+  salary_min: 100000
+  salary_currency: "USD"
+  
+  earliest_start_date: "2026-01"
+  notice_period: "2 weeks"
+
+# -----------------------------------------------------------------------------
+# Work Authorization
+# -----------------------------------------------------------------------------
+work_authorization:
+  authorized_to_work_in_us: true
+  require_visa_sponsorship: false
+  current_visa_status: "Citizen"  # F-1, H-1B, Green Card, Citizen, etc.
+  
+# -----------------------------------------------------------------------------
+# Demographics (for voluntary self-identification)
+# -----------------------------------------------------------------------------
+demographics:
+  gender: ""  # Male, Female, Non-binary, Prefer not to say
+  ethnicity: ""  # Asian, Black, Hispanic, White, etc.
+  veteran_status: "No"  # Yes, No, Prefer not to say
+  disability_status: "No"  # Yes, No, Prefer not to say
+  
+# -----------------------------------------------------------------------------
+# Education
+# -----------------------------------------------------------------------------
+education:
+  highest_degree: "Bachelor's"
+  degree_status: "Completed"  # Completed, In Progress
+  
+  degrees:
+    - degree: "Bachelor of Science"
+      field: "Computer Science"
+      university: "University Name"
+      location: "City, State"
+      start_date: "2018-08"
+      end_date: "2022-05"
+      gpa: "3.5"
+      honors: ""
+
+# -----------------------------------------------------------------------------
+# Work Experience
+# -----------------------------------------------------------------------------
+experience:
+  years_of_experience: "2"
+  current_title: "Software Engineer"
+  current_company: "Company Name"
+  
+  positions:
+    - title: "Software Engineer"
+      company: "Company Name"
+      location: "City, State"
+      start_date: "2022-06"
+      end_date: "Present"
+      description: "Description of your role and responsibilities"
+
+# -----------------------------------------------------------------------------
+# Skills
+# -----------------------------------------------------------------------------
+skills:
+  programming_languages:
+    - "Python"
+    - "JavaScript"
+    
+  frameworks:
+    - "React"
+    - "FastAPI"
+    
+  tools:
+    - "Git"
+    - "Docker"
+    
+  domains:
+    - "Web Development"
+    - "Machine Learning"
+
+# -----------------------------------------------------------------------------
+# Common Application Questions (Pre-filled Answers)
+# -----------------------------------------------------------------------------
+common_answers:
+  has_relative_at_company: false
+  previously_worked_at_company: false
+  referral_source: "LinkedIn"
+  is_over_18: true
+  has_drivers_license: true
+  willing_background_check: true
+  willing_drug_test: true
+
+# -----------------------------------------------------------------------------
+# File Uploads Configuration
+# -----------------------------------------------------------------------------
+files:
+  allowed_directories:
+    - "/path/to/your/documents"
+  
+  default_resume: "/path/to/your/resume.pdf"
+  cover_letter: ""
+  transcript: ""
