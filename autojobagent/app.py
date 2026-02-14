@@ -1,5 +1,10 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+import time
+import os
+import re
+import yaml
+from openai import OpenAI
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,9 +15,11 @@ from .db.database import init_db, get_session
 from .models.job_post import JobStatus
 from .models.job_log import JobLog
 from .core.scheduler import scheduler
+from .core.browser_manager import BrowserManager, BrowserSession
 
 BASE_DIR = Path(__file__).resolve().parent
 UI_DIR = BASE_DIR / "ui"
+CONFIG_PATH = BASE_DIR / "config.yaml"
 
 
 @asynccontextmanager
@@ -24,6 +31,26 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Job Autopilot - Auto Application Agent", lifespan=lifespan)
+
+_login_session: BrowserSession | None = None
+_llm_health_cache: dict | None = None
+_RESUME_MATCH_LOG_RE = re.compile(r"score=(\d+),\s*reason=(.*)\)$")
+
+
+def _load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _save_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(
+        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -62,7 +89,53 @@ def list_jobs(status: JobStatus | None = None):
         if status is not None:
             query = query.filter(JobPost.status == status)
         jobs = query.order_by(JobPost.create_time.desc()).all()
-        return [job.to_dict() for job in jobs]
+        rows = [job.to_dict() for job in jobs]
+        _attach_resume_match_info(rows, session)
+        return rows
+
+
+def _attach_resume_match_info(rows: list[dict], session) -> None:
+    """
+    Enrich job rows with resume match metadata parsed from logs:
+    - resume_match_score
+    - resume_match_reason
+    """
+    if not rows:
+        return
+    job_ids = [r.get("id") for r in rows if r.get("id") is not None]
+    if not job_ids:
+        return
+
+    logs = (
+        session.query(JobLog)
+        .filter(JobLog.job_id.in_(job_ids))
+        .order_by(JobLog.create_time.desc())
+        .all()
+    )
+
+    match_map: dict[int, tuple[int | None, str | None]] = {}
+    for log in logs:
+        if log.job_id in match_map:
+            continue
+        msg = (log.message or "").strip()
+        if "匹配结果:" not in msg or "(score=" not in msg:
+            continue
+        m = _RESUME_MATCH_LOG_RE.search(msg)
+        if not m:
+            match_map[log.job_id] = (None, None)
+            continue
+        try:
+            score = int(m.group(1))
+        except Exception:
+            score = None
+        reason = (m.group(2) or "").strip() or None
+        match_map[log.job_id] = (score, reason)
+
+    for row in rows:
+        job_id = row.get("id")
+        score, reason = match_map.get(job_id, (None, None))
+        row["resume_match_score"] = score
+        row["resume_match_reason"] = reason
 
 
 @app.post("/api/jobs")
@@ -107,6 +180,100 @@ def pause_applying():
     """
     scheduler.stop()
     return {"ok": True, "message": "paused"}
+
+
+@app.post("/api/browser/login/open")
+def open_login_browser(url: str):
+    """
+    打开用于手动登录的浏览器窗口（复用 profile），由用户自行完成登录。
+    """
+    global _login_session
+    if _login_session is not None:
+        return {"ok": False, "error": "login session already running"}
+    manager = BrowserManager(log_fn=lambda msg, level="info": print(f"[login] [{level.upper()}] {msg}"))
+    _login_session = manager.launch()
+    target = url.strip() if url else "about:blank"
+    try:
+        _login_session.page.goto(target, wait_until="domcontentloaded", timeout=30000)
+    except Exception as e:
+        return {"ok": False, "error": f"open login page failed: {e}"}
+    return {"ok": True, "message": "login browser opened", "url": _login_session.page.url}
+
+
+@app.post("/api/browser/login/close")
+def close_login_browser():
+    """关闭手动登录浏览器窗口。"""
+    global _login_session
+    if _login_session is None:
+        return {"ok": False, "error": "no login session"}
+    try:
+        _login_session.close()
+    finally:
+        _login_session = None
+    return {"ok": True, "message": "login browser closed"}
+
+
+@app.get("/api/browser/login/status")
+def login_browser_status():
+    """查询手动登录浏览器是否仍在运行。"""
+    running = _login_session is not None
+    return {"ok": True, "running": running}
+
+
+@app.get("/api/llm/models")
+def get_llm_models():
+    """返回当前模型与可选模型列表。"""
+    cfg = _load_config()
+    llm_cfg = cfg.get("llm", {})
+    models = llm_cfg.get("fallback_models") or []
+    current = llm_cfg.get("model", "")
+    return {"ok": True, "current": current, "models": models}
+
+
+@app.post("/api/llm/model")
+def set_llm_model(payload: dict):
+    """切换当前模型（必须在 fallback_models 中）。"""
+    model = (payload.get("model") or "").strip()
+    if not model:
+        return {"ok": False, "error": "model is required"}
+    cfg = _load_config()
+    llm_cfg = cfg.setdefault("llm", {})
+    models = llm_cfg.get("fallback_models") or []
+    if model not in models:
+        return {"ok": False, "error": "model not in fallback_models"}
+    llm_cfg["model"] = model
+    # 选中模型优先
+    llm_cfg["fallback_models"] = [model] + [m for m in models if m != model]
+    _save_config(cfg)
+    return {"ok": True, "model": model}
+
+
+@app.get("/api/llm/health")
+def llm_health_check():
+    """对当前模型做一次轻量健康检查。"""
+    cfg = _load_config()
+    llm_cfg = cfg.get("llm", {})
+    model = llm_cfg.get("model", "")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"ok": False, "error": "OPENAI_API_KEY 未设置"}
+    if not model:
+        return {"ok": False, "error": "model 未设置"}
+    client = OpenAI(api_key=api_key)
+    start = time.time()
+    try:
+        client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            temperature=0.0,
+        )
+        latency_ms = int((time.time() - start) * 1000)
+        global _llm_health_cache
+        _llm_health_cache = {"model": model, "ok": True, "latency_ms": latency_ms}
+        return {"ok": True, "model": model, "latency_ms": latency_ms}
+    except Exception as e:
+        return {"ok": False, "model": model, "error": str(e)}
 
 
 @app.get("/api/jobs/{job_id}/logs")

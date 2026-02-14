@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
-from sqlalchemy import Integer, String, DateTime, Text
+from sqlalchemy import Integer, String, DateTime
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..db.database import Base
@@ -23,7 +23,7 @@ class Resume(Base):
     )
     language: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
     last_used_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 

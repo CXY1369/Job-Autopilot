@@ -115,7 +115,8 @@
         color: var(--text-muted);
       }
 
-      input[type="text"] {
+      input[type="text"],
+      select {
         width: 100%;
         padding: 7px 9px;
         border-radius: 9px;
@@ -127,7 +128,8 @@
         transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
       }
 
-      input[type="text"]:focus {
+      input[type="text"]:focus,
+      select:focus {
         border-color: var(--accent);
         box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.6);
         background: rgba(15, 23, 42, 1);
@@ -175,6 +177,14 @@
         gap: 8px;
         font-size: 12px;
         color: var(--text-muted);
+        flex-wrap: wrap;
+      }
+
+      .toolbar-group {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
       }
 
       .status-chip {
@@ -433,13 +443,17 @@
         </div>
 
         <div class="toolbar">
-          <div style="display: flex; align-items: center; gap: 6px">
+          <div class="toolbar-group">
             <button class="btn-primary" id="btn-add">
               + 添加到待申请列表
             </button>
             <button class="btn-ghost" id="btn-reload">刷新列表</button>
           </div>
-          <div style="display: flex; align-items: center; gap: 6px">
+          <div class="toolbar-group">
+            <label for="model-select">模型</label>
+            <select id="model-select"></select>
+            <button class="btn-ghost" id="btn-model-test">测试</button>
+            <span class="pill" id="model-health">未检测</span>
             <div class="status-chip" id="status-chip">
               <div class="dot dot-idle"></div>
               <span id="status-text">空闲 · 未开始投递</span>
@@ -486,7 +500,7 @@
               </div>
               <div style="display: flex; align-items: center; gap: 6px;">
               <span class="pill" id="manual-count">0</span>
-                <button class="btn-clear" onclick="clearJobs('manual_required')">清空</button>
+                <button class="btn-clear" onclick="clearManualAndFailed()">清空</button>
               </div>
             </div>
             <div class="job-list" id="list-manual"></div>
@@ -549,6 +563,71 @@
         }
       }
 
+      async function fetchModels() {
+        try {
+          const res = await fetch(apiBase + "/api/llm/models");
+          const data = await res.json();
+          if (!data.ok) {
+            log("error", "获取模型列表失败");
+            return;
+          }
+          const select = document.getElementById("model-select");
+          select.innerHTML = "";
+          for (const m of data.models || []) {
+            const opt = document.createElement("option");
+            opt.value = m;
+            opt.textContent = m;
+            select.appendChild(opt);
+          }
+          if (data.current) {
+            select.value = data.current;
+          }
+          log("info", "当前模型：" + (data.current || "未设置"));
+        } catch (e) {
+          log("error", "获取模型列表异常：" + e.message);
+        }
+      }
+
+      async function setModel() {
+        const select = document.getElementById("model-select");
+        const model = select.value;
+        if (!model) return;
+        try {
+          const res = await fetch(apiBase + "/api/llm/model", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model }),
+          });
+          const data = await res.json();
+          if (data.ok) {
+            log("ok", "模型已切换为：" + data.model);
+          } else {
+            log("error", "切换模型失败：" + (data.error || "未知错误"));
+          }
+        } catch (e) {
+          log("error", "切换模型异常：" + e.message);
+        }
+      }
+
+      async function testModel() {
+        const chip = document.getElementById("model-health");
+        chip.textContent = "检测中...";
+        try {
+          const res = await fetch(apiBase + "/api/llm/health");
+          const data = await res.json();
+          if (data.ok) {
+            chip.textContent = `OK ${data.latency_ms}ms`;
+            log("ok", `模型健康检查通过: ${data.model} (${data.latency_ms}ms)`);
+          } else {
+            chip.textContent = "失败";
+            log("error", `模型健康检查失败: ${data.error || "未知错误"}`);
+          }
+        } catch (e) {
+          chip.textContent = "异常";
+          log("error", "模型健康检查异常：" + e.message);
+        }
+      }
+
       function renderJobs(jobs) {
         const byStatus = {
           pending: [],
@@ -602,6 +681,32 @@
           div.appendChild(deleteBtn);
           div.appendChild(title);
           div.appendChild(meta);
+
+          // 显示失败/人工处理原因
+          const reason = job.fail_reason || job.manual_reason;
+          if (reason && (job.status === "failed" || job.status === "manual_required")) {
+            const reasonDiv = document.createElement("div");
+            reasonDiv.style.cssText = "margin-top:3px;font-size:11px;color:rgba(248,113,113,0.85);word-break:break-word;";
+            reasonDiv.textContent = "原因: " + reason;
+            div.appendChild(reasonDiv);
+          }
+
+          // 仅对已成功投递岗位显示匹配信息（简历 + 分数 + hover 原因）
+          if (job.status === "applied" && job.resume_used) {
+            const resumeDiv = document.createElement("div");
+            const resumeName = job.resume_used.split("/").pop();
+            const scoreText =
+              typeof job.resume_match_score === "number"
+                ? ` | 匹配分: ${job.resume_match_score}`
+                : "";
+            resumeDiv.style.cssText = "margin-top:3px;font-size:11px;color:rgba(56,189,248,0.92);word-break:break-word;";
+            resumeDiv.textContent = `简历: ${resumeName}${scoreText}`;
+            if (job.resume_match_reason) {
+              resumeDiv.title = `匹配原因: ${job.resume_match_reason}`;
+            }
+            div.appendChild(resumeDiv);
+          }
+
           div.appendChild(link);
           return div;
         }
@@ -759,12 +864,37 @@
         }
       }
 
+      async function clearManualAndFailed() {
+        if (!confirm('确定要清空所有「待处理」的记录吗？此操作不可恢复！')) return;
+        try {
+          const res1 = await fetch(apiBase + "/api/jobs?status=manual_required", { method: "DELETE" });
+          const data1 = await res1.json();
+          const res2 = await fetch(apiBase + "/api/jobs?status=failed", { method: "DELETE" });
+          const data2 = await res2.json();
+          if (!data1.ok || !data2.ok) {
+            const err1 = data1.error || "";
+            const err2 = data2.error || "";
+            const detail = [err1, err2].filter(Boolean).join(" | ") || "未知错误";
+            log("error", "清空待处理失败：" + detail);
+            return;
+          }
+          const total = (data1.deleted || 0) + (data2.deleted || 0);
+          log("ok", `已清空「待处理」列表，共删除 ${total} 条`);
+          await fetchJobs();
+        } catch (e) {
+          log("error", "清空异常：" + e.message);
+        }
+      }
+
       document.getElementById("btn-add").addEventListener("click", addJob);
       document.getElementById("btn-reload").addEventListener("click", fetchJobs);
       document.getElementById("btn-start").addEventListener("click", startApplying);
       document.getElementById("btn-pause").addEventListener("click", pauseApplying);
+      document.getElementById("model-select").addEventListener("change", setModel);
+      document.getElementById("btn-model-test").addEventListener("click", testModel);
 
       fetchJobs();
+      fetchModels();
     </script>
   </body>
 </html>

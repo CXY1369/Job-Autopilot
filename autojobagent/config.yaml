@@ -1,12 +1,26 @@
 llm:
-  provider: "claude"
-  model: "claude-3.7-sonnet"
+  provider: "openai"
+  model: "gpt-4o"
   max_tokens: 4096
-  temperature: 0.2
+  temperature: 0.1
+  fallback_models:
+    - "gpt-4o"
+    - "gpt-4o-2024-11-20"
+    - "gpt-4.1"
+    - "gpt-4.1-mini"
+    - "gpt-5-mini"
+    - "gpt-4-turbo"
+    - "gpt-4o-mini"
 
 browser:
   headless: false
   slow_mo: 200
+  # 可选：指定 Chromium 可执行文件路径（Chrome/Brave/Edge/Chromium）
+  executable_path: ""
+  # 可选：持久化 profile 目录，用于复用登录态
+  user_data_dir: "~/.cache/autojobagent/chrome-profile"
+  # 可选：Simplify 扩展路径（优先于自动探测）
+  simplify_extension_path: ""
 
 browser_use:
   max_retries_per_page: 3

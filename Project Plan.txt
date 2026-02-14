@@ -1,0 +1,538 @@
+11️⃣ 项目名称
+Job Autopilot_Auto Application Agent —— 全自动求职投递 AI 助手（个人版）
+
+2️⃣ 项目背景与目标
+2.1 项目背景
+当前大多数招聘网站（如 LinkedIn、Indeed、Greenhouse、Lever、BOSS 直聘、企业官网等）：
+•	申请流程高度不统一
+•	表单字段差异极大
+•	页面结构经常变化
+•	需要大量重复人工填写
+•	经常包含：
+o	文件上传
+o	多页跳转
+o	错误校验
+o	邮箱/验证码/手机验证
+现有自动填表工具（如 Simplify 插件）：
+•	✅ 只能处理当前页面
+•	❌ 无法全流程自动
+•	❌ 无法跨页面递归推进
+•	❌ 无法推理缺失字段
+•	❌ 无法自动找工作或批量投递
+
+2.2 项目目标
+本项目目标是构建一个：
+✅ 基于大模型 + 视觉识别 + 浏览器自动化的全自动求职投递 Agent
+最终目标达到像人类操作浏览器页面一样丝滑灵活（识别，滑动，点击，填写，上传，刷新，重新尝试等基本操作的排列组合）
+让用户只需提供：
+•	✅ 个人基本信息
+•	✅ 多份不同方向的简历
+•	✅ 项目经历
+•	✅ 登录招聘网站账号（保持登录）
+系统即可：
+•	✅ 自动搜索岗位（后续阶段）
+•	✅ 自动整理待申请岗位列表
+•	✅ 自动逐一打开岗位页面
+•	✅ 自动填写申请表单（必要时通过 Simplify）
+•	✅ 自动处理错误并修正
+•	✅ 自动上传简历
+•	✅ 自动提交申请
+•	✅ 自动记录所有已投递岗位
+•	✅ 在遇到必须人工处理时暂停并提醒用户
+•	✅ 用户处理完成后自动继续
+
+
+
+3️⃣ MVP 版本边界定义（第一阶段必须实现的）
+⚠️ 本项目采用 “极小闭环优先”原则
+✅ 第一版必须支持：
+•	手动添加岗位链接
+•	待申请列表 / 已申请列表 / 待处理列表
+•	一键开始投递
+•	自动打开岗位申请页面
+•	优先调用 Simplify 插件自动填表
+•	Simplify 填完后自动点击 Next / Continue
+•	若 Simplify 未出现，使用 AI 自动识别页面并填写
+•	支持多页递归填写
+•	支持文件上传（简历）
+•	提交成功后移动到“已申请”
+•	遇到必须人工处理 → 移动到“待处理”
+•	所有历史投递记录保存到本地数据库（SQLite）
+
+❌ 第一版刻意不做（后续阶段）：
+•	❌ 自动全网搜索岗位
+•	❌ 多线程并发投递
+•	❌ 数据可视化分析
+•	❌ 多用户支持
+•	❌ 云端部署
+
+
+4️⃣ 技术栈总览（已最终锁定）
+模块	技术
+主语言	✅ Python 3.11
+浏览器控制	✅ Playwright (Python)
+AI Web Agent	✅ 自研 Vision AI Agent（基于 Playwright，未使用 browser-use 库，因其存在难以调整的兼容问题）
+大模型	✅ OpenAI GPT-4o 系列（因视觉图片输入格式要求，目前仅支持 OpenAI 模型）
+Web 接口	✅ FastAPI
+前端 UI	✅ 原生 HTML + 少量 JS
+数据存储	✅ SQLite
+插件协作	✅ Simplify
+运行方式	✅ 本地运行
+并发模式	✅ 单线程稳定优先
+操作系统	✅ macOS / Windows
+
+5️⃣ 系统整体架构（逻辑）
+[ Web UI ]
+   └── 添加岗位 / 查看状态 / 开始投递
+           ↓
+[ FastAPI 后端 ]
+           ↓
+[ 单线程任务调度器 ]
+           ↓
+[ Playwright 浏览器 ]
+           ↓
+[ 招聘网站页面 + Simplify 插件 ]
+           ↓
+[ Vision AI Agent 决策（自研，基于 Playwright + OpenAI GPT-4o）]
+           ↓
+[ SQLite 数据记录 ]
+
+6️⃣ 核心功能模块拆解（工程级）
+
+✅ 6.1 UI 模块（Web 前端）
+功能：
+•	添加岗位链接
+•	显示：
+o	待申请列表
+o	已申请列表
+o	待处理列表
+•	显示当前运行状态：
+o	空闲 / 投递中 / 暂停 / 待人工处理
+•	待处理列表中显示每个岗位的 fail_reason / manual_reason
+•	一键开始 / 暂停投递
+
+
+
+
+
+
+
+
+
+✅ 6.2 任务调度器模块（核心控制大脑）
+职责：
+•	只允许 单线程执行
+•	严格按顺序处理：
+o	待申请 → 已申请 / 待处理
+•	任一任务异常不得影响下一个任务
+执行流程：
+循环：
+  取一个 待申请岗位
+    打开新浏览器页面
+      执行自动申请流程
+        成功 → 移入已申请
+        人工 → 移入待处理
+        异常 → 写入失败原因
+
+
+
+
+
+
+
+
+
+
+✅ 6.3 自动投递执行模块（核心逻辑）
+工作流程伪代码：
+打开岗位链接
+
+while 未提交成功:
+    if 检测到 Simplify 弹窗:
+        点击 Autofill
+        等待 Autofill 完成
+        点击 Next
+    else:
+        使用 Vision AI Agent 识别页面
+        自动填写表单
+        选择下拉框
+        勾选复选框
+        上传简历
+        点击 Next 或 Submit
+
+    if 页面报错:
+        读取错误信息
+        用用户资料 + 项目 + 简历推理修正
+        继续填写
+
+    if 页面提示需要人工操作:
+        保存当前页面
+        标记为 待处理
+        退出当前岗位流程
+
+✅ 6.4 简历与用户信息管理模块
+支持：
+•	多份简历存储（按方向分类）
+•	项目经历结构化存储
+•	基本个人信息结构化存储
+用于：
+•	表单填写
+•	岗位匹配
+•	错误修正
+•	简历选择决策
+
+✅ 6.5 简历匹配决策模块（LLM）
+输入：
+•	岗位 JD
+•	各简历技能标签
+•	项目经历
+输出：
+•	最匹配简历
+•	推荐使用置信度
+
+
+
+
+
+
+✅ 6.6 数据存储模块
+SQLite 表结构（示意）：
+jobs 表
+字段	含义
+id	自增
+company	公司
+title	岗位
+link	申请链接
+status	pending / applied / manual
+resume_used	使用简历
+fail_reason	失败原因
+create_time	添加时间
+apply_time	投递时间
+
+
+
+
+
+
+
+
+7️⃣ 人工介入机制（必须严格支持）
+任何出现以下情况：
+•	验证码
+•	手机验证
+•	邮箱验证
+•	人脸验证
+•	登录失效
+•	系统风控阻断
+系统必须：
+1. 立即暂停本岗位流程
+2. 保存当前页面截图
+3. 标记岗位为：待处理（manual_required）
+4. 在 UI 待处理列表中写明原因（fail_reason / manual_reason）
+5. 调度器继续处理下一个 pending 岗位
+用户处理完后：
+•	用户自行解决登录/验证等问题后，手动将岗位链接重新添加到待申请列表
+
+
+
+
+8️⃣ MVP 项目目录结构（给 Cursor 或 Codex等AI编程助手的工程骨架）
+autojobagent/
+├── app.py                 # FastAPI 入口
+├── ui/
+│   └── index.html
+├── core/
+│   ├── scheduler.py       # 单线程调度器
+│   ├── applier.py         # 自动投递核心逻辑
+│   ├── simplify_helper.py # Simplify 插件检测与调用
+│   ├── vision_agent.py    # 自研 Vision AI Agent（截图→LLM决策→执行循环）
+│   ├── browser_manager.py # Playwright 浏览器生命周期管理
+│   ├── ui_snapshot.py     # 可交互元素快照（accessibility tree）
+│   ├── heuristics.py      # 启发式规则（登录/验证码检测）
+├── models/
+│   ├── resume.py
+│   ├── user_profile.py
+│   └── job_post.py
+├── db/
+│   └── database.py
+├── storage/
+│   ├── resumes/
+│   ├── uploads/
+│   └── logs/
+└── config.yaml
+
+9️⃣ 投递任务状态机设计（队列 + 状态流转）
+
+目标：让调度器、UI 与数据库对「岗位进度」有统一、可追踪的语义，便于恢复与排错。
+
+9.1 状态枚举
+jobs.status 建议使用以下枚举值：
+•  pending           # 待申请（队列入口）
+•  in_progress       # 正在申请（当前仅单线程，最多一个）
+•  applied           # 已成功提交
+•  manual_required   # 需要人工处理后才能继续
+•  failed            # 自动尝试多次仍失败
+•  paused            # （可选）全局暂停时的占位
+
+9.2 状态流转规则
+核心流转路径：
+•  pending → in_progress
+•  in_progress → applied
+•  in_progress → manual_required
+•  in_progress → failed
+
+人工与重试相关流转：
+•  manual_required / failed 的岗位不自动恢复；用户处理完问题后，手动重新添加岗位链接到待申请列表
+•  pending / in_progress → paused（全局暂停时可选实现）
+
+9.3 调度器取数规则
+•  调度器只从 status = pending 的岗位中按 create_time（或 id）顺序取 1 条
+•  取出后立即标记为 in_progress
+•  本岗位流程结束后，依据结果更新为 applied / manual_required / failed
+
+9.4 UI 展示建议
+•  待申请列表：status in [pending]
+•  已申请列表：status in [applied]
+•  待处理列表：status in [manual_required, failed]，并在行内展示 fail_reason / manual_reason
+
+
+🔟 Simplify 插件集成设计（检测 + 等待 + 兜底）
+
+目标：优先利用现有 Simplify 能力完成页面自动填表，失败时优雅降级到 Vision AI Agent。
+
+10.1 检测 Simplify 悬浮窗
+在每个页面加载后：
+•  通过预设 CSS 选择器 或 文本内容 检测 Simplify 悬浮窗是否存在
+  o 例如：包含 “Autofill this page” 文本的按钮
+•  可在 config.yaml 中配置相关选择器/文本：
+  o simplify.enabled: true/false
+  o simplify.selectors.popup
+  o simplify.selectors.autofill_button
+  o simplify.text.complete: "Autofill complete!"
+
+10.2 Autofill 操作流程
+若检测到 Simplify 悬浮窗：
+1. 点击「Autofill this page」按钮
+2. 等待页面完成自动填写：
+   •  轮询等待 Simplify 悬浮窗中出现 “Autofill complete!” 文案，或
+   •  轮询等待悬浮窗关闭 / 状态变化
+3. 在 Autofill 完成后：
+   •  在当前页面中寻找 Next / Continue / Submit 按钮
+   •  点击后等待页面跳转或下一步加载完成
+
+10.3 超时与失败兜底
+•  若在设定时间内（例如 20~30 秒）未能检测到 “Autofill complete!”：
+  o 记录日志（写入 logs/ + SQLite 日志表）
+  o 可尝试再次点击 Autofill 一次（最多 N 次，N=1~2）
+•  若仍未成功：
+  o 视为 Simplify 当前页面不可用
+  o 关闭/忽略 Simplify 悬浮窗
+  o 切换到 Vision AI Agent 自动填写流程
+
+10.4 检测方式说明
+•  实际实现中，Simplify 检测采用文本匹配方式（匹配 "Autofill this page"、"Autofill complete!" 等文案），而非 CSS 选择器
+•  文本匹配比 CSS 选择器更稳定，不易因 Simplify 插件 DOM 更新而失效
+•  等待超时时间通过 SimplifyConfig 配置（默认 25 秒）
+
+1️⃣1️⃣ Vision AI Agent 调用策略（自研，替代 Browser-Use）
+
+说明：项目初期尝试使用 browser-use 库，但发现存在难以调整的兼容问题，因此基于 Playwright 自研了完整的 Vision AI Agent（core/vision_agent.py）。
+
+11.1 核心架构：观察-思考-行动循环
+在 core/vision_agent.py 中实现 BrowserAgent 类，核心循环：
+1. 观察：截图（PNG→JPEG压缩）+ 获取页面文本 + 生成可交互元素快照（UI Snapshot）
+2. 思考：将截图、页面文本、元素快照、用户信息一起发给 LLM，让其分析并返回下一步操作（JSON格式）
+3. 行动：根据 LLM 返回的操作指令，通过 Playwright 执行 click/fill/type/upload/scroll 等动作
+4. 反馈：检查操作结果，记录到历史，继续循环直到任务完成或放弃
+
+11.2 给 LLM 的上下文（提示词大纲）
+提示中包含：
+•  当前页面截图（JPEG，限制宽度 1280px）
+•  页面可见文本（截断至 5000 字符）
+•  可交互元素快照（基于 accessibility tree 的 ref→元素映射）
+•  用户个人信息（从 config/user_profile.yaml 加载）
+•  操作规范手册（从 config/agent_guidelines.md 加载）
+•  最近 5 步操作历史
+•  上传信号检测结果与候选文件列表
+
+11.3 动作约束（安全边界）
+•  不允许：
+  o 关闭整个浏览器或 Playwright 上下文
+  o 修改浏览器设置、扩展设置
+  o 上传白名单目录以外的文件
+•  允许：
+  o 在当前 tab 内进行点击、输入、滚动、选择、上传文件等操作
+  o 在同一域下的多页申请流程中前进/后退
+•  前进门控：阻止在必填字段未填或页面有错误提示时点击 Next/Submit
+
+11.4 智能终止与容错
+•  最大步数限制（默认 50 步）
+•  连续 5 次操作失败自动停止
+•  二次验证完成状态：排除 Simplify 扩展误报，检查页面是否真的显示成功信息
+•  模型降级机制：遇到 429 Rate Limit 自动切换备选模型
+
+11.5 可观测性
+•  每步截图保存到 job 专属目录
+•  NDJSON trace 日志支持复盘
+•  数据库日志记录每步操作
+
+
+1️⃣2️⃣ 简历与用户信息管理 + 匹配决策细化
+
+12.1 数据结构（模型层大纲）
+•  resume.py
+  o 字段示意：
+    - id: int
+    - name: str                    # 简历名称，如 "后端（Python）"
+    - path: str                    # 文件路径
+    - tags: list[str]              # 技能/方向标签，如 ["backend", "python", "ml"]
+    - language: str                # 语言，如 "en", "zh"
+    - last_used_time: datetime
+•  user_profile.py
+  o 基本信息：
+    - name, email, phone, city, country, years_of_experience, education 等
+  o 可选问题模板：
+    - 为什么选择该公司（可模板化）
+    - 期望薪资范围
+    - 是否需要签证支持
+    - 可入职时间
+•  job_post.py
+  o id, company, title, link, jd_text, created_at 等
+
+12.2 简历选择策略
+•  规则 + LLM 混合模式：
+  o 规则层：
+    - 根据 JD 关键词（如 backend/frontend/data/ml）筛选候选简历集
+  o LLM 层：
+    - 输入：岗位 JD + 候选简历标签 + 项目经历摘要
+    - 输出：{"resume_id": ..., "confidence": 0.x, "reason": "...简要说明"} 
+•  UI 侧增强：
+  o 用户可以在添加岗位或编辑岗位时，强制指定使用某一份简历（覆盖自动选择）
+
+
+1️⃣3️⃣ 数据存储与日志记录扩展
+
+13.1 jobs 表补充字段
+在原有字段基础上，补充：
+•  status          # 状态机字段（见 9.1）
+•  manual_reason   # 需要人工处理的原因（验证码/登录失效等）
+
+13.2 logs / job_steps 表（可选但推荐）
+增加一张简单的步骤/日志表，例如 job_steps：
+•  id
+•  job_id
+•  step        # 如 "open_page", "simplify_autofill", "vision_agent_fill", "submit"
+•  status      # success / fail / info
+•  message     # 详细信息或错误提示
+•  created_at
+
+用途：
+•  快速排查某一岗位为什么失败或进入待处理
+•  分析 Simplify 与 Vision AI Agent 的成功率，为后续优化提供依据
+
+13.3 文件日志
+•  Vision AI Agent 每次运行生成 NDJSON trace 日志（agent_trace_job_{id}_{timestamp}.ndjson）
+•  记录每步操作的证据链：截图、LLM 输入输出、操作结果
+•  存放在 storage/logs/ 目录下，支持复盘与调试
+
+
+1️⃣4️⃣ 人工介入与恢复机制细化
+
+14.1 触发人工介入的典型场景
+•  出现验证码（图形验证码 / reCAPTCHA 等）
+•  手机短信验证 / 邮箱链接验证
+•  登录失效，需要重新登录
+•  系统风控阻断或风控问卷
+
+14.2 系统行为
+一旦检测到上述场景之一：
+1. 立即暂停本岗位自动流程（不再尝试填写/提交）
+2. 保存当前页面截图到 storage/screenshots/
+3. 更新 jobs 表：
+   •  status = manual_required
+   •  manual_reason = 具体原因
+4. 写入 job_logs 日志表
+5. UI 待处理列表中显示该岗位及对应的失败原因
+6. 调度器继续处理下一个 pending 岗位
+
+14.3 用户处理后的恢复策略
+•  用户自行解决登录/验证码等问题后，手动将岗位链接重新添加到待申请列表
+•  不提供自动恢复机制（manual_required → pending），避免复杂的断点续传逻辑
+
+
+1️⃣5️⃣ 配置文件（config.yaml）设计大纲
+
+15.1 LLM / 模型相关
+llm:
+  provider: "openai"         # 目前仅支持 OpenAI（因视觉图片输入格式要求）
+  model: "gpt-4o"            # 默认模型：最佳视觉理解
+  max_tokens: 4096
+  temperature: 0.1
+  fallback_models:           # 模型降级列表（遇到 429 Rate Limit 时自动切换）
+    - "gpt-4o"
+    - "gpt-4o-2024-11-20"
+    - "gpt-4.1"
+    - "gpt-4.1-mini"
+    - "gpt-4o-mini"
+
+15.2 浏览器配置
+browser:
+  headless: false           # MVP 建议默认 false，便于肉眼观察
+  slow_mo: 200              # 每步操作延时，方便观察
+
+vision_agent:
+  max_steps: 50                # Agent 最大操作步数
+  max_consecutive_failures: 5  # 连续失败终止阈值
+
+15.3 Simplify 配置
+simplify:
+  enabled: true
+  text:
+    complete: "Autofill complete!"
+  timeout_seconds: 25
+# 注：实际检测使用文本匹配（"Autofill this page"等），不依赖 CSS 选择器
+
+15.4 存储相关
+storage:
+  resume_dir: "./autojobagent/storage/resumes"
+  uploads_dir: "./autojobagent/storage/uploads"
+  logs_dir: "./autojobagent/storage/logs"
+
+15.5 安全与权限边界约定
+•  程序只在 storage.resume_dir / uploads_dir / logs_dir 范围内读写文件
+•  上传文件仅从 resume_dir / uploads_dir 中选择
+•  不主动访问或修改用户其他目录
+
+
+1️⃣6️⃣ MVP 实施阶段划分（便于快速落地）
+
+阶段 0（v0：最小闭环，本地命令行）
+•  目标：在一个主力招聘站点上，通过命令行输入单个岗位链接 + 指定简历，实现一次成功投递
+•  范围：
+  o 不需要 Web UI
+  o 只实现核心自动投递流程（Playwright + Vision AI Agent + Simplify 集成）
+  o 结果写入 SQLite
+
+阶段 1（v1：Web UI + 队列管理）
+•  目标：实现当前文档中完整的 autojobagent 目录结构与 Web UI
+•  范围：
+  o Web UI：添加岗位、查看列表、查看状态、一键开始/暂停
+  o 调度器：单线程队列 + 状态机
+  o 数据库存储：jobs 表 + 基础日志
+  o 人工介入机制基础版本
+
+阶段 2（v1.x：体验优化与站点扩展）
+•  优化：
+  o 简历匹配策略优化
+  o 不同站点常见问题的规则化补丁
+  o 日志与失败原因可视化
+•  扩展：
+  o 支持更多招聘网站和不同页面结构
+  o 增加配置项以更好适配各站点
+
+阶段 3（后续：自动搜岗、多线程、云端等）
+•  引入自动全网岗位搜索
+•  多线程/多进程并发投递
+•  数据分析与统计报表
+•  多用户与云端部署（若有需要）
+

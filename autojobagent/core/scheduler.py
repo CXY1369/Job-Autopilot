@@ -86,7 +86,7 @@ class JobScheduler:
         """
         调用自动投递执行模块处理一个岗位。
         """
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         result = apply_for_job(job)
         
@@ -95,19 +95,24 @@ class JobScheduler:
             db_job = session.get(JobPost, job.id)
             if not db_job:
                 return
+            if result.resume_used:
+                db_job.resume_used = result.resume_used
             if result.success:
                 db_job.status = JobStatus.APPLIED
                 db_job.fail_reason = None
+                db_job.manual_reason = None
                 print(f"[job={job.id}] ✓ 状态更新为: APPLIED")
             elif result.manual_required:
                 db_job.status = JobStatus.MANUAL_REQUIRED
+                db_job.fail_reason = None
                 db_job.manual_reason = result.manual_reason
                 print(f"[job={job.id}] ⚠ 状态更新为: MANUAL_REQUIRED")
             else:
                 db_job.status = JobStatus.FAILED
                 db_job.fail_reason = result.fail_reason
+                db_job.manual_reason = None
                 print(f"[job={job.id}] ❌ 状态更新为: FAILED")
-            db_job.apply_time = datetime.utcnow()
+            db_job.apply_time = datetime.now(timezone.utc)
             session.add(db_job)
             # get_session() 会自动 commit
 

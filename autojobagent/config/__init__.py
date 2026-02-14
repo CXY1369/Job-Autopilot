@@ -4,9 +4,8 @@ Configuration module for loading user profile and settings.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import yaml
 
@@ -15,6 +14,9 @@ import yaml
 CONFIG_DIR = Path(__file__).parent
 USER_PROFILE_PATH = CONFIG_DIR / "user_profile.yaml"
 AGENT_GUIDELINES_PATH = CONFIG_DIR / "agent_guidelines.md"
+PROJECT_RESUME_VARIANTS_DIR = (
+    CONFIG_DIR.parent / "storage" / "resumes" / "variants"
+)
 
 
 _user_profile_cache: Optional[dict] = None
@@ -74,10 +76,6 @@ def get_user_info_for_prompt() -> str:
     # 当前位置
     current_city = location.get('current_city', '')
     current_full = location.get('full_location', '')
-    
-    # 偏好工作位置（取前3个）
-    preferred_locs = work_pref.get('preferred_locations', [])[:3]
-    preferred_str = ", ".join(preferred_locs) if preferred_locs else "同当前位置"
     
     info = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -219,6 +217,37 @@ def get_allowed_upload_directories() -> list[str]:
     return files_config.get("allowed_directories", [])
 
 
+def ensure_project_resume_variants_dir() -> str:
+    """
+    Ensure the default project resume variants directory exists.
+    """
+    PROJECT_RESUME_VARIANTS_DIR.mkdir(parents=True, exist_ok=True)
+    return str(PROJECT_RESUME_VARIANTS_DIR.resolve())
+
+
+def get_effective_upload_directories() -> list[str]:
+    """
+    Build effective upload directory list:
+    - user-configured whitelist directories
+    - default project resume variants directory
+    """
+    dirs: list[str] = []
+    dirs.extend(get_allowed_upload_directories())
+    dirs.append(ensure_project_resume_variants_dir())
+
+    # 去重并保持顺序
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in dirs:
+        if not raw:
+            continue
+        if raw in seen:
+            continue
+        seen.add(raw)
+        result.append(raw)
+    return result
+
+
 def get_default_resume_path() -> str:
     """
     Get the default resume file path.
@@ -229,6 +258,114 @@ def get_default_resume_path() -> str:
     profile = load_user_profile()
     files_config = profile.get("files", {})
     return files_config.get("default_resume", "")
+
+
+def is_upload_path_allowed(file_path: str) -> bool:
+    """
+    检查文件路径是否位于白名单目录内。
+    """
+    if not file_path:
+        return False
+
+    try:
+        candidate = Path(file_path).expanduser().resolve()
+    except Exception:
+        return False
+
+    allowed_dirs = get_effective_upload_directories()
+    for raw_dir in allowed_dirs:
+        try:
+            root = Path(raw_dir).expanduser().resolve()
+        except Exception:
+            continue
+        if candidate == root or root in candidate.parents:
+            return True
+    return False
+
+
+def list_upload_candidates(max_files: int = 30) -> list[str]:
+    """
+    从白名单目录扫描可上传候选文件（pdf/doc/docx），按修改时间倒序返回。
+    """
+    exts = {".pdf", ".doc", ".docx"}
+    allowed_dirs = get_effective_upload_directories()
+    candidates: list[Path] = []
+
+    for raw_dir in allowed_dirs:
+        try:
+            root = Path(raw_dir).expanduser().resolve()
+        except Exception:
+            continue
+        if not root.exists() or not root.is_dir():
+            continue
+
+        try:
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() not in exts:
+                    continue
+                # 双重校验，确保 rglob 结果仍在白名单范围内
+                if not is_upload_path_allowed(str(path)):
+                    continue
+                candidates.append(path)
+        except Exception:
+            continue
+
+    # 去重并按修改时间倒序
+    unique_map: dict[str, Path] = {}
+    for p in candidates:
+        unique_map[str(p)] = p
+    deduped = list(unique_map.values())
+    deduped.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return [str(p) for p in deduped[:max_files]]
+
+
+def resolve_upload_candidate(
+    requested_value: str | None,
+    candidates: list[str],
+) -> list[str]:
+    """
+    将 LLM 提供的 value 解析为候选文件优先序列。
+    - 支持完整路径匹配
+    - 支持按文件名（basename）匹配
+    - 若无匹配，返回原候选顺序
+    """
+    if not candidates:
+        return []
+
+    if not requested_value:
+        return list(candidates)
+
+    req = requested_value.strip()
+    if not req:
+        return list(candidates)
+
+    # 1) 完整路径精确匹配（规范化后）
+    try:
+        req_resolved = str(Path(req).expanduser().resolve())
+    except Exception:
+        req_resolved = req
+
+    by_path = [c for c in candidates if str(Path(c).expanduser().resolve()) == req_resolved]
+    if by_path:
+        first = by_path[0]
+        return [first] + [c for c in candidates if c != first]
+
+    # 2) 按文件名匹配
+    req_lower = Path(req).name.lower()
+    by_name = [c for c in candidates if Path(c).name.lower() == req_lower]
+    if by_name:
+        first = by_name[0]
+        return [first] + [c for c in candidates if c != first]
+
+    # 3) 按包含关系进行模糊匹配
+    fuzzy = [c for c in candidates if req_lower in Path(c).name.lower()]
+    if fuzzy:
+        first = fuzzy[0]
+        return [first] + [c for c in candidates if c != first]
+
+    return list(candidates)
 
 
 def load_agent_guidelines(force_reload: bool = False) -> str:

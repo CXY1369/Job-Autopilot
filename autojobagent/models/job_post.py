@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 from sqlalchemy import String, Integer, DateTime, Enum as SQLEnum, Text
@@ -37,7 +37,7 @@ class JobPost(Base):
     fail_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     manual_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     create_time: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
     apply_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 

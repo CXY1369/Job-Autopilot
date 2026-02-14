@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Optional
 
 from playwright.sync_api import Page
 

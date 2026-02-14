@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Integer, Text, DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column
@@ -20,7 +20,7 @@ class JobLog(Base):
     level: Mapped[str] = mapped_column(String(16), default="info", nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     create_time: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
     def to_dict(self) -> dict:
