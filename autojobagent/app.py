@@ -1,9 +1,11 @@
 from contextlib import asynccontextmanager
+from html import unescape
 from pathlib import Path
 import time
 import os
 import re
 import yaml
+import httpx
 from openai import OpenAI
 
 from fastapi import FastAPI
@@ -35,6 +37,7 @@ app = FastAPI(title="Job Autopilot - Auto Application Agent", lifespan=lifespan)
 _login_session: BrowserSession | None = None
 _llm_health_cache: dict | None = None
 _RESUME_MATCH_LOG_RE = re.compile(r"score=(\d+),\s*reason=(.*)\)$")
+_HTML_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 
 def _load_config() -> dict:
@@ -51,6 +54,70 @@ def _save_config(cfg: dict) -> None:
         yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True),
         encoding="utf-8",
     )
+
+
+def _clean_html_text(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    text = re.sub(r"\s+", " ", unescape(raw)).strip()
+    return text or None
+
+
+def _extract_meta_content(html: str, key: str) -> str | None:
+    pattern = re.compile(
+        rf'<meta[^>]+(?:property|name)\s*=\s*["\']{re.escape(key)}["\'][^>]*content\s*=\s*["\'](.*?)["\']',
+        re.IGNORECASE | re.DOTALL,
+    )
+    m = pattern.search(html)
+    if not m:
+        return None
+    return _clean_html_text(m.group(1))
+
+
+def _fetch_job_meta_from_link(link: str) -> tuple[str | None, str | None]:
+    """
+    Best-effort metadata extraction from a job URL.
+    - title: prefers og:title, fallback to <title>
+    - company: prefers og:site_name/application-name, fallback lightweight title heuristic
+    """
+    try:
+        resp = httpx.get(
+            link,
+            timeout=8.0,
+            follow_redirects=True,
+            headers={"User-Agent": "JobAutopilot/1.0 (+metadata-fetch)"},
+        )
+    except Exception:
+        return None, None
+
+    if resp.status_code >= 400 or not resp.text:
+        return None, None
+
+    html = resp.text
+    title = _extract_meta_content(html, "og:title")
+    if not title:
+        m = _HTML_TITLE_RE.search(html)
+        title = _clean_html_text(m.group(1)) if m else None
+
+    company = (
+        _extract_meta_content(html, "og:site_name")
+        or _extract_meta_content(html, "application-name")
+        or _extract_meta_content(html, "twitter:site")
+    )
+
+    # lightweight fallback: "Role - Company" / "Role | Company" / "Role at Company"
+    if title and not company:
+        for sep in [" - ", " | ", " at "]:
+            if sep in title:
+                left, right = title.split(sep, 1)
+                left = _clean_html_text(left)
+                right = _clean_html_text(right)
+                if sep == " at ":
+                    return left or title, right
+                if left and right and len(right.split()) <= 6:
+                    return left, right
+                break
+    return title, company
 
 
 app.add_middleware(
@@ -151,9 +218,18 @@ def add_job(payload: dict):
     if not link:
         return {"ok": False, "error": "link is required"}
 
+    title = payload.get("title", "").strip()
+    company = payload.get("company", "").strip()
+    if not title or not company:
+        fetched_title, fetched_company = _fetch_job_meta_from_link(link)
+        if not title and fetched_title:
+            title = fetched_title
+        if not company and fetched_company:
+            company = fetched_company
+
     job = JobPost(
-        company=payload.get("company", "").strip() or None,
-        title=payload.get("title", "").strip() or None,
+        company=company or None,
+        title=title or None,
         link=link,
         status=JobStatus.PENDING,
     )
