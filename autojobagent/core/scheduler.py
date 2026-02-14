@@ -89,7 +89,7 @@ class JobScheduler:
         from datetime import datetime, timezone
 
         result = apply_for_job(job)
-        
+
         # 使用 get_session() 确保自动 commit
         with get_session() as session:
             db_job = session.get(JobPost, job.id)
@@ -119,5 +119,3 @@ class JobScheduler:
 
 # 全局单例调度器（MVP 简化处理）
 scheduler = JobScheduler()
-
-

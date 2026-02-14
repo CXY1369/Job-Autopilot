@@ -47,4 +47,3 @@ def test_scheduler_fetch_and_process_failed_job(monkeypatch, isolated_db):
         assert db_job.manual_reason is None
         assert db_job.resume_used == "/tmp/alex_backend_resume.pdf"
         assert db_job.apply_time is not None
-

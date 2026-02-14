@@ -46,5 +46,3 @@ def get_session():
         raise
     finally:
         session.close()
-
-

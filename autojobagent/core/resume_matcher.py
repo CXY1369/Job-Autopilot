@@ -135,7 +135,10 @@ Return JSON only:
         score = int(data.get("score", 0))
         reason = str(data.get("reason", "")).strip() or "llm selected"
         if best_index < 1 or best_index > len(candidates):
-            log("resume matching: llm best_index out of range, fallback to heuristic", "warn")
+            log(
+                "resume matching: llm best_index out of range, fallback to heuristic",
+                "warn",
+            )
             return None
 
         chosen = candidates[best_index - 1]
@@ -210,4 +213,3 @@ def _safe_parse_json(raw: str) -> dict | None:
         except Exception:
             pass
     return None
-

@@ -48,9 +48,10 @@ def isolated_db(monkeypatch, tmp_path):
 
     # patch modules that imported these symbols directly
     monkeypatch.setattr(app_module, "get_session", testing_get_session, raising=True)
-    monkeypatch.setattr(scheduler_module, "get_session", testing_get_session, raising=True)
+    monkeypatch.setattr(
+        scheduler_module, "get_session", testing_get_session, raising=True
+    )
 
     # create tables after patching engine/session factory
     Base.metadata.create_all(bind=test_engine)
     return TestingSessionLocal
-

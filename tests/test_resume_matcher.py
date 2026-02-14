@@ -55,4 +55,3 @@ def test_choose_best_resume_llm_error_falls_back_to_heuristic(monkeypatch):
     assert result.reason == "heuristic filename keyword overlap"
     assert result.score >= 55
     assert result.candidates_count == 2
-

@@ -47,12 +47,12 @@ class JobPost(Base):
             "company": self.company,
             "title": self.title,
             "link": self.link,
-            "status": self.status.value if isinstance(self.status, JobStatus) else self.status,
+            "status": self.status.value
+            if isinstance(self.status, JobStatus)
+            else self.status,
             "resume_used": self.resume_used,
             "fail_reason": self.fail_reason,
             "manual_reason": self.manual_reason,
             "create_time": self.create_time.isoformat() if self.create_time else None,
             "apply_time": self.apply_time.isoformat() if self.apply_time else None,
         }
-
-

@@ -32,7 +32,9 @@ def run_simplify(page: Page, config: Optional[SimplifyConfig] = None) -> Simplif
     """
     cfg = config or SimplifyConfig()
     if not cfg.enabled:
-        return SimplifyResult(found=False, autofilled=False, message="Simplify disabled")
+        return SimplifyResult(
+            found=False, autofilled=False, message="Simplify disabled"
+        )
 
     deadline = time.time() + cfg.timeout_ms / 1000
     clicked = False
@@ -93,7 +95,9 @@ def run_simplify(page: Page, config: Optional[SimplifyConfig] = None) -> Simplif
                 observations.append(f"banner_check_error:{type(e).__name__}")
 
             try:
-                again_btn = frame.get_by_text("Autofill this page again", exact=False).first
+                again_btn = frame.get_by_text(
+                    "Autofill this page again", exact=False
+                ).first
                 if again_btn and again_btn.is_visible():
                     observations.append("button_became_again")
                     return SimplifyResult(
@@ -178,7 +182,10 @@ def run_simplify(page: Page, config: Optional[SimplifyConfig] = None) -> Simplif
         page.wait_for_timeout(cfg.poll_interval_ms)
 
     # 兜底：即便超时，也根据观测到的 again/complete 决定 autofilled
-    if "button_became_again" in observations or "complete_banner_visible" in observations:
+    if (
+        "button_became_again" in observations
+        or "complete_banner_visible" in observations
+    ):
         return SimplifyResult(
             found=True,
             autofilled=True,

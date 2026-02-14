@@ -43,7 +43,7 @@ class ApplyResult:
 def apply_for_job(job: JobPost) -> ApplyResult:
     """
     Playwright + Simplify + AI Agent 的单岗位执行流程。
-    
+
     核心理念：让 AI 像人类一样操作浏览器，不写死逻辑。
     """
     _log(job.id, "=" * 50)
@@ -55,7 +55,9 @@ def apply_for_job(job: JobPost) -> ApplyResult:
 
     session = None
     try:
-        manager = BrowserManager(log_fn=lambda msg, level="info": _log(job.id, msg, level))
+        manager = BrowserManager(
+            log_fn=lambda msg, level="info": _log(job.id, msg, level)
+        )
         session = manager.launch()
         page = session.page
 
@@ -104,13 +106,15 @@ def apply_for_job(job: JobPost) -> ApplyResult:
                 _log(job.id, "✓ Simplify 填表完成")
             else:
                 _log(job.id, f"⚠ Simplify: {simplify_result.message}", "warn")
-            
+
             # 等待 Simplify 完成
             page.wait_for_timeout(1000)
 
         # 3. AI Agent 接管
         _log(job.id, "\n--- 步骤 3: AI Agent 智能操作 ---")
-        _log(job.id, "AI Agent 已启用：上传白名单校验 + 前进门控（避免盲点 Next/Submit）")
+        _log(
+            job.id, "AI Agent 已启用：上传白名单校验 + 前进门控（避免盲点 Next/Submit）"
+        )
         agent_success = run_browser_agent(page, job)  # 使用默认 max_steps=50
 
         # 4. 保存最终页面截图
@@ -120,10 +124,10 @@ def apply_for_job(job: JobPost) -> ApplyResult:
             _log(job.id, f"✓ 截图已保存: {screenshot_path}")
         else:
             _log(job.id, "⚠ 截图保存失败", "warn")
-        
+
         # 5. 结果处理
         _log(job.id, "\n--- 结果 ---")
-        
+
         if agent_success:
             _log(job.id, "✓ 投递成功！")
             _log(job.id, "等待 5 秒后关闭页面...")
@@ -173,26 +177,26 @@ def _log(job_id: int, message: str, level: str = "info") -> None:
 def _save_final_screenshot(page: Page, job_id: int) -> Optional[str]:
     """
     保存最终页面截图。
-    
+
     Args:
         page: Playwright Page 对象
         job_id: 岗位 ID
-        
+
     Returns:
         截图文件路径，失败则返回 None
     """
     try:
         # 确保目录存在
         SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        
+
         # 生成文件名：job_{id}_{timestamp}.png
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"job_{job_id}_{timestamp}.png"
         filepath = SCREENSHOTS_DIR / filename
-        
+
         # 保存全页截图
         page.screenshot(path=str(filepath), full_page=True)
-        
+
         return str(filepath)
     except Exception as e:
         print(f"[job={job_id}] [ERROR] 截图保存失败: {e}")
@@ -210,5 +214,3 @@ def _persist_job_resume_used(job_id: int, resume_path: str) -> None:
         db_job.resume_used = resume_path
         session.add(db_job)
         session.commit()
-
-

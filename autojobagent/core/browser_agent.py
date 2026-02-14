@@ -66,5 +66,3 @@ class BrowserAgent:
             "manual_reason": None,
             "resume_used": resume.name if resume else None,
         }
-
-

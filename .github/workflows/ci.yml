@@ -19,7 +19,7 @@ on:
 
 jobs:
   lint:
-    name: Lint (Ruff + Black)
+    name: Lint (Ruff)
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -35,13 +35,13 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install ruff black
+          pip install ruff
 
       - name: Run Ruff
         run: ruff check autojobagent tests
 
-      - name: Run Black (check mode)
-        run: black --check autojobagent tests
+      - name: Run Ruff Format Check
+        run: ruff format --check autojobagent tests
 
   core-tests:
     name: Core Tests (Fast Gate)

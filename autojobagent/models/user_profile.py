@@ -30,7 +30,10 @@ class UserProfile(Base):
     )
 
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
 
     def to_dict(self) -> dict:
@@ -46,5 +49,3 @@ class UserProfile(Base):
             "templates": self.templates,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
-
-

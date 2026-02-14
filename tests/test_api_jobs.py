@@ -78,4 +78,3 @@ def test_clear_manual_and_failed_via_two_calls(isolated_db):
     remaining = r3.json()
     assert len(remaining) == 1
     assert remaining[0]["status"] == "pending"
-

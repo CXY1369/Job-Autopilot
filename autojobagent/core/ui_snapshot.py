@@ -96,7 +96,13 @@ def build_ui_snapshot(
                 if not el.is_visible(timeout=100):
                     continue
                 meta = _describe(el)
-                name = meta.get("label") or meta.get("aria") or meta.get("text") or meta.get("placeholder") or meta.get("name")
+                name = (
+                    meta.get("label")
+                    or meta.get("aria")
+                    or meta.get("text")
+                    or meta.get("placeholder")
+                    or meta.get("name")
+                )
                 name = (name or "").strip()
                 if not name:
                     continue
@@ -172,7 +178,9 @@ def build_ui_snapshot(
     for item in items:
         type_hint = f", type={item.input_type}" if item.input_type else ""
         req_hint = ", required" if item.required else ""
-        snapshot_lines.append(f"{item.ref} | role={item.role}{type_hint}{req_hint} | name={item.name}")
+        snapshot_lines.append(
+            f"{item.ref} | role={item.role}{type_hint}{req_hint} | name={item.name}"
+        )
 
     snapshot_text = "\n".join(snapshot_lines) if snapshot_lines else "（无可交互元素）"
     return snapshot_text, ref_map

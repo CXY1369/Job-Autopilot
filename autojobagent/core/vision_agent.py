@@ -49,13 +49,13 @@ DEBUG_LOG_PATH = DEBUG_LOG_DIR / "vision_agent.ndjson"
 
 
 DEFAULT_FALLBACK_MODELS = [
-    "gpt-4o",           # 默认模型：最佳视觉理解
-    "gpt-4o-2024-11-20", # 最新版本
-    "gpt-4.1",          # 新一代模型
-    "gpt-4.1-mini",     # 轻量版
-    "gpt-5-mini",       # 实验版
-    "gpt-4-turbo",      # 稳定后备
-    "gpt-4o-mini",      # 最后备选
+    "gpt-4o",  # 默认模型：最佳视觉理解
+    "gpt-4o-2024-11-20",  # 最新版本
+    "gpt-4.1",  # 新一代模型
+    "gpt-4.1-mini",  # 轻量版
+    "gpt-5-mini",  # 实验版
+    "gpt-4-turbo",  # 稳定后备
+    "gpt-4o-mini",  # 最后备选
 ]
 
 # 截图压缩配置
@@ -66,17 +66,21 @@ SCREENSHOT_JPEG_QUALITY = 75  # JPEG 质量（0-100），75 是清晰度和体�
 @dataclass
 class AgentAction:
     """单个操作"""
+
     action: str  # click, fill, type, select, upload, scroll, wait, done, stuck
     ref: Optional[str] = None  # 目标元素 ref（优先）
     selector: Optional[str] = None  # 目标元素的文本/描述
     value: Optional[str] = None  # 填入的值
-    element_type: Optional[str] = None  # 元素类型：button, link, checkbox, radio, input, option, text
+    element_type: Optional[str] = (
+        None  # 元素类型：button, link, checkbox, radio, input, option, text
+    )
     reason: Optional[str] = None  # 为什么这样做
 
 
 @dataclass
 class AgentState:
     """Agent 当前状态"""
+
     status: Literal["continue", "done", "stuck", "error"]
     summary: str  # 当前页面状态描述
     next_action: Optional[AgentAction] = None
@@ -86,14 +90,14 @@ class AgentState:
 class BrowserAgent:
     """
     像人类一样操作浏览器的 AI Agent。
-    
+
     核心能力：
     - 观察：截图 + 获取页面文本
     - 思考：让 LLM 分析状态并决定下一步
     - 行动：执行点击、填写、滚动等基本操作
     - 循环：不断重复直到任务完成或放弃
     """
-    
+
     def __init__(self, page: Page, job, max_steps: int = 50):
         self.page = page
         self.job = job
@@ -101,11 +105,11 @@ class BrowserAgent:
         self.max_steps = max_steps
         self.step_count = 0
         self.history: list[str] = []  # 操作历史，帮助 LLM 避免重复
-        
+
         # OpenAI 客户端
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.client = OpenAI(api_key=self.api_key) if self.api_key else None
-        
+
         settings = BrowserManager()._load_settings()
         self.llm_cfg = settings.get("llm", {})
         fallback_models = self.llm_cfg.get("fallback_models") or DEFAULT_FALLBACK_MODELS
@@ -113,20 +117,24 @@ class BrowserAgent:
             fallback_models = DEFAULT_FALLBACK_MODELS
         preferred_model = self.llm_cfg.get("model")
         if preferred_model and preferred_model in fallback_models:
-            fallback_models = [preferred_model] + [m for m in fallback_models if m != preferred_model]
+            fallback_models = [preferred_model] + [
+                m for m in fallback_models if m != preferred_model
+            ]
         self.fallback_models = fallback_models
         # 默认首选 GPT-4o
         self.model_index = 0
         self.model = self.fallback_models[self.model_index]
-        
+
         # 创建 job 专属截图目录
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.screenshot_dir = STORAGE_DIR / f"job_{self.job_id}_{timestamp}"
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self._last_screenshot_bytes: bytes = b""  # 缓存最近一次截图用于保存
         TRACE_DIR.mkdir(parents=True, exist_ok=True)
-        self.trace_path = TRACE_DIR / f"agent_trace_job_{self.job_id}_{timestamp}.ndjson"
-        
+        self.trace_path = (
+            TRACE_DIR / f"agent_trace_job_{self.job_id}_{timestamp}.ndjson"
+        )
+
         # 智能终止机制
         self.consecutive_failures = 0  # 连续失败计数
         self.max_consecutive_failures = 5  # 连续失败阈值
@@ -136,7 +144,7 @@ class BrowserAgent:
         self.preferred_resume_path: str | None = getattr(job, "resume_used", None)
         self._last_upload_signals: list[str] = []
 
-    #region agent log
+    # region agent log
     def _ndjson_log(self, hypothesis_id: str, location: str, message: str, data: dict):
         """轻量级调试日志，写入 NDJSON 文件。"""
         payload = {
@@ -154,40 +162,41 @@ class BrowserAgent:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             pass
-    #endregion
-    
+
+    # endregion
+
     def run(self) -> bool:
         """
         运行 Agent 主循环，返回是否成功完成任务。
         """
         self._log("========== AI Agent 开始运行 ==========")
         self._log(f"最大步数: {self.max_steps}")
-        
+
         if not self.client:
             self._log("❌ OPENAI_API_KEY 未设置，无法运行 Agent", "error")
             return False
-        
+
         while self.step_count < self.max_steps:
             self.step_count += 1
             self._log(f"\n--- 第 {self.step_count} 步 ---")
-            
+
             # 1. 观察
             state = self._observe_and_think()
-            
+
             if state.status == "error":
                 self._log(f"❌ 观察/思考出错: {state.summary}", "error")
                 continue
-            
+
             # 2. 记录 LLM 的分析
             self._log(f"📋 状态: {state.summary}")
-            
+
             # 3. 检查是否完成（带二次验证）
             if state.status == "done":
                 self._log("🔍 Agent 判断任务完成，进行二次验证...")
-                
+
                 # 二次验证：检查页面是否真的显示成功信息
                 is_really_done, verification_msg = self._verify_completion()
-                
+
                 if is_really_done:
                     self._log(f"✓ 二次验证通过: {verification_msg}")
                     self._log("========== AI Agent 运行结束 ==========")
@@ -197,67 +206,82 @@ class BrowserAgent:
                     self._log("   继续执行，可能还有未完成的步骤...")
                     # 不返回，继续循环
                     continue
-            
+
             if state.status == "stuck":
                 self._log("⚠ Agent 判断无法继续，需要人工介入", "warn")
                 self._log("========== AI Agent 运行结束 ==========")
                 return False
-            
+
             # 4. 执行下一步操作
             if state.next_action:
                 action = state.next_action
                 elem_info = f"[{action.element_type}]" if action.element_type else ""
                 ref_info = f"(ref={action.ref}) " if action.ref else ""
-                self._log(f"🎯 计划: {action.action} {ref_info}{elem_info} {action.selector or ''} {action.value or ''}")
+                self._log(
+                    f"🎯 计划: {action.action} {ref_info}{elem_info} {action.selector or ''} {action.value or ''}"
+                )
                 if action.reason:
                     self._log(f"   原因: {action.reason}")
-                
+
                 success = self._execute_action(action)
-                
+
                 # 记录到历史（让 AI 能看到操作结果，从而调整策略）
                 target_desc = action.ref or (action.selector or "")
                 action_desc = f"{action.action}({target_desc}"
                 if action.value:
                     action_desc += f", {action.value}"
                 action_desc += ")"
-                
+
                 if success:
-                    self.history.append(f"步骤{self.step_count}: {action_desc} ✓ [请检查截图确认是否正确生效]")
+                    self.history.append(
+                        f"步骤{self.step_count}: {action_desc} ✓ [请检查截图确认是否正确生效]"
+                    )
                     self.consecutive_failures = 0  # 重置连续失败计数
                 else:
-                    self.history.append(f"步骤{self.step_count}: {action_desc} ✗失败 [操作未成功，可能需要换方法]")
+                    self.history.append(
+                        f"步骤{self.step_count}: {action_desc} ✗失败 [操作未成功，可能需要换方法]"
+                    )
                     self.consecutive_failures += 1  # 增加连续失败计数
-                
+
                 if success:
                     self._log("   ✓ 执行成功")
                 else:
-                    self._log(f"   ❌ 执行失败 (连续失败: {self.consecutive_failures}/{self.max_consecutive_failures})", "warn")
+                    self._log(
+                        f"   ❌ 执行失败 (连续失败: {self.consecutive_failures}/{self.max_consecutive_failures})",
+                        "warn",
+                    )
                     # 保存失败截图（带 _failed 后缀）
                     try:
                         failed_screenshot = self.page.screenshot(full_page=True)
                         failed_compressed = self._compress_screenshot(failed_screenshot)
-                        failed_path = self.screenshot_dir / f"step_{self.step_count:02d}_failed.jpg"
+                        failed_path = (
+                            self.screenshot_dir
+                            / f"step_{self.step_count:02d}_failed.jpg"
+                        )
                         failed_path.write_bytes(failed_compressed)
                         self._log(f"   💾 失败截图: {failed_path.name}")
                     except Exception:
                         pass
-                    
+
                     # 智能终止：连续失败次数过多
                     if self.consecutive_failures >= self.max_consecutive_failures:
-                        self._log(f"⚠ 连续 {self.consecutive_failures} 次操作失败，停止执行", "warn")
+                        self._log(
+                            f"⚠ 连续 {self.consecutive_failures} 次操作失败，停止执行",
+                            "warn",
+                        )
                         self._log("========== AI Agent 运行结束（智能终止）==========")
                         return False
-                
+
                 # 等待页面响应后立即截图（让 AI 看到实时变化）
                 # 短暂等待让页面 UI 更新（如下拉框出现）
                 self.page.wait_for_timeout(500)
             else:
                 self._log("⚠ LLM 没有给出下一步操作", "warn")
-        
+
         self._log(f"⚠ 已达到最大步数 {self.max_steps}，停止执行", "warn")
         self._log("========== AI Agent 运行结束 ==========")
         return False
-    
+
     def _observe_and_think(self) -> AgentState:
         """
         观察当前页面状态，让 LLM 思考下一步。
@@ -267,24 +291,28 @@ class BrowserAgent:
         try:
             png_bytes = self.page.screenshot(full_page=True)
             original_size = len(png_bytes) / 1024
-            
+
             # 压缩截图：PNG → JPEG，并限制宽度
             compressed_bytes = self._compress_screenshot(png_bytes)
             screenshot_b64 = base64.b64encode(compressed_bytes).decode("utf-8")
             compressed_size = len(compressed_bytes) / 1024
-            
+
             # 保存截图到 job 专属目录
             self._last_screenshot_bytes = compressed_bytes
             screenshot_path = self.screenshot_dir / f"step_{self.step_count:02d}.jpg"
             screenshot_path.write_bytes(compressed_bytes)
-            
-            ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
-            self._log(f"📸 截图成功: {original_size:.1f} KB → {compressed_size:.1f} KB (压缩 {ratio:.0f}%)")
+
+            ratio = (
+                (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
+            )
+            self._log(
+                f"📸 截图成功: {original_size:.1f} KB → {compressed_size:.1f} KB (压缩 {ratio:.0f}%)"
+            )
             self._log(f"   💾 已保存: {screenshot_path.name}")
         except Exception as e:
             self._log(f"❌ 截图失败: {e}", "error")
             return AgentState(status="error", summary=f"截图失败: {e}")
-        
+
         # 2. 获取页面文本
         try:
             visible_text = self.page.inner_text("body")[:5000]
@@ -305,13 +333,13 @@ class BrowserAgent:
                 status="stuck",
                 summary="检测到登录/验证码/身份验证页面，需要人工处理",
             )
-        
+
         # 3. 获取页面 URL 并检测页面变化
         try:
             current_url = self.page.url
         except Exception:
             current_url = "unknown"
-        
+
         # 页面变化检测：URL 变化时重置状态并标记
         is_new_page = False
         if self.last_url is not None and self.last_url != current_url:
@@ -320,14 +348,15 @@ class BrowserAgent:
             self.history.append("[页面跳转] 新页面，需要重新扫描空缺字段并规划")
             self.consecutive_failures = 0  # 重置连续失败计数
         self.last_url = current_url
-        
+
         # 3.5 记录快照用于复盘
         self._step_log(
             event="snapshot",
             payload={
                 "step": self.step_count,
                 "url": current_url,
-                "snapshot_lines": snapshot_text.count("\n") + (1 if snapshot_text else 0),
+                "snapshot_lines": snapshot_text.count("\n")
+                + (1 if snapshot_text else 0),
                 "snapshot_preview": snapshot_text[:2000],
             },
         )
@@ -342,11 +371,11 @@ class BrowserAgent:
             if self.upload_candidates
             else "- （白名单目录下暂无可上传文件）"
         )
-        
+
         # 获取用户个人信息和操作规范
         user_info = get_user_info_for_prompt()
         agent_guidelines = load_agent_guidelines()
-        
+
         system_prompt = f"""你是一个浏览器自动化 AI Agent，正在帮用户填写英文求职申请表单。
 
 ## ⚖️ 合规声明
@@ -510,7 +539,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 
         # 构建 user_prompt（根据是否是新页面调整引导）
         new_page_hint = "[新页面] " if is_new_page else ""
-        
+
         user_prompt = f"""历史:
 {history_text}
 
@@ -569,7 +598,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 
         # 5. 调用 LLM（带模型降级机制）
         self._log(f"🤔 正在思考... (模型: {self.model})")
-        
+
         messages = [
             {"role": "system", "content": system_prompt},
             {
@@ -578,12 +607,14 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                     {"type": "text", "text": user_prompt},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"},
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{screenshot_b64}"
+                        },
                     },
                 ],
             },
         ]
-        #region agent log
+        # region agent log
         self._ndjson_log(
             hypothesis_id="H1",
             location="vision_agent:_observe_and_think:before_llm",
@@ -597,7 +628,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 "upload_candidates_count": len(self.upload_candidates),
             },
         )
-        #endregion
+        # endregion
 
         raw = None
         while self.model_index < len(self.fallback_models):
@@ -610,7 +641,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                     messages=messages,
                 )
                 raw = completion.choices[0].message.content or ""
-                #region agent log
+                # region agent log
                 self._ndjson_log(
                     hypothesis_id="H2",
                     location="vision_agent:_observe_and_think:after_llm",
@@ -621,7 +652,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                         "raw_prefix": raw[:200],
                     },
                 )
-                #endregion
+                # endregion
                 break  # 成功则跳出
             except Exception as e:
                 error_str = str(e)
@@ -637,7 +668,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                         time.sleep(1)  # 短暂等待后重试
                     else:
                         self._log("❌ 所有模型都遇到速率限制，请稍后重试", "error")
-                        return AgentState(status="error", summary="所有模型都遇到速率限制")
+                        return AgentState(
+                            status="error", summary="所有模型都遇到速率限制"
+                        )
                 # 模型能力不匹配（如不支持图片输入）时也尝试回退到下一个模型
                 elif any(
                     kw in error_lower
@@ -652,7 +685,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                         "not found",
                     ]
                 ):
-                    self._log(f"⚠️ 模型 {self.model} 能力不匹配或不可用，尝试回退", "warn")
+                    self._log(
+                        f"⚠️ 模型 {self.model} 能力不匹配或不可用，尝试回退", "warn"
+                    )
                     self.model_index += 1
                     if self.model_index < len(self.fallback_models):
                         self.model = self.fallback_models[self.model_index]
@@ -660,19 +695,21 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                         time.sleep(1)
                     else:
                         self._log("❌ 所有候选模型都不支持当前请求", "error")
-                        return AgentState(status="error", summary="所有候选模型都不支持当前请求")
+                        return AgentState(
+                            status="error", summary="所有候选模型都不支持当前请求"
+                        )
                 else:
                     self._log(f"❌ LLM 调用失败: {e}", "error")
                     return AgentState(status="error", summary=f"LLM 调用失败: {e}")
-        
+
         if raw is None:
             return AgentState(status="error", summary="LLM 未返回结果")
-        
+
         # 6. 解析返回
         data = self._safe_parse_json(raw)
         if not data:
             self._log(f"❌ LLM 返回格式错误: {raw[:300]}", "error")
-            #region agent log
+            # region agent log
             self._ndjson_log(
                 hypothesis_id="H3",
                 location="vision_agent:_observe_and_think:parse_fail",
@@ -683,12 +720,14 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                     "raw_prefix": raw[:200],
                 },
             )
-            #endregion
-            return AgentState(status="error", summary="LLM 返回格式错误", raw_response=raw)
-        
+            # endregion
+            return AgentState(
+                status="error", summary="LLM 返回格式错误", raw_response=raw
+            )
+
         status = data.get("status", "continue")
         summary = data.get("summary", "")
-        
+
         next_action = None
         if status == "continue" and data.get("next_action"):
             act = data["next_action"]
@@ -700,14 +739,14 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 element_type=act.get("element_type"),
                 reason=act.get("reason"),
             )
-        
+
         return AgentState(
             status=status,
             summary=summary,
             next_action=next_action,
             raw_response=raw,
         )
-    
+
     def _execute_action(self, action: AgentAction) -> bool:
         """
         执行单个操作，返回是否成功。
@@ -725,35 +764,35 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                         self._log(f"⚠ 阻止盲目前进：{blocked_reason}", "warn")
                         return False
                 return self._smart_click(action.selector, action.element_type)
-            
+
             elif action.action == "fill":
                 return self._smart_fill(action.selector, action.value)
-            
+
             elif action.action == "type":
                 return self._smart_type(action.selector, action.value)
-            
+
             elif action.action == "select":
                 return self._do_select(action.selector, action.value)
 
             elif action.action == "upload":
                 return self._do_upload(action)
-            
+
             elif action.action == "scroll":
                 direction = action.value or action.selector or "down"
                 return self._do_scroll(direction)
-            
+
             elif action.action == "wait":
                 seconds = int(action.value or 2)
                 self.page.wait_for_timeout(seconds * 1000)
                 return True
-            
+
             elif action.action in ("done", "stuck"):
                 return True
-            
+
             else:
                 self._log(f"未知操作类型: {action.action}", "warn")
                 return False
-                
+
         except Exception as e:
             self._log(f"执行异常: {e}", "error")
             return False
@@ -778,20 +817,32 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                         return False
                 locator.click(timeout=1500)
                 if self._verify_ref_action_effect(action, locator, item):
-                    self._step_log("action_verify", {"action": action.action, "ref": action.ref, "ok": True})
+                    self._step_log(
+                        "action_verify",
+                        {"action": action.action, "ref": action.ref, "ok": True},
+                    )
                     return True
                 ok = self._retry_ref_action(action, locator, item)
-                self._step_log("action_verify", {"action": action.action, "ref": action.ref, "ok": ok})
+                self._step_log(
+                    "action_verify",
+                    {"action": action.action, "ref": action.ref, "ok": ok},
+                )
                 return ok
             if action.action == "fill":
                 if action.value is None:
                     return False
                 locator.fill(str(action.value), timeout=1500)
                 if self._verify_ref_action_effect(action, locator, item):
-                    self._step_log("action_verify", {"action": action.action, "ref": action.ref, "ok": True})
+                    self._step_log(
+                        "action_verify",
+                        {"action": action.action, "ref": action.ref, "ok": True},
+                    )
                     return True
                 ok = self._retry_ref_action(action, locator, item)
-                self._step_log("action_verify", {"action": action.action, "ref": action.ref, "ok": ok})
+                self._step_log(
+                    "action_verify",
+                    {"action": action.action, "ref": action.ref, "ok": ok},
+                )
                 return ok
             if action.action == "type":
                 if action.value is None:
@@ -799,10 +850,16 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 locator.click(timeout=800)
                 locator.type(str(action.value), delay=40)
                 if self._verify_ref_action_effect(action, locator, item):
-                    self._step_log("action_verify", {"action": action.action, "ref": action.ref, "ok": True})
+                    self._step_log(
+                        "action_verify",
+                        {"action": action.action, "ref": action.ref, "ok": True},
+                    )
                     return True
                 ok = self._retry_ref_action(action, locator, item)
-                self._step_log("action_verify", {"action": action.action, "ref": action.ref, "ok": ok})
+                self._step_log(
+                    "action_verify",
+                    {"action": action.action, "ref": action.ref, "ok": ok},
+                )
                 return ok
             if action.action == "select":
                 if action.value is None:
@@ -812,10 +869,16 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 except Exception:
                     locator.click(timeout=1500)
                 if self._verify_ref_action_effect(action, locator, item):
-                    self._step_log("action_verify", {"action": action.action, "ref": action.ref, "ok": True})
+                    self._step_log(
+                        "action_verify",
+                        {"action": action.action, "ref": action.ref, "ok": True},
+                    )
                     return True
                 ok = self._retry_ref_action(action, locator, item)
-                self._step_log("action_verify", {"action": action.action, "ref": action.ref, "ok": ok})
+                self._step_log(
+                    "action_verify",
+                    {"action": action.action, "ref": action.ref, "ok": ok},
+                )
                 return ok
             if action.action == "upload":
                 return self._do_upload(action, locator=locator)
@@ -949,7 +1012,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 total += 1
         return total
 
-    def _verify_ref_action_effect(self, action: AgentAction, locator, item: SnapshotItem) -> bool:
+    def _verify_ref_action_effect(
+        self, action: AgentAction, locator, item: SnapshotItem
+    ) -> bool:
         """对 ref 动作进行基础后验校验，失败则返回 False 触发重试。"""
         try:
             if action.action == "click":
@@ -969,7 +1034,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             if action.action == "upload":
                 # upload 的 value 可能是文件名或完整路径；由 _verify_upload_success 统一确认
                 if action.value:
-                    ordered = resolve_upload_candidate(action.value, self.upload_candidates)
+                    ordered = resolve_upload_candidate(
+                        action.value, self.upload_candidates
+                    )
                     if ordered:
                         return self._verify_upload_success(ordered[0])
                 return False
@@ -977,7 +1044,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             return False
         return True
 
-    def _retry_ref_action(self, action: AgentAction, locator, item: SnapshotItem) -> bool:
+    def _retry_ref_action(
+        self, action: AgentAction, locator, item: SnapshotItem
+    ) -> bool:
         """当后验失败时，尝试一次更稳妥的补救动作。"""
         try:
             if action.action in ("fill", "type"):
@@ -1033,7 +1102,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 f.write(json.dumps(data, ensure_ascii=False) + "\n")
         except Exception:
             pass
-    
+
     def _smart_click(self, selector: str, element_type: str = None) -> bool:
         """
         智能点击：根据元素类型选择最佳策略。
@@ -1041,10 +1110,10 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         """
         if not selector:
             return False
-        
+
         timeout = 1000  # 每个策略 1 秒
         check_timeout = 200  # 可见性检查 200ms
-        
+
         # 清理 selector：去除重复词（如 "Dallas Dallas" → "Dallas"）
         words = selector.split()
         seen = set()
@@ -1054,17 +1123,17 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 seen.add(w.lower())
                 unique_words.append(w)
         clean_selector = " ".join(unique_words)
-        
+
         # 从复杂 selector 中提取简短关键词（如 "Yes"、"No"）
         short_selector = clean_selector
         if " " in clean_selector and len(clean_selector) > 20:
             # 如果 selector 很长，尝试取最后一个词（通常是 Yes/No）
             if unique_words[-1] in ["Yes", "No", "yes", "no"]:
                 short_selector = unique_words[-1]
-        
+
         # 提取第一个关键词用于模糊匹配（如 "Dallas" 匹配 "Dallas, TX"）
         first_word = unique_words[0] if unique_words else clean_selector
-        
+
         # 根据元素类型选择策略
         if element_type == "button":
             strategies = [
@@ -1114,7 +1183,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 # 模糊匹配
                 lambda: self.page.get_by_text(first_word, exact=False).first,
             ]
-        
+
         # 尝试点击（带滚动重试）
         max_scroll_attempts = 2
         for scroll_attempt in range(max_scroll_attempts + 1):
@@ -1126,27 +1195,29 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                         return True
                 except Exception:
                     continue
-            
+
             # 如果所有策略都失败，尝试滚动页面后重试
             if scroll_attempt < max_scroll_attempts:
                 try:
                     self.page.evaluate("window.scrollBy(0, 300)")
                     self.page.wait_for_timeout(300)
-                    self._log(f"   🔄 滚动页面，重试定位 ({scroll_attempt + 1}/{max_scroll_attempts})")
+                    self._log(
+                        f"   🔄 滚动页面，重试定位 ({scroll_attempt + 1}/{max_scroll_attempts})"
+                    )
                 except Exception:
                     break
-        
+
         return False
-    
+
     def _smart_fill(self, selector: str, value: str) -> bool:
         """智能填写：通过 label 精确定位输入框并填写"""
         if not selector or value is None:
             return False
-        
+
         timeout = 1500
         value_str = str(value)
         clean_selector = selector.replace("*", "").strip()
-        
+
         # 只用基于 label 的精确定位，避免误定位到其他输入框
         strategies = [
             lambda: self.page.get_by_label(selector, exact=False).first,
@@ -1154,10 +1225,13 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             lambda: self.page.get_by_role("textbox", name=selector).first,
             lambda: self.page.get_by_role("textbox", name=clean_selector).first,
             # 通过 label 文本找相邻输入框
-            lambda: self.page.locator(f"label:has-text('{clean_selector}')").locator("..").locator("input").first,
+            lambda: self.page.locator(f"label:has-text('{clean_selector}')")
+            .locator("..")
+            .locator("input")
+            .first,
         ]
         # 注意：不要用 get_by_placeholder 这种宽泛匹配，容易定位到错误字段
-        
+
         for strategy in strategies:
             try:
                 locator = strategy()
@@ -1166,13 +1240,13 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                     return True
             except Exception:
                 continue
-        
+
         return False
-    
+
     def _smart_type(self, selector: str, value: str) -> bool:
         """
         智能输入：逐字输入触发 autocomplete 下拉框。
-        
+
         处理各种 autocomplete 输入框：
         - 带 * 的 label（如 "Location*"）
         - placeholder 提示（如 "Start typing..."）
@@ -1180,10 +1254,10 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         """
         if not selector or value is None:
             return False
-        
+
         # 清理 selector（去掉可能的 * 和多余空格）
         clean_selector = selector.replace("*", "").strip()
-        
+
         # 快速找到输入框 - 优先使用 label 匹配，避免误定位
         input_elem = None
         strategies = [
@@ -1198,12 +1272,15 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             lambda: self.page.get_by_role("textbox", name=selector).first,
             lambda: self.page.get_by_role("textbox", name=clean_selector).first,
             # 5. 通过包含 selector 文本的 label 元素找相邻输入框
-            lambda: self.page.locator(f"label:has-text('{clean_selector}')").locator("..").locator("input, [role='combobox']").first,
+            lambda: self.page.locator(f"label:has-text('{clean_selector}')")
+            .locator("..")
+            .locator("input, [role='combobox']")
+            .first,
             # 6. 直接通过 aria-label
             lambda: self.page.locator(f"[aria-label*='{clean_selector}' i]").first,
         ]
         # 注意：不要用 get_by_placeholder("type") 这种宽泛匹配，容易定位到错误字段
-        
+
         for strategy in strategies:
             try:
                 elem = strategy()
@@ -1213,33 +1290,32 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                     break
             except Exception:
                 continue
-        
+
         if not input_elem:
             self._log(f"   ⚠️ 无法定位输入框: {selector}", "warn")
             return False
-        
+
         try:
             # 1. 点击激活输入框
             input_elem.click(timeout=800)
             self.page.wait_for_timeout(100)
-            
+
             # 2. 清空现有内容（全选后删除，更可靠）
             input_elem.press("Control+a")
             self.page.wait_for_timeout(30)
             input_elem.press("Backspace")
             self.page.wait_for_timeout(50)
-            
+
             # 3. 逐字输入，触发 autocomplete
             input_elem.type(str(value), delay=40)  # 逐字输入触发下拉
-            
+
             # 4. 短暂等待让下拉框出现（主循环会截图让 AI 看到变化）
             self.page.wait_for_timeout(600)
             return True
         except Exception as e:
             self._log(f"   ⚠️ 输入失败: {e}", "warn")
             return False
-    
-    
+
     def _do_select(self, selector: str, value: str) -> bool:
         """
         选择下拉框选项（仅处理原生 <select>）。
@@ -1247,7 +1323,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         """
         if not selector or not value:
             return False
-        
+
         # 只尝试原生 select，其他情况让 AI 用 type + click
         try:
             select = self.page.get_by_label(selector).first
@@ -1256,7 +1332,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 return True
         except Exception:
             pass
-        
+
         # 尝试直接点击已显示的选项（下拉框可能已经打开）
         try:
             option = self.page.get_by_role("option", name=value).first
@@ -1265,7 +1341,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 return True
         except Exception:
             pass
-        
+
         return False
 
     def _do_upload(self, action: AgentAction, locator=None) -> bool:
@@ -1287,7 +1363,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         if self.preferred_resume_path:
             preferred = self.preferred_resume_path
             if is_upload_path_allowed(preferred):
-                ordered_candidates = [preferred] + [c for c in ordered_candidates if c != preferred]
+                ordered_candidates = [preferred] + [
+                    c for c in ordered_candidates if c != preferred
+                ]
 
         if not ordered_candidates:
             self._log("⚠ 无可用上传候选文件（白名单目录为空）", "warn")
@@ -1385,7 +1463,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             pass
 
         return False
-    
+
     def _do_scroll(self, direction: str) -> bool:
         """滚动页面"""
         try:
@@ -1396,23 +1474,23 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             return True
         except Exception:
             return False
-    
+
     def _verify_completion(self) -> tuple[bool, str]:
         """
         二次验证：检查页面是否真的完成了申请。
-        
+
         关键逻辑：
         1. 如果 Submit 按钮仍可见且没有成功消息 → 表单未提交
         2. 排除浏览器扩展消息（如 "Autofill complete!"）的干扰
         3. 必须有明确的成功消息才算完成
-        
+
         返回:
             tuple[bool, str]: (是否真的完成, 验证信息)
         """
         try:
             # 获取页面文本
             body_text = self.page.inner_text("body").lower()
-            
+
             # 1. 检查是否有真正的成功标志（必须是网站返回的，不是扩展）
             success_indicators = [
                 "thank you for applying",
@@ -1427,9 +1505,11 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 "we'll be in touch",
                 "we will review your application",
             ]
-            
-            has_success = any(indicator in body_text for indicator in success_indicators)
-            
+
+            has_success = any(
+                indicator in body_text for indicator in success_indicators
+            )
+
             # 2. 排除浏览器扩展的误报消息
             extension_false_positives = [
                 "autofill complete",
@@ -1437,13 +1517,13 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 "extension",
                 "chrome extension",
             ]
-            
+
             # 如果页面只有扩展相关的"成功"消息，不算真正成功
             if not has_success:
                 for fp in extension_false_positives:
                     if fp in body_text and "complete" in body_text:
                         self._log(f"   ⚠ 检测到扩展消息 '{fp}'，不是真正的申请成功")
-            
+
             # 3. 检查是否有错误标志
             error_indicators = [
                 "this field is required",
@@ -1453,13 +1533,13 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 "please complete",
                 "invalid",
             ]
-            
+
             has_error = False
             for indicator in error_indicators:
                 if indicator in body_text:
                     has_error = True
                     break
-            
+
             # 4. 检查是否还有 Submit 按钮可见（关键检查！）
             has_submit_button = False
             submit_button_checks = [
@@ -1468,7 +1548,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 ("button", "Apply"),
                 ("button", "Submit your application"),
             ]
-            
+
             for role, name in submit_button_checks:
                 try:
                     submit_btn = self.page.get_by_role(role, name=name).first
@@ -1478,44 +1558,46 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                         break
                 except Exception:
                     continue
-            
+
             # 也检查文本匹配
             if not has_submit_button:
                 try:
-                    submit_text = self.page.get_by_text("Submit Application", exact=False).first
+                    submit_text = self.page.get_by_text(
+                        "Submit Application", exact=False
+                    ).first
                     if submit_text.is_visible(timeout=300):
                         has_submit_button = True
                         self._log("   🔍 检测到 Submit Application 文本仍可见")
                 except Exception:
                     pass
-            
+
             # 5. 综合判断
             # 关键规则：如果 Submit 按钮仍可见且没有成功消息，表单肯定未提交
             if has_submit_button and not has_success:
                 return False, "Submit 按钮仍可见，表单尚未提交"
-            
+
             if has_error:
                 return False, "页面仍有错误提示，表单未完成"
-            
+
             if has_success and not has_error:
                 return True, "页面显示申请成功信息，无错误提示"
-            
+
             # 如果没有成功标志也没有 Submit 按钮，可能是跳转到了其他页面
             if not has_success and not has_submit_button:
                 # 保守判断，可能需要继续观察
                 return False, "未检测到明确的成功信息，可能需要继续"
-            
+
             return False, "状态不确定，继续执行"
-            
+
         except Exception as e:
             self._log(f"⚠ 二次验证出错: {e}", "warn")
             # 验证出错时，保守返回 False
             return False, f"验证过程出错: {e}"
-    
+
     def _compress_screenshot(self, png_bytes: bytes) -> bytes:
         """
         压缩截图：PNG → JPEG，限制宽度，降低体积但保证识别质量。
-        
+
         压缩策略：
         - 转换为 JPEG 格式（比 PNG 体积小很多）
         - 限制最大宽度为 1280px（足够 LLM 识别文字和 UI 元素）
@@ -1524,26 +1606,30 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         try:
             # 打开 PNG 图片
             img = Image.open(io.BytesIO(png_bytes))
-            
+
             # 如果宽度超过限制，等比例缩小
             if img.width > SCREENSHOT_MAX_WIDTH:
                 ratio = SCREENSHOT_MAX_WIDTH / img.width
                 new_height = int(img.height * ratio)
-                img = img.resize((SCREENSHOT_MAX_WIDTH, new_height), Image.Resampling.LANCZOS)
-            
+                img = img.resize(
+                    (SCREENSHOT_MAX_WIDTH, new_height), Image.Resampling.LANCZOS
+                )
+
             # 转换为 RGB（JPEG 不支持 RGBA）
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
-            
+
             # 保存为 JPEG
             output = io.BytesIO()
-            img.save(output, format="JPEG", quality=SCREENSHOT_JPEG_QUALITY, optimize=True)
+            img.save(
+                output, format="JPEG", quality=SCREENSHOT_JPEG_QUALITY, optimize=True
+            )
             return output.getvalue()
         except Exception as e:
             # 压缩失败时返回原始 PNG
             self._log(f"⚠️ 截图压缩失败，使用原图: {e}", "warn")
             return png_bytes
-    
+
     def _safe_parse_json(self, raw: str) -> dict | None:
         """安全解析 JSON"""
         # 直接解析
@@ -1551,7 +1637,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             return json.loads(raw)
         except Exception:
             pass
-        
+
         # 从 markdown 代码块提取
         if "```" in raw:
             try:
@@ -1566,7 +1652,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                     return json.loads(raw[start:end].strip())
             except Exception:
                 pass
-        
+
         # 提取 { ... }
         if "{" in raw and "}" in raw:
             try:
@@ -1575,9 +1661,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 return json.loads(raw[start:end])
             except Exception:
                 pass
-        
+
         return None
-    
+
     def _log(self, message: str, level: str = "info") -> None:
         """写入日志"""
         with SessionLocal() as session:

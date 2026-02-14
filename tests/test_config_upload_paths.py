@@ -41,4 +41,3 @@ def test_is_upload_path_allowed_inside_and_outside(monkeypatch, tmp_path):
 
     assert config.is_upload_path_allowed(str(inside)) is True
     assert config.is_upload_path_allowed(str(outside)) is False
-

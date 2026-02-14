@@ -20,6 +20,8 @@ def detect_manual_required(visible_text: str) -> bool:
         return True
     login_keywords = ["sign in", "log in", "login"]
     verify_keywords = ["password", "verification code", "two-factor", "2fa", "verify"]
-    if any(k in text for k in login_keywords) and any(k in text for k in verify_keywords):
+    if any(k in text for k in login_keywords) and any(
+        k in text for k in verify_keywords
+    ):
         return True
     return False

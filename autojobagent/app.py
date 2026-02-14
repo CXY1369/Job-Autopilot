@@ -52,6 +52,7 @@ def _save_config(cfg: dict) -> None:
         encoding="utf-8",
     )
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -190,14 +191,20 @@ def open_login_browser(url: str):
     global _login_session
     if _login_session is not None:
         return {"ok": False, "error": "login session already running"}
-    manager = BrowserManager(log_fn=lambda msg, level="info": print(f"[login] [{level.upper()}] {msg}"))
+    manager = BrowserManager(
+        log_fn=lambda msg, level="info": print(f"[login] [{level.upper()}] {msg}")
+    )
     _login_session = manager.launch()
     target = url.strip() if url else "about:blank"
     try:
         _login_session.page.goto(target, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
         return {"ok": False, "error": f"open login page failed: {e}"}
-    return {"ok": True, "message": "login browser opened", "url": _login_session.page.url}
+    return {
+        "ok": True,
+        "message": "login browser opened",
+        "url": _login_session.page.url,
+    }
 
 
 @app.post("/api/browser/login/close")
@@ -303,7 +310,7 @@ def delete_job(job_id: int):
         # 再删除岗位记录
         deleted = session.query(JobPost).filter(JobPost.id == job_id).delete()
         session.commit()
-        
+
         if deleted:
             return {"ok": True, "message": f"Job {job_id} deleted"}
         else:
@@ -314,7 +321,7 @@ def delete_job(job_id: int):
 def clear_jobs(status: JobStatus):
     """
     清空指定状态的所有岗位记录及其关联的日志。
-    
+
     例如：DELETE /api/jobs?status=applied 清空所有已申请的记录
     """
     from .db.database import SessionLocal
@@ -323,25 +330,37 @@ def clear_jobs(status: JobStatus):
     with SessionLocal() as session:
         # 找出所有符合条件的 job_id
         job_ids = [
-            job.id for job in 
-            session.query(JobPost.id).filter(JobPost.status == status).all()
+            job.id
+            for job in session.query(JobPost.id).filter(JobPost.status == status).all()
         ]
-        
+
         if not job_ids:
-            return {"ok": True, "message": f"No jobs with status {status.value}", "deleted": 0}
-        
+            return {
+                "ok": True,
+                "message": f"No jobs with status {status.value}",
+                "deleted": 0,
+            }
+
         # 删除关联日志
-        session.query(JobLog).filter(JobLog.job_id.in_(job_ids)).delete(synchronize_session=False)
+        session.query(JobLog).filter(JobLog.job_id.in_(job_ids)).delete(
+            synchronize_session=False
+        )
         # 删除岗位记录
-        deleted = session.query(JobPost).filter(JobPost.status == status).delete(synchronize_session=False)
+        deleted = (
+            session.query(JobPost)
+            .filter(JobPost.status == status)
+            .delete(synchronize_session=False)
+        )
         session.commit()
-        
-        return {"ok": True, "message": f"Cleared {deleted} jobs with status {status.value}", "deleted": deleted}
+
+        return {
+            "ok": True,
+            "message": f"Cleared {deleted} jobs with status {status.value}",
+            "deleted": deleted,
+        }
 
 
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("autojobagent.app:app", host="127.0.0.1", port=8000, reload=True)
-
-

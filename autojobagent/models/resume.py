@@ -44,5 +44,3 @@ class Resume(Base):
             if self.last_used_time
             else None,
         }
-
-

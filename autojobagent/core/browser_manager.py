@@ -47,7 +47,9 @@ class BrowserManager:
 
         headless = bool(browser_cfg.get("headless", False))
         slow_mo = int(browser_cfg.get("slow_mo", 0))
-        raw_profile_dir = browser_cfg.get("user_data_dir") or "~/.cache/autojobagent/chrome-profile"
+        raw_profile_dir = (
+            browser_cfg.get("user_data_dir") or "~/.cache/autojobagent/chrome-profile"
+        )
         user_data_dir = str(Path(raw_profile_dir).expanduser())
         executable_path = browser_cfg.get("executable_path")
 
