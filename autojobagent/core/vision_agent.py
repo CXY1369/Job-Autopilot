@@ -67,7 +67,7 @@ SCREENSHOT_JPEG_QUALITY = 75  # JPEG 质量（0-100），75 是清晰度和体�
 class AgentAction:
     """单个操作"""
 
-    action: str  # click, fill, type, select, upload, scroll, wait, done, stuck
+    action: str  # click, fill, type, select, upload, scroll, refresh, wait, done, stuck
     ref: Optional[str] = None  # 目标元素 ref（优先）
     selector: Optional[str] = None  # 目标元素的文本/描述
     value: Optional[str] = None  # 填入的值
@@ -143,6 +143,10 @@ class BrowserAgent:
         self.upload_candidates: list[str] = list_upload_candidates(max_files=30)
         self.preferred_resume_path: str | None = getattr(job, "resume_used", None)
         self._last_upload_signals: list[str] = []
+        self.refresh_attempts = 0
+        self.max_refresh_attempts = 2
+        self.refresh_exhausted = False
+        self.manual_reason_hint: str | None = None
 
     # region agent log
     def _ndjson_log(self, hypothesis_id: str, location: str, message: str, data: dict):
@@ -208,6 +212,7 @@ class BrowserAgent:
                     continue
 
             if state.status == "stuck":
+                self._set_manual_reason_hint(state.summary or "需要人工介入")
                 self._log("⚠ Agent 判断无法继续，需要人工介入", "warn")
                 self._log("========== AI Agent 运行结束 ==========")
                 return False
@@ -264,7 +269,33 @@ class BrowserAgent:
                         pass
 
                     # 智能终止：连续失败次数过多
+                    if self.consecutive_failures >= 3:
+                        if self.refresh_attempts < self.max_refresh_attempts:
+                            self._log(
+                                f"⚠ 连续失败达到 {self.consecutive_failures} 次，触发页面刷新重试",
+                                "warn",
+                            )
+                            refreshed = self._do_refresh(trigger="auto_stuck_recovery")
+                            if refreshed:
+                                self.consecutive_failures = 0
+                                continue
+                        elif self.refresh_exhausted:
+                            self._set_manual_reason_hint(
+                                "页面刷新两次后仍无进展，需要人工处理"
+                            )
+                            self._log(
+                                "⚠ 页面刷新次数已用尽，停止执行并标记待人工处理",
+                                "warn",
+                            )
+                            self._log(
+                                "========== AI Agent 运行结束（刷新重试耗尽）=========="
+                            )
+                            return False
+
                     if self.consecutive_failures >= self.max_consecutive_failures:
+                        self._set_manual_reason_hint(
+                            "连续操作失败达到上限，需要人工处理"
+                        )
                         self._log(
                             f"⚠ 连续 {self.consecutive_failures} 次操作失败，停止执行",
                             "warn",
@@ -279,6 +310,7 @@ class BrowserAgent:
                 self._log("⚠ LLM 没有给出下一步操作", "warn")
 
         self._log(f"⚠ 已达到最大步数 {self.max_steps}，停止执行", "warn")
+        self._set_manual_reason_hint("已达到最大步数仍未完成，需要人工处理")
         self._log("========== AI Agent 运行结束 ==========")
         return False
 
@@ -493,6 +525,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 | type | autocomplete 输入框（Location等） | 字段标签或 ref | 内容 |
 | upload | 上传简历/附件（仅在页面有上传信号时） | 上传控件文本或 ref | 候选文件名或完整路径 |
 | scroll | 滚动页面 | - | up/down |
+| refresh | 当前页面卡住/多次无进展时刷新重试 | - | - |
 | done | 任务完成 | - | - |
 | stuck | 无法继续 | - | - |
 
@@ -520,6 +553,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 2. 所有内容用英文填写
 3. 已上传的文件不重复上传
 4. 只有在页面存在上传信号时才允许使用 upload 动作
+5. refresh 最多使用 2 次；若两次后仍无进展，返回 stuck
 
 ## 什么时候返回 stuck？（重要！不要轻易放弃！）
 
@@ -781,6 +815,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 direction = action.value or action.selector or "down"
                 return self._do_scroll(direction)
 
+            elif action.action == "refresh":
+                return self._do_refresh(trigger="llm_action")
+
             elif action.action == "wait":
                 seconds = int(action.value or 2)
                 self.page.wait_for_timeout(seconds * 1000)
@@ -885,6 +922,8 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             if action.action == "scroll":
                 direction = action.value or action.selector or "down"
                 return self._do_scroll(direction)
+            if action.action == "refresh":
+                return self._do_refresh(trigger="llm_action")
             if action.action in ("wait", "done", "stuck"):
                 if action.action == "wait":
                     seconds = int(action.value or 2)
@@ -1475,6 +1514,40 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         except Exception:
             return False
 
+    def _do_refresh(self, trigger: str = "unknown") -> bool:
+        """
+        刷新当前页面重试：
+        - 最多允许两次
+        - 超限后标记刷新耗尽
+        """
+        if self.refresh_attempts >= self.max_refresh_attempts:
+            self.refresh_exhausted = True
+            self._log(
+                f"⚠ refresh 已达上限 ({self.max_refresh_attempts})，不再重试",
+                "warn",
+            )
+            return False
+
+        attempt = self.refresh_attempts + 1
+        self._log(
+            f"🔄 刷新当前页面重试 ({attempt}/{self.max_refresh_attempts}) trigger={trigger}",
+            "warn",
+        )
+        try:
+            self.page.reload(wait_until="domcontentloaded", timeout=30000)
+            self.page.wait_for_timeout(1200)
+            self.refresh_attempts += 1
+            self.history.append(
+                f"刷新页面重试({self.refresh_attempts}/{self.max_refresh_attempts})"
+            )
+            return True
+        except Exception as e:
+            self.refresh_attempts += 1
+            self._log(f"⚠ 页面刷新失败: {e}", "warn")
+            if self.refresh_attempts >= self.max_refresh_attempts:
+                self.refresh_exhausted = True
+            return False
+
     def _verify_completion(self) -> tuple[bool, str]:
         """
         二次验证：检查页面是否真的完成了申请。
@@ -1671,9 +1744,22 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             session.commit()
         print(f"[job={self.job_id}] [{level.upper()}] {message}")
 
+    def _set_manual_reason_hint(self, reason: str) -> None:
+        """将人工介入原因同步给外层调用方。"""
+        self.manual_reason_hint = reason
+        try:
+            setattr(self.job, "manual_reason_hint", reason)
+        except Exception:
+            pass
+
 
 # 便捷函数
 def run_browser_agent(page: Page, job, max_steps: int = 50) -> bool:
     """运行浏览器 Agent"""
     agent = BrowserAgent(page, job, max_steps)
-    return agent.run()
+    success = agent.run()
+    try:
+        setattr(job, "manual_reason_hint", agent.manual_reason_hint)
+    except Exception:
+        pass
+    return success

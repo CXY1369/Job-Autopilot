@@ -145,10 +145,13 @@ def apply_for_job(job: JobPost) -> ApplyResult:
             except Exception:
                 pass
             session.close()
+            manual_reason = (
+                getattr(job, "manual_reason_hint", None) or "AI Agent 未能完成全部操作"
+            )
             return ApplyResult(
                 success=False,
                 manual_required=True,
-                manual_reason="AI Agent 未能完成全部操作",
+                manual_reason=manual_reason,
                 resume_used=job.resume_used,
             )
 
