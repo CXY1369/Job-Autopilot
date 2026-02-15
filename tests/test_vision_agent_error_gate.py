@@ -1,5 +1,8 @@
 from autojobagent.core.browser_manager import BrowserManager
-from autojobagent.core.vision_agent import BrowserAgent, evaluate_progression_block_reason
+from autojobagent.core.vision_agent import (
+    BrowserAgent,
+    evaluate_progression_block_reason,
+)
 
 
 class _DummyJob:
@@ -17,7 +20,9 @@ def test_progression_gate_does_not_block_job_description_keywords_only():
         "global_error_keyword_hits": 1,  # 例如“required skills”在岗位描述中出现
         "error_snippets": [],
     }
-    reason = evaluate_progression_block_reason(evidence, llm_confirms_context_error=False)
+    reason = evaluate_progression_block_reason(
+        evidence, llm_confirms_context_error=False
+    )
     assert reason is None
 
 
@@ -31,7 +36,9 @@ def test_progression_gate_blocks_invalid_field():
         "global_error_keyword_hits": 0,
         "error_snippets": [],
     }
-    reason = evaluate_progression_block_reason(evidence, llm_confirms_context_error=False)
+    reason = evaluate_progression_block_reason(
+        evidence, llm_confirms_context_error=False
+    )
     assert reason is not None
 
 
@@ -45,7 +52,9 @@ def test_progression_gate_blocks_error_container_with_red_signal():
         "global_error_keyword_hits": 1,
         "error_snippets": ["Please complete this required field."],
     }
-    reason = evaluate_progression_block_reason(evidence, llm_confirms_context_error=False)
+    reason = evaluate_progression_block_reason(
+        evidence, llm_confirms_context_error=False
+    )
     assert reason is not None
 
 
@@ -59,7 +68,9 @@ def test_progression_gate_uses_llm_for_ambiguous_global_keywords():
         "global_error_keyword_hits": 2,
         "error_snippets": [],
     }
-    reason = evaluate_progression_block_reason(evidence, llm_confirms_context_error=True)
+    reason = evaluate_progression_block_reason(
+        evidence, llm_confirms_context_error=True
+    )
     assert reason is not None
 
 

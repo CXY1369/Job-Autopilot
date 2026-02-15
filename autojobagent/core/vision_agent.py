@@ -105,7 +105,9 @@ def evaluate_progression_block_reason(
         return f"检测到 {invalid_field_count} 个无效字段（aria-invalid/:invalid）"
     if required_empty_count > 0:
         return f"检测到 {required_empty_count} 个必填字段为空"
-    if error_container_hits > 0 and (red_error_hits > 0 or local_error_keyword_hits > 0):
+    if error_container_hits > 0 and (
+        red_error_hits > 0 or local_error_keyword_hits > 0
+    ):
         return "检测到表单错误提示（错误容器/红色文本）"
 
     # 仅有全页关键词时，不立即拦截；需要 LLM 复核上下文
@@ -403,7 +405,9 @@ class BrowserAgent:
             has_login_button=evidence["has_login_button"],
             has_apply_cta=evidence["has_apply_cta"],
         )
-        page_state = self._classify_page_state(snapshot_map, evidence, manual_assessment)
+        page_state = self._classify_page_state(
+            snapshot_map, evidence, manual_assessment
+        )
         self._step_log(
             event="page_state",
             payload={
@@ -1221,7 +1225,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             return None
 
         payload = [
-            {"id": f"l{i+1}", "text": text}
+            {"id": f"l{i + 1}", "text": text}
             for i, text in enumerate(labels[:40])  # 控制成本
         ]
         if not payload:
@@ -1409,7 +1413,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         )
 
         # 先看强结构化证据，避免“required skills”这类正文干扰
-        reason = evaluate_progression_block_reason(evidence, llm_confirms_context_error=False)
+        reason = evaluate_progression_block_reason(
+            evidence, llm_confirms_context_error=False
+        )
         if reason:
             return reason
 
@@ -1422,7 +1428,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             evidence, llm_confirms_context_error=llm_confirm
         )
 
-    def _collect_form_error_evidence(self, visible_text: str) -> dict[str, int | list[str]]:
+    def _collect_form_error_evidence(
+        self, visible_text: str
+    ) -> dict[str, int | list[str]]:
         """收集表单错误相关证据，尽量只看表单上下文。"""
         base = {
             "invalid_field_count": 0,

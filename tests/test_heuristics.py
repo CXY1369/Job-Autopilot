@@ -17,9 +17,7 @@ def test_detect_manual_required_false():
 
 
 def test_assess_manual_required_apply_entry_not_login():
-    text = (
-        "Sign in to save this job. You can still apply now for this position without login."
-    )
+    text = "Sign in to save this job. You can still apply now for this position without login."
     result = assess_manual_required(
         text,
         password_input_count=0,
