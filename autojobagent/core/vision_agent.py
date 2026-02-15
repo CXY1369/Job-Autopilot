@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -37,7 +38,7 @@ from ..config import (
 )
 from .browser_manager import BrowserManager
 from .ui_snapshot import build_ui_snapshot, SnapshotItem
-from .heuristics import detect_manual_required
+from .heuristics import assess_manual_required
 
 
 # 截图保存目录
@@ -87,6 +88,33 @@ class AgentState:
     raw_response: Optional[str] = None
 
 
+def evaluate_progression_block_reason(
+    evidence: dict[str, int | list[str] | bool],
+    *,
+    llm_confirms_context_error: bool = False,
+) -> str | None:
+    """根据结构化证据评估是否应阻止 Next/Submit。"""
+    invalid_field_count = int(evidence.get("invalid_field_count", 0) or 0)
+    required_empty_count = int(evidence.get("required_empty_count", 0) or 0)
+    red_error_hits = int(evidence.get("red_error_hits", 0) or 0)
+    error_container_hits = int(evidence.get("error_container_hits", 0) or 0)
+    local_error_keyword_hits = int(evidence.get("local_error_keyword_hits", 0) or 0)
+    global_error_keyword_hits = int(evidence.get("global_error_keyword_hits", 0) or 0)
+
+    if invalid_field_count > 0:
+        return f"检测到 {invalid_field_count} 个无效字段（aria-invalid/:invalid）"
+    if required_empty_count > 0:
+        return f"检测到 {required_empty_count} 个必填字段为空"
+    if error_container_hits > 0 and (red_error_hits > 0 or local_error_keyword_hits > 0):
+        return "检测到表单错误提示（错误容器/红色文本）"
+
+    # 仅有全页关键词时，不立即拦截；需要 LLM 复核上下文
+    if global_error_keyword_hits > 0 and llm_confirms_context_error:
+        return "检测到与当前表单相关的错误提示（经语义复核）"
+
+    return None
+
+
 class BrowserAgent:
     """
     像人类一样操作浏览器的 AI Agent。
@@ -124,6 +152,7 @@ class BrowserAgent:
         # 默认首选 GPT-4o
         self.model_index = 0
         self.model = self.fallback_models[self.model_index]
+        self.intent_model = self.llm_cfg.get("intent_model") or self.fallback_models[0]
 
         # 创建 job 专属截图目录
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -147,6 +176,9 @@ class BrowserAgent:
         self.max_refresh_attempts = 2
         self.refresh_exhausted = False
         self.manual_reason_hint: str | None = None
+        self._intent_cache: dict[str, dict[str, list[str]]] = {}
+        self._last_snapshot_intents: dict[str, set[str]] = {}
+        self._error_gate_cache: dict[str, bool] = {}
 
     # region agent log
     def _ndjson_log(self, hypothesis_id: str, location: str, message: str, data: dict):
@@ -354,17 +386,57 @@ class BrowserAgent:
         # 2.5 生成可交互元素快照
         snapshot_text, snapshot_map = build_ui_snapshot(self.page)
         self._last_snapshot_map = snapshot_map
+        self._last_snapshot_intents = self._infer_snapshot_intents(
+            snapshot_map, visible_text
+        )
 
-        # 2.6 检测登录/验证码等需人工介入的场景
-        if detect_manual_required(visible_text):
+        # 2.6 证据化检测登录/验证码等需人工介入场景（避免纯关键词误判）
+        evidence = self._collect_manual_required_evidence(
+            visible_text,
+            snapshot_map,
+            self._last_snapshot_intents,
+        )
+        manual_assessment = assess_manual_required(
+            visible_text,
+            password_input_count=evidence["password_input_count"],
+            captcha_element_count=evidence["captcha_element_count"],
+            has_login_button=evidence["has_login_button"],
+            has_apply_cta=evidence["has_apply_cta"],
+        )
+        page_state = self._classify_page_state(snapshot_map, evidence, manual_assessment)
+        self._step_log(
+            event="page_state",
+            payload={
+                "page_state": page_state,
+                "manual_required": manual_assessment.manual_required,
+                "manual_reason": manual_assessment.reason,
+                "manual_confidence": manual_assessment.confidence,
+                "evidence": manual_assessment.evidence,
+            },
+        )
+        if manual_assessment.manual_required:
             self._step_log(
                 event="manual_required",
-                payload={"reason": "login_or_captcha"},
+                payload={
+                    "reason": manual_assessment.reason,
+                    "confidence": manual_assessment.confidence,
+                    "evidence": manual_assessment.evidence,
+                },
             )
             return AgentState(
                 status="stuck",
                 summary="检测到登录/验证码/身份验证页面，需要人工处理",
             )
+        if page_state == "job_detail_with_apply":
+            apply_action = self._build_apply_entry_action(
+                snapshot_map, self._last_snapshot_intents
+            )
+            if apply_action:
+                return AgentState(
+                    status="continue",
+                    summary="检测到职位详情页，先点击 Apply 进入申请页面",
+                    next_action=apply_action,
+                )
 
         # 3. 获取页面 URL 并检测页面变化
         try:
@@ -562,6 +634,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 - 出现验证码（CAPTCHA）
 - 页面完全无法加载
 - 需要付费
+- 只有看到 sign in/login 文案还不够，必须有密码框或验证码等强证据
 
 **这些情况不是 stuck，要继续操作：**
 - 某个字段填错了 → 点击正确选项修复
@@ -627,6 +700,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 - 空的普通必填字段 → fill 填写
 - 页面有上传信号且需要简历/CV 时 → 使用 upload（value 填候选文件名或完整路径）
 - checkbox 多选 → 按规划**逐个勾选**，全部完成再继续
+- 如果当前是职位详情页且有“进入申请流程”的按钮/链接（同义表达也算）→ 先点击进入申请页，不要误判 stuck
 - 都填好了且无错误提示 → Submit
 - 感谢/确认信息 → done"""
 
@@ -959,21 +1033,344 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         if input_count > 0:
             signals.append(f"input[type=file] x{input_count}")
 
-        lower = (visible_text or "").lower()
-        keywords = [
-            "upload",
-            "attach",
-            "resume",
-            "cv",
-            "cover letter",
-            "drop files",
-            "choose file",
+        # 首选语义意图：通过快照元素名称和页面文本识别“上传诉求”
+        upload_refs = [
+            ref
+            for ref, intents in self._last_snapshot_intents.items()
+            if "upload_request" in intents
         ]
-        for kw in keywords:
-            if kw in lower:
-                signals.append(f"text:{kw}")
+        if upload_refs:
+            signals.append(f"intent:upload_request refs={len(upload_refs)}")
+
+        page_text_intents = self._infer_text_intents(visible_text, limit=1200)
+        if "upload_request" in page_text_intents:
+            signals.append("intent:upload_request text")
 
         return signals
+
+    def _collect_manual_required_evidence(
+        self,
+        visible_text: str,
+        snapshot_map: dict[str, SnapshotItem],
+        snapshot_intents: dict[str, set[str]],
+    ) -> dict[str, int | bool]:
+        """收集登录/验证码判定所需 DOM+文本证据。"""
+        password_input_count = self._safe_locator_count("input[type='password']")
+        captcha_selectors = [
+            "iframe[src*='recaptcha']",
+            ".g-recaptcha",
+            "[id*='captcha' i]",
+            "[class*='captcha' i]",
+            "iframe[title*='captcha' i]",
+        ]
+        captcha_element_count = 0
+        for selector in captcha_selectors:
+            captcha_element_count += self._safe_locator_count(selector)
+
+        has_login_button = any(
+            ref in snapshot_map
+            and snapshot_map[ref].role in ("button", "link")
+            and "login_action" in intents
+            for ref, intents in snapshot_intents.items()
+        )
+        has_apply_cta = any(
+            ref in snapshot_map
+            and snapshot_map[ref].role in ("button", "link")
+            and "apply_entry" in intents
+            for ref, intents in snapshot_intents.items()
+        )
+        page_text_intents = self._infer_text_intents(visible_text, limit=1200)
+        has_login_button = has_login_button or ("login_action" in page_text_intents)
+
+        return {
+            "password_input_count": password_input_count,
+            "captcha_element_count": captcha_element_count,
+            "has_login_button": has_login_button,
+            "has_apply_cta": has_apply_cta,
+        }
+
+    def _classify_page_state(
+        self,
+        snapshot_map: dict[str, SnapshotItem],
+        evidence: dict[str, int | bool],
+        manual_assessment,
+    ) -> str:
+        """轻量页面状态分类：login/captcha、职位详情页、申请页。"""
+        if manual_assessment.manual_required:
+            return "manual_gate"
+
+        form_roles = {"textbox", "combobox", "checkbox", "radio", "file_input"}
+        form_item_count = sum(
+            1
+            for item in snapshot_map.values()
+            if item.role in form_roles and (item.in_form or item.required)
+        )
+        has_form_fields = form_item_count >= 2
+        has_apply_cta = bool(evidence.get("has_apply_cta", False))
+
+        if has_apply_cta and not has_form_fields:
+            return "job_detail_with_apply"
+        return "application_or_form_page"
+
+    def _build_apply_entry_action(
+        self,
+        snapshot_map: dict[str, SnapshotItem],
+        snapshot_intents: dict[str, set[str]],
+    ) -> AgentAction | None:
+        """在职位详情页中优先定位进入申请流程的 Apply 按钮。"""
+        candidates: list[SnapshotItem] = []
+        for ref, item in snapshot_map.items():
+            if item.role not in ("button", "link"):
+                continue
+            intents = snapshot_intents.get(ref, set())
+            if "apply_entry" in intents:
+                candidates.append(item)
+        if not candidates:
+            return None
+        # 优先 button，名称更具体者优先，避免点到噪声链接
+        candidates.sort(
+            key=lambda it: (
+                it.role != "button",
+                len(it.name),
+            )
+        )
+        picked = candidates[0]
+        return AgentAction(
+            action="click",
+            ref=picked.ref,
+            selector=picked.name,
+            element_type=picked.role,
+            reason="职位详情页检测到 Apply 入口，先进入申请页",
+        )
+
+    def _safe_locator_count(self, selector: str) -> int:
+        try:
+            return self.page.locator(selector).count()
+        except Exception:
+            return 0
+
+    def _infer_snapshot_intents(
+        self,
+        snapshot_map: dict[str, SnapshotItem],
+        visible_text: str,
+    ) -> dict[str, set[str]]:
+        """为当前快照中的按钮/链接推断语义意图。"""
+        ref_to_label: dict[str, str] = {}
+        for ref, item in snapshot_map.items():
+            if item.role not in ("button", "link"):
+                continue
+            name = (item.name or "").strip()
+            if not name:
+                continue
+            ref_to_label[ref] = name
+
+        if not ref_to_label:
+            return {}
+
+        label_intents = self._infer_label_intents(
+            list(ref_to_label.values()),
+            context=visible_text[:800],
+        )
+        ref_intents: dict[str, set[str]] = {}
+        for ref, label in ref_to_label.items():
+            ref_intents[ref] = label_intents.get(label, set())
+        return ref_intents
+
+    def _infer_label_intents(
+        self,
+        labels: list[str],
+        context: str = "",
+    ) -> dict[str, set[str]]:
+        """
+        对一组 UI 文本做语义意图分类。
+        优先使用低成本文本模型，失败回退到强共识关键词。
+        """
+        cleaned = []
+        seen = set()
+        for label in labels:
+            text = (label or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            cleaned.append(text)
+        if not cleaned:
+            return {}
+
+        cache_key = self._intent_cache_key(cleaned, context)
+        cached = self._intent_cache.get(cache_key)
+        if cached is not None:
+            return {k: set(v) for k, v in cached.items()}
+
+        result = self._infer_label_intents_with_llm(cleaned, context)
+        if result is None:
+            result = {label: self._fallback_label_intents(label) for label in cleaned}
+        else:
+            for label in cleaned:
+                result.setdefault(label, self._fallback_label_intents(label))
+
+        # 存 list 以便 JSON 可序列化和轻量缓存
+        self._intent_cache[cache_key] = {k: sorted(v) for k, v in result.items()}
+        return result
+
+    def _infer_label_intents_with_llm(
+        self,
+        labels: list[str],
+        context: str,
+    ) -> dict[str, set[str]] | None:
+        if not self.client:
+            return None
+
+        payload = [
+            {"id": f"l{i+1}", "text": text}
+            for i, text in enumerate(labels[:40])  # 控制成本
+        ]
+        if not payload:
+            return {}
+
+        system_prompt = (
+            "You classify browser UI label intents for job application automation. "
+            "Return strict JSON only."
+        )
+        user_prompt = (
+            "Classify each UI label into zero or more intents.\n"
+            "Allowed intents:\n"
+            "- apply_entry: enter/start job application\n"
+            "- login_action: sign in/authenticate/account access\n"
+            "- progression_action: next/continue/review/submit/proceed steps\n"
+            "- upload_request: upload/attach file or resume\n"
+            "Rules:\n"
+            "1) Use semantic meaning, not literal keyword matching.\n"
+            "2) Support variants and other languages.\n"
+            "3) Be conservative; if uncertain, return empty intents for that label.\n"
+            f"Page context (may help): {context[:600]}\n"
+            f"Labels JSON:\n{json.dumps(payload, ensure_ascii=False)}\n"
+            'Return JSON: {"items":[{"id":"l1","intents":["apply_entry"]}]}'
+        )
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.intent_model,
+                temperature=0.0,
+                max_tokens=500,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            raw = completion.choices[0].message.content or ""
+            data = self._safe_parse_json(raw)
+            if not data or not isinstance(data.get("items"), list):
+                return None
+            id_to_text = {item["id"]: item["text"] for item in payload}
+            allowed = {
+                "apply_entry",
+                "login_action",
+                "progression_action",
+                "upload_request",
+            }
+            out: dict[str, set[str]] = {v: set() for v in id_to_text.values()}
+            for item in data["items"]:
+                if not isinstance(item, dict):
+                    continue
+                label_id = str(item.get("id", "")).strip()
+                text = id_to_text.get(label_id)
+                if not text:
+                    continue
+                intents = item.get("intents", [])
+                if not isinstance(intents, list):
+                    continue
+                normalized = {str(x).strip() for x in intents}
+                out[text].update(i for i in normalized if i in allowed)
+            return out
+        except Exception:
+            return None
+
+    def _infer_text_intents(self, text: str, limit: int = 1200) -> set[str]:
+        """
+        对整页文本做语义意图分类（低频、可缓存）。
+        只输出少量全局意图。
+        """
+        snippet = (text or "").strip()
+        if not snippet:
+            return set()
+        snippet = snippet[:limit]
+        cache_key = f"text::{hashlib.sha1(snippet.encode('utf-8')).hexdigest()}"
+        cached = self._intent_cache.get(cache_key)
+        if cached is not None:
+            intents = cached.get("__text__", [])
+            return set(intents)
+
+        intents: set[str] = set()
+        if self.client:
+            try:
+                completion = self.client.chat.completions.create(
+                    model=self.intent_model,
+                    temperature=0.0,
+                    max_tokens=220,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Classify page text intents for job application flow. "
+                                "Return strict JSON."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "Allowed intents: login_action, upload_request.\n"
+                                "Use semantic meaning and multilingual understanding.\n"
+                                f"Text:\n{snippet}\n"
+                                'Return JSON: {"intents":["login_action"]}'
+                            ),
+                        },
+                    ],
+                )
+                raw = completion.choices[0].message.content or ""
+                data = self._safe_parse_json(raw)
+                if data and isinstance(data.get("intents"), list):
+                    allowed = {"login_action", "upload_request"}
+                    intents = {
+                        str(x).strip()
+                        for x in data["intents"]
+                        if str(x).strip() in allowed
+                    }
+            except Exception:
+                intents = set()
+
+        # LLM 不可用/失败时回退到强共识词（兜底）
+        if not intents:
+            lower = snippet.lower()
+            if any(k in lower for k in ["upload", "attach", "resume", "cv"]):
+                intents.add("upload_request")
+            if any(k in lower for k in ["sign in", "log in", "login"]):
+                intents.add("login_action")
+
+        self._intent_cache[cache_key] = {"__text__": sorted(intents)}
+        return intents
+
+    def _fallback_label_intents(self, label: str) -> set[str]:
+        """当语义模型不可用时，使用极小硬规则集合兜底。"""
+        text = (label or "").strip().lower()
+        intents: set[str] = set()
+        if not text:
+            return intents
+
+        # 强共识短词，仅做兜底，不作为主策略
+        if any(k in text for k in ["apply", "application", "candidature"]):
+            intents.add("apply_entry")
+            intents.add("progression_action")
+        if any(k in text for k in ["next", "continue", "submit", "proceed", "review"]):
+            intents.add("progression_action")
+        if any(k in text for k in ["sign in", "log in", "login", "authenticate"]):
+            intents.add("login_action")
+        if any(k in text for k in ["upload", "attach", "resume", "cv", "file"]):
+            intents.add("upload_request")
+        return intents
+
+    def _intent_cache_key(self, labels: list[str], context: str = "") -> str:
+        stable = "\n".join(sorted(labels))
+        base = f"{stable}\n--ctx--\n{context[:600]}"
+        return f"labels::{hashlib.sha1(base.encode('utf-8')).hexdigest()}"
 
     def _is_progression_action(
         self,
@@ -987,20 +1384,11 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             name = item.name or ""
         elif action.selector:
             name = action.selector
-        progression_keywords = [
-            "next",
-            "continue",
-            "submit",
-            "apply",
-            "review",
-            "proceed",
-            "继续",
-            "下一步",
-            "提交",
-            "申请",
-        ]
-        text = name.lower()
-        return any(k in text for k in progression_keywords)
+        if not name:
+            return False
+        label_intents = self._infer_label_intents([name])
+        intents = label_intents.get(name, set())
+        return "progression_action" in intents or "apply_entry" in intents
 
     def _get_progression_block_reason(self) -> str | None:
         """
@@ -1010,8 +1398,41 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             visible_text = self.page.inner_text("body")
         except Exception:
             visible_text = ""
-        lower = (visible_text or "").lower()
+        evidence = self._collect_form_error_evidence(visible_text)
+        self._step_log(
+            event="progression_gate_evidence",
+            payload={
+                "step": self.step_count,
+                "url": getattr(self.page, "url", ""),
+                "evidence": evidence,
+            },
+        )
 
+        # 先看强结构化证据，避免“required skills”这类正文干扰
+        reason = evaluate_progression_block_reason(evidence, llm_confirms_context_error=False)
+        if reason:
+            return reason
+
+        # 仅有关键词命中时，做一次低频语义复核（可缓存）
+        global_hits = int(evidence.get("global_error_keyword_hits", 0) or 0)
+        if global_hits <= 0:
+            return None
+        llm_confirm = self._verify_error_context_with_llm(evidence, visible_text)
+        return evaluate_progression_block_reason(
+            evidence, llm_confirms_context_error=llm_confirm
+        )
+
+    def _collect_form_error_evidence(self, visible_text: str) -> dict[str, int | list[str]]:
+        """收集表单错误相关证据，尽量只看表单上下文。"""
+        base = {
+            "invalid_field_count": 0,
+            "required_empty_count": 0,
+            "error_container_hits": 0,
+            "local_error_keyword_hits": 0,
+            "red_error_hits": 0,
+            "global_error_keyword_hits": 0,
+            "error_snippets": [],
+        }
         error_keywords = [
             "required",
             "missing",
@@ -1024,14 +1445,189 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             "缺失",
             "错误",
         ]
-        if any(k in lower for k in error_keywords):
-            return "页面存在错误或必填缺失提示"
+        lower = (visible_text or "").lower()
+        base["global_error_keyword_hits"] = sum(
+            1 for kw in error_keywords if kw in lower
+        )
+        try:
+            payload = self.page.evaluate(
+                """
+                (errorKeywords) => {
+                  const toLower = (v) => String(v || "").toLowerCase();
+                  const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (!style) return false;
+                    if (style.display === "none" || style.visibility === "hidden") return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+                  const parseRgb = (color) => {
+                    if (!color) return null;
+                    const m = String(color).match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/i);
+                    if (!m) return null;
+                    return { r: Number(m[1]), g: Number(m[2]), b: Number(m[3]) };
+                  };
+                  const isReddish = (el) => {
+                    const rgb = parseRgb(window.getComputedStyle(el).color);
+                    if (!rgb) return false;
+                    return rgb.r >= 140 && rgb.r > rgb.g + 25 && rgb.r > rgb.b + 25;
+                  };
+                  const forms = Array.from(document.querySelectorAll("form"));
+                  const roots = forms.length > 0 ? forms : [document.body];
+                  const inScope = (el) => roots.some((root) => root && root.contains(el));
+                  const matchesKeyword = (text) => {
+                    const t = toLower(text);
+                    return errorKeywords.some((kw) => t.includes(toLower(kw)));
+                  };
+                  const invalidSet = new Set();
+                  const reqEmptySet = new Set();
+                  roots.forEach((root) => {
+                    if (!root) return;
+                    root.querySelectorAll("input, textarea, select").forEach((el) => {
+                      if (!isVisible(el)) return;
+                      if (el.getAttribute("aria-invalid") === "true" || el.matches(":invalid")) {
+                        invalidSet.add(el);
+                      }
+                      const required = el.required || el.getAttribute("aria-required") === "true";
+                      if (required) {
+                        const val = "value" in el ? String(el.value || "").trim() : "";
+                        if (!val) reqEmptySet.add(el);
+                      }
+                    });
+                  });
+                  const selectors = [
+                    "[role='alert']",
+                    "[aria-live='assertive']",
+                    "[class*='error' i]",
+                    "[class*='invalid' i]",
+                    "[class*='field-error' i]",
+                    "[data-testid*='error' i]"
+                  ];
+                  const nodes = [];
+                  selectors.forEach((sel) => {
+                    document.querySelectorAll(sel).forEach((el) => {
+                      if (isVisible(el) && inScope(el)) nodes.push(el);
+                    });
+                  });
+                  const dedup = Array.from(new Set(nodes));
+                  let localKwHits = 0;
+                  let redHits = 0;
+                  const snippets = [];
+                  dedup.forEach((node) => {
+                    const text = (node.innerText || node.textContent || "").trim();
+                    if (!text) return;
+                    if (matchesKeyword(text)) localKwHits += 1;
+                    if (isReddish(node)) redHits += 1;
+                    if (snippets.length < 6) snippets.push(text.slice(0, 180));
+                  });
+                  return {
+                    invalid_field_count: invalidSet.size,
+                    required_empty_count: reqEmptySet.size,
+                    error_container_hits: dedup.length,
+                    local_error_keyword_hits: localKwHits,
+                    red_error_hits: redHits,
+                    error_snippets: snippets
+                  };
+                }
+                """,
+                error_keywords,
+            )
+        except Exception:
+            payload = {}
 
-        missing_required = self._count_empty_required_fields()
-        if missing_required > 0:
-            return f"仍有 {missing_required} 个必填字段为空"
+        if isinstance(payload, dict):
+            for key in (
+                "invalid_field_count",
+                "required_empty_count",
+                "error_container_hits",
+                "local_error_keyword_hits",
+                "red_error_hits",
+            ):
+                try:
+                    base[key] = int(payload.get(key, 0) or 0)
+                except Exception:
+                    base[key] = 0
+            snippets = payload.get("error_snippets", [])
+            if isinstance(snippets, list):
+                base["error_snippets"] = [str(s)[:200] for s in snippets[:6]]
 
-        return None
+        return base
+
+    def _verify_error_context_with_llm(
+        self,
+        evidence: dict[str, int | list[str]],
+        visible_text: str,
+    ) -> bool:
+        """只在歧义场景下调用 LLM，判断是否为真实表单错误上下文。"""
+        if not self.client:
+            return False
+        cache_payload = json.dumps(
+            {
+                "evidence": evidence,
+                "text": (visible_text or "")[:1200],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        key = hashlib.sha1(cache_payload.encode("utf-8")).hexdigest()
+        if key in self._error_gate_cache:
+            return self._error_gate_cache[key]
+
+        snippets = evidence.get("error_snippets", [])
+        if not isinstance(snippets, list):
+            snippets = []
+        prompt = {
+            "task": "Decide if current page has blocking form-validation errors",
+            "rules": [
+                "Return true only if errors are clearly about form validation/submission.",
+                "Ignore job description text such as 'required skills'.",
+                "Prefer field/error-container evidence over generic wording.",
+            ],
+            "evidence": {
+                "invalid_field_count": int(evidence.get("invalid_field_count", 0) or 0),
+                "required_empty_count": int(
+                    evidence.get("required_empty_count", 0) or 0
+                ),
+                "error_container_hits": int(
+                    evidence.get("error_container_hits", 0) or 0
+                ),
+                "local_error_keyword_hits": int(
+                    evidence.get("local_error_keyword_hits", 0) or 0
+                ),
+                "red_error_hits": int(evidence.get("red_error_hits", 0) or 0),
+                "global_error_keyword_hits": int(
+                    evidence.get("global_error_keyword_hits", 0) or 0
+                ),
+                "error_snippets": [str(s)[:180] for s in snippets[:6]],
+            },
+            "visible_text_excerpt": (visible_text or "")[:1000],
+            "return_json_only": {"is_blocking_error": True, "reason": "brief"},
+        }
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.fallback_models[0],
+                temperature=0.0,
+                max_tokens=160,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You validate form error context. Return strict JSON only.",
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(prompt, ensure_ascii=False),
+                    },
+                ],
+            )
+            raw = completion.choices[0].message.content or ""
+            data = self._safe_parse_json(raw)
+            verdict = bool(data and data.get("is_blocking_error") is True)
+        except Exception:
+            verdict = False
+
+        self._error_gate_cache[key] = verdict
+        return verdict
 
     def _count_empty_required_fields(self) -> int:
         """
