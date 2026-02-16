@@ -271,7 +271,9 @@ class BrowserAgent:
         self.max_refresh_attempts = 2
         self.refresh_exhausted = False
         self.manual_reason_hint: str | None = None
-        self.simplify_state = str(getattr(job, "simplify_state", "unknown") or "unknown")
+        self.simplify_state = str(
+            getattr(job, "simplify_state", "unknown") or "unknown"
+        )
         self.simplify_message = str(getattr(job, "simplify_message", "") or "")
         self._intent_cache: dict[str, dict[str, list[str]]] = {}
         self._last_snapshot_intents: dict[str, set[str]] = {}
@@ -396,7 +398,9 @@ class BrowserAgent:
                             "⚠ 重复失败已无替代路径，停止执行并转人工处理",
                             "warn",
                         )
-                        self._log("========== AI Agent 运行结束（重复失败无替代）==========")
+                        self._log(
+                            "========== AI Agent 运行结束（重复失败无替代）=========="
+                        )
                         return False
                     self.history.append(
                         f"步骤{self.step_count}: 跳过重复失败动作 {action.action}({action.ref or action.selector or ''})，要求改用其他策略"
@@ -1120,8 +1124,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             risk_or_blocker = self._sanitize_simplify_claims(risk_or_blocker)
             if action_plan:
                 action_plan = [
-                    self._sanitize_simplify_claims(x) or ""
-                    for x in action_plan
+                    self._sanitize_simplify_claims(x) or "" for x in action_plan
                 ]
 
         next_action = None
@@ -2348,7 +2351,11 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 ),
                 "first_item_attrs": (
                     sorted(
-                        [k for k in vars(sorted_items[0]).keys() if not k.startswith("_")]
+                        [
+                            k
+                            for k in vars(sorted_items[0]).keys()
+                            if not k.startswith("_")
+                        ]
                     )[:20]
                     if sorted_items
                     else []
@@ -2381,7 +2388,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                     "error_type": type(e).__name__,
                     "item_repr": repr(item)[:300] if "item" in locals() else None,
                     "item_attrs": (
-                        sorted([k for k in vars(item).keys() if not k.startswith("_")])[:20]
+                        sorted([k for k in vars(item).keys() if not k.startswith("_")])[
+                            :20
+                        ]
                         if "item" in locals()
                         else []
                     ),

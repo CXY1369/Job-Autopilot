@@ -204,9 +204,7 @@ def test_build_alternate_action_selects_other_submit_button(monkeypatch):
     )
     agent = BrowserAgent(page=object(), job=_DummyJob())
     agent._last_snapshot_map = {
-        "e8": SnapshotItem(
-            ref="e8", role="button", name="Submit Application", nth=0
-        ),
+        "e8": SnapshotItem(ref="e8", role="button", name="Submit Application", nth=0),
         "e9": SnapshotItem(ref="e9", role="button", name="Submit", nth=1),
     }
     action = AgentAction(action="click", ref="e8", selector="Submit Application")

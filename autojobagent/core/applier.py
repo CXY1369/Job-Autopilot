@@ -177,11 +177,17 @@ def apply_for_job(job: JobPost) -> ApplyResult:
                     _log(job.id, "✓ Simplify 填表完成（申请页）")
                     simplify_applied = True
                     setattr(job, "simplify_state", "completed")
-                    setattr(job, "simplify_message", simplify_result.message or "autofilled")
+                    setattr(
+                        job, "simplify_message", simplify_result.message or "autofilled"
+                    )
                 else:
                     _log(job.id, f"⚠ Simplify: {simplify_result.message}", "warn")
                     setattr(job, "simplify_state", "ready")
-                    setattr(job, "simplify_message", simplify_result.message or "not_completed")
+                    setattr(
+                        job,
+                        "simplify_message",
+                        simplify_result.message or "not_completed",
+                    )
                 page.wait_for_timeout(1000)
                 # region agent log
                 append_debug_log(
