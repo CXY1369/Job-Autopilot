@@ -74,6 +74,8 @@ def apply_for_job(job: JobPost) -> ApplyResult:
 
         # 等待页面稳定
         page.wait_for_timeout(2000)
+        setattr(job, "simplify_state", "unknown")
+        setattr(job, "simplify_message", "not_probed_yet")
         # region agent log
         append_debug_log(
             location="applier.py:post_goto",
@@ -142,6 +144,12 @@ def apply_for_job(job: JobPost) -> ApplyResult:
         if session.simplify_loaded and _looks_like_application_page(page):
             _log(job.id, "\n--- 步骤 2.5: 申请页 Simplify 状态检测 ---")
             simplify_state = probe_simplify_state(page)
+            setattr(job, "simplify_state", simplify_state.status)
+            setattr(
+                job,
+                "simplify_message",
+                simplify_state.message or "n/a",
+            )
             _log(
                 job.id,
                 f"ℹ Simplify 状态: {simplify_state.status} ({simplify_state.message or 'n/a'})",
@@ -168,8 +176,12 @@ def apply_for_job(job: JobPost) -> ApplyResult:
                 if simplify_result.autofilled:
                     _log(job.id, "✓ Simplify 填表完成（申请页）")
                     simplify_applied = True
+                    setattr(job, "simplify_state", "completed")
+                    setattr(job, "simplify_message", simplify_result.message or "autofilled")
                 else:
                     _log(job.id, f"⚠ Simplify: {simplify_result.message}", "warn")
+                    setattr(job, "simplify_state", "ready")
+                    setattr(job, "simplify_message", simplify_result.message or "not_completed")
                 page.wait_for_timeout(1000)
                 # region agent log
                 append_debug_log(
@@ -195,6 +207,9 @@ def apply_for_job(job: JobPost) -> ApplyResult:
                 _log(job.id, "✓ Simplify 已完成当前页自动填写")
             else:
                 _log(job.id, "ℹ Simplify 当前不可用，交由 Agent 继续填写")
+        elif not session.simplify_loaded:
+            setattr(job, "simplify_state", "unavailable")
+            setattr(job, "simplify_message", "extension_not_loaded")
 
         # 3. AI Agent 接管（补全 + 提交）
         _log(job.id, "\n--- 步骤 3: AI Agent 智能操作 ---")

@@ -126,11 +126,18 @@ def evaluate_progression_block_reason(
                 break
     invalid_field_samples = evidence.get("invalid_field_samples", [])
     file_upload_state_samples = evidence.get("file_upload_state_samples", [])
+    required_empty_samples = evidence.get("required_empty_samples", [])
     all_invalid_are_file = False
+    all_required_empty_are_file = False
     if isinstance(invalid_field_samples, list) and invalid_field_samples:
         all_invalid_are_file = all(
             isinstance(it, dict) and str(it.get("type", "")).lower() == "file"
             for it in invalid_field_samples
+        )
+    if isinstance(required_empty_samples, list) and required_empty_samples:
+        all_required_empty_are_file = all(
+            isinstance(it, dict) and str(it.get("type", "")).lower() == "file"
+            for it in required_empty_samples
         )
     has_upload_ready_signal = False
     if isinstance(file_upload_state_samples, list):
@@ -149,12 +156,14 @@ def evaluate_progression_block_reason(
             all_invalid_are_file
             and has_upload_ready_signal
             and has_enabled_submit
-            and required_empty_count <= 0
+            and (required_empty_count <= 0 or all_required_empty_are_file)
             and error_container_hits <= 0
             and red_error_hits <= 0
             and local_error_keyword_hits <= 0
         ):
             evidence["allowed_by_file_upload_state"] = True
+            evidence["gate_decision"] = "allow"
+            evidence["allowed_by"] = "file_only_invalid_with_upload_ready"
             return None
         # 对“仅 invalid 单信号”做保护：若提交按钮可用且无其它错误证据，不阻塞提交流程
         if (
@@ -165,19 +174,31 @@ def evaluate_progression_block_reason(
             and local_error_keyword_hits <= 0
             and has_enabled_submit
         ):
+            evidence["gate_decision"] = "allow"
+            evidence["allowed_by"] = "single_invalid_without_other_errors"
             return None
+        evidence["gate_decision"] = "block"
+        evidence["blocked_by"] = "invalid_field_count"
         return f"检测到 {invalid_field_count} 个无效字段（aria-invalid/:invalid）"
     if required_empty_count > 0:
+        evidence["gate_decision"] = "block"
+        evidence["blocked_by"] = "required_empty_count"
         return f"检测到 {required_empty_count} 个必填字段为空"
     if error_container_hits > 0 and (
         red_error_hits > 0 or local_error_keyword_hits > 0
     ):
+        evidence["gate_decision"] = "block"
+        evidence["blocked_by"] = "error_container_with_visual_or_local_keyword"
         return "检测到表单错误提示（错误容器/红色文本）"
 
     # 仅有全页关键词时，不立即拦截；需要 LLM 复核上下文
     if global_error_keyword_hits > 0 and llm_confirms_context_error:
+        evidence["gate_decision"] = "block"
+        evidence["blocked_by"] = "global_keyword_confirmed_by_llm"
         return "检测到与当前表单相关的错误提示（经语义复核）"
 
+    evidence["gate_decision"] = "allow"
+    evidence["allowed_by"] = "no_blocking_evidence"
     return None
 
 
@@ -250,6 +271,8 @@ class BrowserAgent:
         self.max_refresh_attempts = 2
         self.refresh_exhausted = False
         self.manual_reason_hint: str | None = None
+        self.simplify_state = str(getattr(job, "simplify_state", "unknown") or "unknown")
+        self.simplify_message = str(getattr(job, "simplify_message", "") or "")
         self._intent_cache: dict[str, dict[str, list[str]]] = {}
         self._last_snapshot_intents: dict[str, set[str]] = {}
         self._error_gate_cache: dict[str, bool] = {}
@@ -257,6 +280,7 @@ class BrowserAgent:
         self._state_cache_by_fingerprint: dict[str, AgentState] = {}
         self._action_fail_counts: dict[str, int] = {}
         self._action_cache_use_counts: dict[str, int] = {}
+        self._repeated_skip_counts: dict[str, int] = {}
 
     # region agent log
     def _ndjson_log(self, hypothesis_id: str, location: str, message: str, data: dict):
@@ -344,15 +368,40 @@ class BrowserAgent:
                 action = state.next_action
                 fp = state.page_fingerprint or self._last_observed_fingerprint
                 if self._should_skip_repeated_action(fp, action):
+                    skip_key = self._action_fail_key(fp, action)
+                    skip_count = self._repeated_skip_counts.get(skip_key, 0) + 1
+                    self._repeated_skip_counts[skip_key] = skip_count
                     self._log(
                         "⚠ 检测到同页面重复失败动作，触发重规划而不重复执行",
                         "warn",
                     )
+                    alternate_action = self._build_alternate_action(action)
+                    if alternate_action is not None:
+                        self._log("   ↪ 尝试同页替代动作以打破循环")
+                        action = alternate_action
+                    elif skip_count == 1:
+                        # 第一次跳过时清理该页缓存，强制下一步重规划。
+                        if fp:
+                            self._state_cache_by_fingerprint.pop(fp, None)
+                        self.history.append(
+                            f"步骤{self.step_count}: 跳过重复失败动作后清理页面计划缓存 {action.action}({action.ref or action.selector or ''})"
+                        )
+                        self.consecutive_failures += 1
+                        continue
+                    elif skip_count >= 3:
+                        self._set_manual_reason_hint(
+                            "同页面重复失败且无可执行替代动作，需要人工处理"
+                        )
+                        self._log(
+                            "⚠ 重复失败已无替代路径，停止执行并转人工处理",
+                            "warn",
+                        )
+                        self._log("========== AI Agent 运行结束（重复失败无替代）==========")
+                        return False
                     self.history.append(
                         f"步骤{self.step_count}: 跳过重复失败动作 {action.action}({action.ref or action.selector or ''})，要求改用其他策略"
                     )
                     self.consecutive_failures += 1
-                    continue
                 elem_info = f"[{action.element_type}]" if action.element_type else ""
                 ref_info = f"(ref={action.ref}) " if action.ref else ""
                 self._log(
@@ -869,13 +918,18 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 ## 上传信号检测
 {upload_signal_text}
 
+## Simplify 系统探针状态（以此为准）
+- state: {self.simplify_state}
+- message: {self.simplify_message or "n/a"}
+- 规则：若 state 为 unavailable/unknown，不得声称“Simplify 已自动填写”
+
 ## 白名单可上传候选文件（仅可从以下文件中选择）
 {upload_candidates_text}
 
 ## {new_page_hint}请按以下步骤处理当前页面：
 
 **1. 完整扫描并规划（列出所有空缺！）**
-- Simplify 是否已自动填写完成？
+- 仅当上方 Simplify state=completed/running 时，才能提及 Simplify 已填写
 - 列出**所有**空缺必填字段，不要只说第一个！
 - 每个字段给出**具体值**（从用户信息查找）
 - checkbox 多选：取"用户偏好 ∩ 页面选项"的交集（模糊匹配）
@@ -1059,6 +1113,16 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             action_plan = [str(x) for x in action_plan[:8]]
         if not isinstance(risk_or_blocker, str):
             risk_or_blocker = None
+        if self.simplify_state.lower() in ("unavailable", "unknown"):
+            summary = self._sanitize_simplify_claims(summary)
+            page_overview = self._sanitize_simplify_claims(page_overview)
+            field_audit = self._sanitize_simplify_claims(field_audit)
+            risk_or_blocker = self._sanitize_simplify_claims(risk_or_blocker)
+            if action_plan:
+                action_plan = [
+                    self._sanitize_simplify_claims(x) or ""
+                    for x in action_plan
+                ]
 
         next_action = None
         if status == "continue" and data.get("next_action"):
@@ -2269,15 +2333,64 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
     ) -> str:
         """为页面构建稳定指纹，用于计划缓存与重复动作抑制。"""
         top_items = []
-        for item in sorted(snapshot_map.values(), key=lambda x: x.ref)[:40]:
-            top_items.append(
-                {
-                    "r": item.role,
-                    "n": (item.name or "")[:60],
-                    "t": item.type or "",
-                    "req": bool(item.required),
-                }
+        sorted_items = sorted(snapshot_map.values(), key=lambda x: x.ref)[:40]
+        # region agent log
+        append_debug_log(
+            location="vision_agent.py:_build_page_fingerprint:entry",
+            message="fingerprint entry snapshot item schema",
+            data={
+                "job_id": self.job_id,
+                "step": self.step_count,
+                "url": current_url,
+                "snapshot_count": len(snapshot_map),
+                "first_item_class": (
+                    sorted_items[0].__class__.__name__ if sorted_items else None
+                ),
+                "first_item_attrs": (
+                    sorted(
+                        [k for k in vars(sorted_items[0]).keys() if not k.startswith("_")]
+                    )[:20]
+                    if sorted_items
+                    else []
+                ),
+            },
+            run_id="pre-fix-debug",
+            hypothesis_id="H8",
+        )
+        # endregion
+        try:
+            for item in sorted_items:
+                top_items.append(
+                    {
+                        "r": item.role,
+                        "n": (item.name or "")[:60],
+                        "t": item.input_type or "",
+                        "req": bool(item.required),
+                    }
+                )
+        except Exception as e:
+            # region agent log
+            append_debug_log(
+                location="vision_agent.py:_build_page_fingerprint:error",
+                message="fingerprint build failed due to snapshot item schema mismatch",
+                data={
+                    "job_id": self.job_id,
+                    "step": self.step_count,
+                    "url": current_url,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "item_repr": repr(item)[:300] if "item" in locals() else None,
+                    "item_attrs": (
+                        sorted([k for k in vars(item).keys() if not k.startswith("_")])[:20]
+                        if "item" in locals()
+                        else []
+                    ),
+                },
+                run_id="pre-fix-debug",
+                hypothesis_id="H9",
             )
+            # endregion
+            raise
         payload = {"url": (current_url or "").split("#")[0], "items": top_items}
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
@@ -2305,8 +2418,51 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         key = self._action_fail_key(page_fingerprint, action)
         if success:
             self._action_fail_counts[key] = 0
+            self._repeated_skip_counts[key] = 0
             return
         self._action_fail_counts[key] = self._action_fail_counts.get(key, 0) + 1
+
+    def _sanitize_simplify_claims(self, text: str | None) -> str | None:
+        if not text:
+            return text
+        lowered = text.lower()
+        if "simplify" not in lowered:
+            return text
+        claim_markers = [
+            "已自动填写",
+            "自动填写完成",
+            "simplify 已",
+            "simplify已",
+            "autofill complete",
+            "autofilled",
+        ]
+        if any(marker in lowered for marker in claim_markers):
+            return text.replace("Simplify", "页面").replace("simplify", "页面")
+        return text
+
+    def _build_alternate_action(self, action: AgentAction) -> AgentAction | None:
+        """为重复失败动作构建同页替代动作，优先尝试其他 submit/apply 按钮。"""
+        if action.action != "click":
+            return None
+        source_item = self._last_snapshot_map.get(action.ref or "")
+        if not self._is_progression_action(action, item=source_item):
+            return None
+        for ref, item in self._last_snapshot_map.items():
+            if ref == action.ref:
+                continue
+            if item.role not in ("button", "link"):
+                continue
+            label = (item.name or "").lower()
+            if "submit" not in label and "apply" not in label:
+                continue
+            return AgentAction(
+                action="click",
+                ref=ref,
+                selector=item.name,
+                element_type=item.role,
+                reason="替代提交入口，避免重复点击同一按钮",
+            )
+        return None
 
     def _step_log(self, event: str, payload: dict) -> None:
         """写入每步证据链日志。"""
@@ -2717,6 +2873,13 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             self.page.reload(wait_until="domcontentloaded", timeout=30000)
             self.page.wait_for_timeout(1200)
             self.refresh_attempts += 1
+            # 刷新后清理缓存，避免沿用旧页面动作计划。
+            self._state_cache_by_fingerprint.clear()
+            self._action_fail_counts.clear()
+            self._action_cache_use_counts.clear()
+            self._repeated_skip_counts.clear()
+            self._error_gate_cache.clear()
+            self._last_observed_fingerprint = ""
             self.history.append(
                 f"刷新页面重试({self.refresh_attempts}/{self.max_refresh_attempts})"
             )
