@@ -53,3 +53,18 @@ def test_assess_manual_required_captcha_dom_signal():
     )
     assert result.manual_required is True
     assert result.reason == "captcha_detected"
+
+
+def test_assess_manual_required_recaptcha_legal_notice_not_blocking():
+    text = (
+        "This site is protected by reCAPTCHA and the Google Privacy Policy and Terms of Service apply."
+    )
+    result = assess_manual_required(
+        text,
+        password_input_count=0,
+        captcha_element_count=0,
+        has_captcha_challenge_text=False,
+        has_login_button=False,
+        has_apply_cta=True,
+    )
+    assert result.manual_required is False

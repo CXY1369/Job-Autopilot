@@ -18,7 +18,7 @@ import io
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Literal
@@ -37,6 +37,7 @@ from ..config import (
     resolve_upload_candidate,
 )
 from .browser_manager import BrowserManager
+from .debug_probe import append_debug_log
 from .ui_snapshot import build_ui_snapshot, SnapshotItem
 from .heuristics import assess_manual_required
 
@@ -86,6 +87,11 @@ class AgentState:
     summary: str  # 当前页面状态描述
     next_action: Optional[AgentAction] = None
     raw_response: Optional[str] = None
+    page_overview: Optional[str] = None
+    field_audit: Optional[str] = None
+    action_plan: Optional[list[str]] = None
+    risk_or_blocker: Optional[str] = None
+    page_fingerprint: Optional[str] = None
 
 
 def evaluate_progression_block_reason(
@@ -100,8 +106,70 @@ def evaluate_progression_block_reason(
     error_container_hits = int(evidence.get("error_container_hits", 0) or 0)
     local_error_keyword_hits = int(evidence.get("local_error_keyword_hits", 0) or 0)
     global_error_keyword_hits = int(evidence.get("global_error_keyword_hits", 0) or 0)
+    submit_candidates = evidence.get("submit_candidates", [])
+    has_enabled_submit = False
+    if isinstance(submit_candidates, list):
+        for item in submit_candidates:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "")).lower()
+            item_type = str(item.get("type", "")).lower()
+            is_submit_like = (
+                ("submit" in text)
+                or ("apply" in text)
+                or item_type == "submit"
+            )
+            if not is_submit_like:
+                continue
+            disabled = bool(item.get("disabled", False))
+            aria_disabled = str(item.get("aria_disabled", "")).lower()
+            if (not disabled) and aria_disabled not in ("true", "1"):
+                has_enabled_submit = True
+                break
+    invalid_field_samples = evidence.get("invalid_field_samples", [])
+    file_upload_state_samples = evidence.get("file_upload_state_samples", [])
+    all_invalid_are_file = False
+    if isinstance(invalid_field_samples, list) and invalid_field_samples:
+        all_invalid_are_file = all(
+            isinstance(it, dict)
+            and str(it.get("type", "")).lower() == "file"
+            for it in invalid_field_samples
+        )
+    has_upload_ready_signal = False
+    if isinstance(file_upload_state_samples, list):
+        for sample in file_upload_state_samples:
+            if not isinstance(sample, dict):
+                continue
+            if bool(sample.get("has_replace_text")) or bool(
+                sample.get("has_uploaded_file_name")
+            ):
+                has_upload_ready_signal = True
+                break
 
     if invalid_field_count > 0:
+        # 对 file input 的站点差异做特例：只要上传状态已就绪，不阻塞提交
+        if (
+            all_invalid_are_file
+            and has_upload_ready_signal
+            and has_enabled_submit
+            and required_empty_count <= 0
+            and error_container_hits <= 0
+            and red_error_hits <= 0
+            and local_error_keyword_hits <= 0
+        ):
+            evidence["allowed_by_file_upload_state"] = True
+            return None
+        # 对“仅 invalid 单信号”做保护：若提交按钮可用且无其它错误证据，不阻塞提交流程
+        if (
+            not all_invalid_are_file
+            and
+            required_empty_count <= 0
+            and error_container_hits <= 0
+            and red_error_hits <= 0
+            and local_error_keyword_hits <= 0
+            and has_enabled_submit
+        ):
+            return None
         return f"检测到 {invalid_field_count} 个无效字段（aria-invalid/:invalid）"
     if required_empty_count > 0:
         return f"检测到 {required_empty_count} 个必填字段为空"
@@ -128,11 +196,19 @@ class BrowserAgent:
     - 循环：不断重复直到任务完成或放弃
     """
 
-    def __init__(self, page: Page, job, max_steps: int = 50):
+    def __init__(
+        self,
+        page: Page,
+        job,
+        max_steps: int = 50,
+        *,
+        pre_nav_only: bool = False,
+    ):
         self.page = page
         self.job = job
         self.job_id = job.id
         self.max_steps = max_steps
+        self.pre_nav_only = pre_nav_only
         self.step_count = 0
         self.history: list[str] = []  # 操作历史，帮助 LLM 避免重复
 
@@ -181,6 +257,10 @@ class BrowserAgent:
         self._intent_cache: dict[str, dict[str, list[str]]] = {}
         self._last_snapshot_intents: dict[str, set[str]] = {}
         self._error_gate_cache: dict[str, bool] = {}
+        self._last_observed_fingerprint: str = ""
+        self._state_cache_by_fingerprint: dict[str, AgentState] = {}
+        self._action_fail_counts: dict[str, int] = {}
+        self._action_cache_use_counts: dict[str, int] = {}
 
     # region agent log
     def _ndjson_log(self, hypothesis_id: str, location: str, message: str, data: dict):
@@ -210,7 +290,7 @@ class BrowserAgent:
         self._log("========== AI Agent 开始运行 ==========")
         self._log(f"最大步数: {self.max_steps}")
 
-        if not self.client:
+        if not self.client and not self.pre_nav_only:
             self._log("❌ OPENAI_API_KEY 未设置，无法运行 Agent", "error")
             return False
 
@@ -227,9 +307,21 @@ class BrowserAgent:
 
             # 2. 记录 LLM 的分析
             self._log(f"📋 状态: {state.summary}")
+            if state.page_overview:
+                self._log(f"🧭 页面概览: {state.page_overview}")
+            if state.field_audit:
+                self._log(f"🧾 字段审计: {state.field_audit}")
+            if state.action_plan:
+                self._log(f"🗺 计划序列: {' -> '.join(state.action_plan[:5])}")
+            if state.risk_or_blocker:
+                self._log(f"⚠ 风险/阻塞: {state.risk_or_blocker}")
 
             # 3. 检查是否完成（带二次验证）
             if state.status == "done":
+                if self.pre_nav_only:
+                    self._log("✓ 预导航完成：已进入申请页")
+                    self._log("========== AI Agent 运行结束 ==========")
+                    return True
                 self._log("🔍 Agent 判断任务完成，进行二次验证...")
 
                 # 二次验证：检查页面是否真的显示成功信息
@@ -254,6 +346,17 @@ class BrowserAgent:
             # 4. 执行下一步操作
             if state.next_action:
                 action = state.next_action
+                fp = state.page_fingerprint or self._last_observed_fingerprint
+                if self._should_skip_repeated_action(fp, action):
+                    self._log(
+                        "⚠ 检测到同页面重复失败动作，触发重规划而不重复执行",
+                        "warn",
+                    )
+                    self.history.append(
+                        f"步骤{self.step_count}: 跳过重复失败动作 {action.action}({action.ref or action.selector or ''})，要求改用其他策略"
+                    )
+                    self.consecutive_failures += 1
+                    continue
                 elem_info = f"[{action.element_type}]" if action.element_type else ""
                 ref_info = f"(ref={action.ref}) " if action.ref else ""
                 self._log(
@@ -263,6 +366,7 @@ class BrowserAgent:
                     self._log(f"   原因: {action.reason}")
 
                 success = self._execute_action(action)
+                self._record_action_result(fp, action, success)
 
                 # 记录到历史（让 AI 能看到操作结果，从而调整策略）
                 target_desc = action.ref or (action.selector or "")
@@ -388,9 +492,40 @@ class BrowserAgent:
         # 2.5 生成可交互元素快照
         snapshot_text, snapshot_map = build_ui_snapshot(self.page)
         self._last_snapshot_map = snapshot_map
+        try:
+            current_url_for_fp = self.page.url
+        except Exception:
+            current_url_for_fp = "unknown"
+        page_fingerprint = self._build_page_fingerprint(current_url_for_fp, snapshot_map)
+        self._last_observed_fingerprint = page_fingerprint
         self._last_snapshot_intents = self._infer_snapshot_intents(
             snapshot_map, visible_text
         )
+        # region agent log
+        append_debug_log(
+            location="vision_agent.py:_observe_and_think:snapshot_intents",
+            message="snapshot and intent summary",
+            data={
+                "job_id": self.job_id,
+                "step": self.step_count,
+                "url": getattr(self.page, "url", ""),
+                "snapshot_items": len(snapshot_map),
+                "apply_intent_refs": sum(
+                    1
+                    for intents in self._last_snapshot_intents.values()
+                    if "apply_entry" in intents
+                ),
+                "login_intent_refs": sum(
+                    1
+                    for intents in self._last_snapshot_intents.values()
+                    if "login_action" in intents
+                ),
+                "sample_refs": list(sorted(snapshot_map.keys()))[:8],
+            },
+            run_id="pre-fix-debug",
+            hypothesis_id="H4",
+        )
+        # endregion
 
         # 2.6 证据化检测登录/验证码等需人工介入场景（避免纯关键词误判）
         evidence = self._collect_manual_required_evidence(
@@ -402,12 +537,31 @@ class BrowserAgent:
             visible_text,
             password_input_count=evidence["password_input_count"],
             captcha_element_count=evidence["captcha_element_count"],
+            has_captcha_challenge_text=evidence["has_captcha_challenge_text"],
             has_login_button=evidence["has_login_button"],
             has_apply_cta=evidence["has_apply_cta"],
         )
         page_state = self._classify_page_state(
             snapshot_map, evidence, manual_assessment
         )
+        # region agent log
+        append_debug_log(
+            location="vision_agent.py:_observe_and_think:manual_gate_check",
+            message="manual gate decision",
+            data={
+                "job_id": self.job_id,
+                "step": self.step_count,
+                "url": getattr(self.page, "url", ""),
+                "page_state": page_state,
+                "manual_required": manual_assessment.manual_required,
+                "manual_reason": manual_assessment.reason,
+                "manual_confidence": manual_assessment.confidence,
+                "evidence": manual_assessment.evidence,
+            },
+            run_id="pre-fix-debug",
+            hypothesis_id="H2",
+        )
+        # endregion
         self._step_log(
             event="page_state",
             payload={
@@ -430,7 +584,33 @@ class BrowserAgent:
             return AgentState(
                 status="stuck",
                 summary="检测到登录/验证码/身份验证页面，需要人工处理",
+                page_fingerprint=page_fingerprint,
             )
+
+        if self.pre_nav_only:
+            if page_state == "application_or_form_page":
+                return AgentState(
+                    status="done",
+                    summary="预导航阶段：已进入申请页",
+                    page_fingerprint=page_fingerprint,
+                )
+            if page_state == "job_detail_with_apply":
+                apply_action = self._build_apply_entry_action(
+                    snapshot_map, self._last_snapshot_intents
+                )
+                if apply_action:
+                    return AgentState(
+                        status="continue",
+                        summary="预导航阶段：点击 Apply 进入申请页",
+                        next_action=apply_action,
+                        page_fingerprint=page_fingerprint,
+                    )
+            return AgentState(
+                status="stuck",
+                summary="预导航阶段：未识别到可进入申请页的入口",
+                page_fingerprint=page_fingerprint,
+            )
+
         if page_state == "job_detail_with_apply":
             apply_action = self._build_apply_entry_action(
                 snapshot_map, self._last_snapshot_intents
@@ -440,6 +620,7 @@ class BrowserAgent:
                     status="continue",
                     summary="检测到职位详情页，先点击 Apply 进入申请页面",
                     next_action=apply_action,
+                    page_fingerprint=page_fingerprint,
                 )
 
         # 3. 获取页面 URL 并检测页面变化
@@ -468,6 +649,27 @@ class BrowserAgent:
                 "snapshot_preview": snapshot_text[:2000],
             },
         )
+
+        cached_state = self._state_cache_by_fingerprint.get(page_fingerprint)
+        if (
+            cached_state
+            and cached_state.next_action is not None
+            and cached_state.status == "continue"
+        ):
+            cache_key = self._action_fail_key(page_fingerprint, cached_state.next_action)
+            if (
+                self._action_fail_counts.get(cache_key, 0) == 0
+                and self._action_cache_use_counts.get(cache_key, 0) < 1
+            ):
+                self._action_cache_use_counts[cache_key] = (
+                    self._action_cache_use_counts.get(cache_key, 0) + 1
+                )
+                self._log("⚡ 页面稳定，复用上一步计划缓存")
+                return replace(
+                    cached_state,
+                    summary=f"{cached_state.summary}（缓存计划）",
+                    page_fingerprint=page_fingerprint,
+                )
 
         # 4. 构建 prompt
         history_text = "\n".join(self.history[-5:]) if self.history else "无"
@@ -614,6 +816,10 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 {{
   "status": "continue/done/stuck",
   "summary": "当前看到什么（中文）",
+  "page_overview": "页面结构与关键信息概览（可选）",
+  "field_audit": "必填项已完成/未完成清单（可选）",
+  "action_plan": ["计划步骤1", "计划步骤2"],
+  "risk_or_blocker": "当前潜在风险或阻塞（可选）",
   "next_action": {{
     "action": "操作",
     "ref": "可交互元素 ref（优先使用）",
@@ -839,6 +1045,20 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 
         status = data.get("status", "continue")
         summary = data.get("summary", "")
+        page_overview = data.get("page_overview")
+        field_audit = data.get("field_audit")
+        action_plan = data.get("action_plan")
+        risk_or_blocker = data.get("risk_or_blocker")
+        if not isinstance(page_overview, str):
+            page_overview = None
+        if not isinstance(field_audit, str):
+            field_audit = None
+        if not isinstance(action_plan, list):
+            action_plan = None
+        else:
+            action_plan = [str(x) for x in action_plan[:8]]
+        if not isinstance(risk_or_blocker, str):
+            risk_or_blocker = None
 
         next_action = None
         if status == "continue" and data.get("next_action"):
@@ -852,12 +1072,22 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 reason=act.get("reason"),
             )
 
-        return AgentState(
+        result_state = AgentState(
             status=status,
             summary=summary,
             next_action=next_action,
             raw_response=raw,
+            page_overview=page_overview,
+            field_audit=field_audit,
+            action_plan=action_plan,
+            risk_or_blocker=risk_or_blocker,
+            page_fingerprint=page_fingerprint,
         )
+        if result_state.status == "continue" and result_state.next_action is not None:
+            self._state_cache_by_fingerprint[page_fingerprint] = result_state
+            cache_key = self._action_fail_key(page_fingerprint, result_state.next_action)
+            self._action_cache_use_counts[cache_key] = 0
+        return result_state
 
     def _execute_action(self, action: AgentAction) -> bool:
         """
@@ -1063,13 +1293,22 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         captcha_selectors = [
             "iframe[src*='recaptcha']",
             ".g-recaptcha",
-            "[id*='captcha' i]",
-            "[class*='captcha' i]",
+            "iframe[src*='hcaptcha']",
+            ".h-captcha",
+            "[data-sitekey][data-callback]",
             "iframe[title*='captcha' i]",
         ]
-        captcha_element_count = 0
-        for selector in captcha_selectors:
-            captcha_element_count += self._safe_locator_count(selector)
+        captcha_element_count = self._count_visible_captcha_challenge(captcha_selectors)
+        lower_text = (visible_text or "").lower()
+        captcha_challenge_phrases = [
+            "i am not a robot",
+            "verify you are human",
+            "security check",
+            "complete the challenge",
+            "select all images",
+            "are you human",
+        ]
+        has_captcha_challenge_text = any(p in lower_text for p in captcha_challenge_phrases)
 
         has_login_button = any(
             ref in snapshot_map
@@ -1086,9 +1325,30 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         page_text_intents = self._infer_text_intents(visible_text, limit=1200)
         has_login_button = has_login_button or ("login_action" in page_text_intents)
 
+        captcha_selector_details = self._collect_selector_details(captcha_selectors)
+        # region agent log
+        append_debug_log(
+            location="vision_agent.py:_collect_manual_required_evidence:captcha",
+            message="captcha selector diagnostics",
+            data={
+                "job_id": self.job_id,
+                "url": getattr(self.page, "url", ""),
+                "captcha_selector_details": captcha_selector_details,
+                "password_input_count": password_input_count,
+                "has_captcha_challenge_text": has_captcha_challenge_text,
+                "has_login_button": has_login_button,
+                "has_apply_cta": has_apply_cta,
+                "page_text_intents": sorted(page_text_intents),
+            },
+            run_id="pre-fix-debug",
+            hypothesis_id="H1",
+        )
+        # endregion
+
         return {
             "password_input_count": password_input_count,
             "captcha_element_count": captcha_element_count,
+            "has_captcha_challenge_text": has_captcha_challenge_text,
             "has_login_button": has_login_button,
             "has_apply_cta": has_apply_cta,
         }
@@ -1111,6 +1371,35 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         )
         has_form_fields = form_item_count >= 2
         has_apply_cta = bool(evidence.get("has_apply_cta", False))
+        current_url = ""
+        try:
+            current_url = (self.page.url or "").lower()
+        except Exception:
+            current_url = ""
+        looks_like_application_url = (
+            "/application" in current_url
+            or "/apply" in current_url
+            or "greenhouse.io" in current_url
+        )
+        # region agent log
+        append_debug_log(
+            location="vision_agent.py:_classify_page_state:inputs",
+            message="page state classification inputs",
+            data={
+                "job_id": self.job_id,
+                "url": current_url,
+                "form_item_count": form_item_count,
+                "has_form_fields": has_form_fields,
+                "has_apply_cta": has_apply_cta,
+                "looks_like_application_url": looks_like_application_url,
+            },
+            run_id="pre-fix-debug",
+            hypothesis_id="H5",
+        )
+        # endregion
+
+        if looks_like_application_url:
+            return "application_or_form_page"
 
         if has_apply_cta and not has_form_fields:
             return "job_detail_with_apply"
@@ -1122,12 +1411,35 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         snapshot_intents: dict[str, set[str]],
     ) -> AgentAction | None:
         """在职位详情页中优先定位进入申请流程的 Apply 按钮。"""
+        current_url = ""
+        try:
+            current_url = (self.page.url or "").lower()
+        except Exception:
+            current_url = ""
+        if "/application" in current_url or "/apply" in current_url:
+            return None
+
         candidates: list[SnapshotItem] = []
         for ref, item in snapshot_map.items():
             if item.role not in ("button", "link"):
                 continue
             intents = snapshot_intents.get(ref, set())
             if "apply_entry" in intents:
+                label = (item.name or "").lower()
+                # 明确排除非“进入申请页”的按钮，避免把 Replace/Upload 当作 Apply
+                if any(
+                    bad in label
+                    for bad in [
+                        "replace",
+                        "upload",
+                        "autofill",
+                        "tailor",
+                        "settings",
+                        "profile",
+                        "close",
+                    ]
+                ):
+                    continue
                 candidates.append(item)
         if not candidates:
             return None
@@ -1152,6 +1464,82 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             return self.page.locator(selector).count()
         except Exception:
             return 0
+
+    def _collect_selector_details(self, selectors: list[str]) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for selector in selectors:
+            try:
+                details = self.page.evaluate(
+                    """
+                    (sel) => {
+                      const nodes = Array.from(document.querySelectorAll(sel));
+                      const isVisible = (el) => {
+                        const st = window.getComputedStyle(el);
+                        if (!st) return false;
+                        if (st.display === "none" || st.visibility === "hidden") return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                      };
+                      const samples = nodes.slice(0, 3).map((el) => ({
+                        tag: (el.tagName || "").toLowerCase(),
+                        id: el.id || "",
+                        className: String(el.className || "").slice(0, 80),
+                        text: String(el.textContent || "").trim().slice(0, 120),
+                        visible: isVisible(el),
+                        rect: (() => {
+                          const r = el.getBoundingClientRect();
+                          return { w: Math.round(r.width), h: Math.round(r.height) };
+                        })()
+                      }));
+                      return {
+                        total: nodes.length,
+                        visible: samples.filter((s) => s.visible).length,
+                        samples,
+                      };
+                    }
+                    """,
+                    selector,
+                )
+            except Exception as exc:
+                details = {"error": str(exc)}
+            out[selector] = details
+        return out
+
+    def _count_visible_captcha_challenge(self, selectors: list[str]) -> int:
+        """只统计可见验证码挑战节点，排除 recaptcha 法律声明文本。"""
+        total = 0
+        for selector in selectors:
+            try:
+                count = self.page.evaluate(
+                    """
+                    (sel) => {
+                      const nodes = Array.from(document.querySelectorAll(sel));
+                      const isVisible = (el) => {
+                        const st = window.getComputedStyle(el);
+                        if (!st) return false;
+                        if (st.display === "none" || st.visibility === "hidden") return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                      };
+                      const isLegalNotice = (el) => {
+                        const cls = String(el.className || "").toLowerCase();
+                        const text = String(el.textContent || "").toLowerCase();
+                        return (
+                          cls.includes("recaptchalegal") ||
+                          (text.includes("protected by recaptcha") &&
+                           text.includes("privacy policy") &&
+                           text.includes("terms of service"))
+                        );
+                      };
+                      return nodes.filter((el) => isVisible(el) && !isLegalNotice(el)).length;
+                    }
+                    """,
+                    selector,
+                )
+                total += int(count or 0)
+            except Exception:
+                continue
+        return total
 
     def _infer_snapshot_intents(
         self,
@@ -1417,16 +1805,63 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             evidence, llm_confirms_context_error=False
         )
         if reason:
+            # region agent log
+            append_debug_log(
+                location="vision_agent.py:_get_progression_block_reason:decision",
+                message="progression gate blocked by structured evidence",
+                data={
+                    "job_id": self.job_id,
+                    "step": self.step_count,
+                    "url": getattr(self.page, "url", ""),
+                    "reason": reason,
+                    "evidence": evidence,
+                },
+                run_id="pre-fix-debug",
+                hypothesis_id="H6",
+            )
+            # endregion
             return reason
 
         # 仅有关键词命中时，做一次低频语义复核（可缓存）
         global_hits = int(evidence.get("global_error_keyword_hits", 0) or 0)
         if global_hits <= 0:
+            # region agent log
+            append_debug_log(
+                location="vision_agent.py:_get_progression_block_reason:decision",
+                message="progression gate allowed without global keyword hits",
+                data={
+                    "job_id": self.job_id,
+                    "step": self.step_count,
+                    "url": getattr(self.page, "url", ""),
+                    "reason": None,
+                    "evidence": evidence,
+                },
+                run_id="pre-fix-debug",
+                hypothesis_id="H6",
+            )
+            # endregion
             return None
         llm_confirm = self._verify_error_context_with_llm(evidence, visible_text)
-        return evaluate_progression_block_reason(
+        final_reason = evaluate_progression_block_reason(
             evidence, llm_confirms_context_error=llm_confirm
         )
+        # region agent log
+        append_debug_log(
+            location="vision_agent.py:_get_progression_block_reason:decision",
+            message="progression gate decision after llm verification",
+            data={
+                "job_id": self.job_id,
+                "step": self.step_count,
+                "url": getattr(self.page, "url", ""),
+                "llm_confirm": llm_confirm,
+                "reason": final_reason,
+                "evidence": evidence,
+            },
+            run_id="pre-fix-debug",
+            hypothesis_id="H6",
+        )
+        # endregion
+        return final_reason
 
     def _collect_form_error_evidence(
         self, visible_text: str
@@ -1440,6 +1875,10 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             "red_error_hits": 0,
             "global_error_keyword_hits": 0,
             "error_snippets": [],
+            "invalid_field_samples": [],
+            "required_empty_samples": [],
+            "submit_candidates": [],
+            "file_upload_state_samples": [],
         }
         error_keywords = [
             "required",
@@ -1483,6 +1922,39 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                   };
                   const forms = Array.from(document.querySelectorAll("form"));
                   const roots = forms.length > 0 ? forms : [document.body];
+                  const labelFor = new Map();
+                  document.querySelectorAll("label[for]").forEach((lb) => {
+                    const k = String(lb.getAttribute("for") || "").trim();
+                    if (k && !labelFor.has(k)) {
+                      labelFor.set(k, (lb.innerText || lb.textContent || "").trim());
+                    }
+                  });
+                  const fieldName = (el) => {
+                    const aria = String(el.getAttribute("aria-label") || "").trim();
+                    if (aria) return aria;
+                    const nm = String(el.getAttribute("name") || "").trim();
+                    if (nm) return nm;
+                    const id = String(el.id || "").trim();
+                    if (id && labelFor.has(id)) {
+                      const byFor = String(labelFor.get(id) || "").trim();
+                      if (byFor) return byFor;
+                    }
+                    const wrapped = el.closest("label");
+                    if (wrapped) {
+                      const t = String(wrapped.innerText || wrapped.textContent || "").trim();
+                      if (t) return t.slice(0, 80);
+                    }
+                    const ph = String(el.getAttribute("placeholder") || "").trim();
+                    if (ph) return ph;
+                    return String(el.id || el.getAttribute("name") || el.tagName || "").trim();
+                  };
+                  const sampleField = (el) => ({
+                    tag: (el.tagName || "").toLowerCase(),
+                    type: String(el.getAttribute("type") || "").toLowerCase(),
+                    name: fieldName(el).slice(0, 120),
+                    required: Boolean(el.required || el.getAttribute("aria-required") === "true"),
+                    value_len: "value" in el ? String(el.value || "").trim().length : 0
+                  });
                   const inScope = (el) => roots.some((root) => root && root.contains(el));
                   const matchesKeyword = (text) => {
                     const t = toLower(text);
@@ -1529,13 +2001,57 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                     if (isReddish(node)) redHits += 1;
                     if (snippets.length < 6) snippets.push(text.slice(0, 180));
                   });
+                  const invalidSamples = Array.from(invalidSet).slice(0, 6).map(sampleField);
+                  const requiredEmptySamples = Array.from(reqEmptySet).slice(0, 6).map(sampleField);
+                  const submitCandidates = Array.from(
+                    document.querySelectorAll("button, input[type='submit']")
+                  )
+                    .filter((el) => isVisible(el) && inScope(el))
+                    .map((el) => ({
+                      text: String(el.innerText || el.value || el.getAttribute("aria-label") || "").trim().slice(0, 80),
+                      disabled: Boolean(el.disabled),
+                      aria_disabled: String(el.getAttribute("aria-disabled") || "").toLowerCase(),
+                      type: String(el.getAttribute("type") || "").toLowerCase()
+                    }))
+                    .filter((it) => {
+                      const t = it.text.toLowerCase();
+                      return t.includes("submit") || t.includes("apply") || it.type === "submit";
+                    })
+                    .slice(0, 6);
+                  const fileUploadStateSamples = Array.from(
+                    document.querySelectorAll("input[type='file']")
+                  )
+                    .filter((el) => isVisible(el) && inScope(el))
+                    .map((el) => {
+                      const parent = el.closest("label, div, section, form") || el.parentElement;
+                      const parentText = String(parent?.innerText || "").toLowerCase();
+                      const hasReplaceText = parentText.includes("replace");
+                      const hasUploadText = parentText.includes("upload");
+                      const hasUploadedFileName =
+                        parentText.includes(".pdf") ||
+                        parentText.includes(".doc") ||
+                        parentText.includes(".docx");
+                      return {
+                        name: fieldName(el).slice(0, 120),
+                        required: Boolean(el.required || el.getAttribute("aria-required") === "true"),
+                        value_len: "value" in el ? String(el.value || "").trim().length : 0,
+                        has_replace_text: hasReplaceText,
+                        has_upload_text: hasUploadText,
+                        has_uploaded_file_name: hasUploadedFileName
+                      };
+                    })
+                    .slice(0, 6);
                   return {
                     invalid_field_count: invalidSet.size,
                     required_empty_count: reqEmptySet.size,
                     error_container_hits: dedup.length,
                     local_error_keyword_hits: localKwHits,
                     red_error_hits: redHits,
-                    error_snippets: snippets
+                    error_snippets: snippets,
+                    invalid_field_samples: invalidSamples,
+                    required_empty_samples: requiredEmptySamples,
+                    submit_candidates: submitCandidates,
+                    file_upload_state_samples: fileUploadStateSamples
                   };
                 }
                 """,
@@ -1559,6 +2075,18 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             snippets = payload.get("error_snippets", [])
             if isinstance(snippets, list):
                 base["error_snippets"] = [str(s)[:200] for s in snippets[:6]]
+            invalid_samples = payload.get("invalid_field_samples", [])
+            if isinstance(invalid_samples, list):
+                base["invalid_field_samples"] = invalid_samples[:6]
+            required_samples = payload.get("required_empty_samples", [])
+            if isinstance(required_samples, list):
+                base["required_empty_samples"] = required_samples[:6]
+            submit_candidates = payload.get("submit_candidates", [])
+            if isinstance(submit_candidates, list):
+                base["submit_candidates"] = submit_candidates[:6]
+            file_upload_state_samples = payload.get("file_upload_state_samples", [])
+            if isinstance(file_upload_state_samples, list):
+                base["file_upload_state_samples"] = file_upload_state_samples[:6]
 
         return base
 
@@ -1731,6 +2259,50 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             return str(expanded).lower() == "true"
         except Exception:
             return False
+
+    def _build_page_fingerprint(
+        self, current_url: str, snapshot_map: dict[str, SnapshotItem]
+    ) -> str:
+        """为页面构建稳定指纹，用于计划缓存与重复动作抑制。"""
+        top_items = []
+        for item in sorted(snapshot_map.values(), key=lambda x: x.ref)[:40]:
+            top_items.append(
+                {
+                    "r": item.role,
+                    "n": (item.name or "")[:60],
+                    "t": item.type or "",
+                    "req": bool(item.required),
+                }
+            )
+        payload = {"url": (current_url or "").split("#")[0], "items": top_items}
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+    def _action_fail_key(self, page_fingerprint: str, action: AgentAction) -> str:
+        return "|".join(
+            [
+                page_fingerprint or "",
+                action.action or "",
+                action.ref or "",
+                action.selector or "",
+                str(action.value or ""),
+            ]
+        )
+
+    def _should_skip_repeated_action(
+        self, page_fingerprint: str, action: AgentAction
+    ) -> bool:
+        key = self._action_fail_key(page_fingerprint, action)
+        return self._action_fail_counts.get(key, 0) >= 2
+
+    def _record_action_result(
+        self, page_fingerprint: str, action: AgentAction, success: bool
+    ) -> None:
+        key = self._action_fail_key(page_fingerprint, action)
+        if success:
+            self._action_fail_counts[key] = 0
+            return
+        self._action_fail_counts[key] = self._action_fail_counts.get(key, 0) + 1
 
     def _step_log(self, event: str, payload: dict) -> None:
         """写入每步证据链日志。"""
@@ -2358,9 +2930,15 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 
 
 # 便捷函数
-def run_browser_agent(page: Page, job, max_steps: int = 50) -> bool:
+def run_browser_agent(
+    page: Page,
+    job,
+    max_steps: int = 50,
+    *,
+    pre_nav_only: bool = False,
+) -> bool:
     """运行浏览器 Agent"""
-    agent = BrowserAgent(page, job, max_steps)
+    agent = BrowserAgent(page, job, max_steps, pre_nav_only=pre_nav_only)
     success = agent.run()
     try:
         setattr(job, "manual_reason_hint", agent.manual_reason_hint)

@@ -22,8 +22,9 @@ from ..config import list_upload_candidates
 from ..models.job_log import JobLog
 from ..models.job_post import JobPost
 from .browser_manager import BrowserManager
+from .debug_probe import append_debug_log
 from .resume_matcher import extract_jd_text_from_page, choose_best_resume_for_jd
-from .simplify_helper import run_simplify
+from .simplify_helper import probe_simplify_state, run_simplify
 from .vision_agent import run_browser_agent
 
 
@@ -73,6 +74,22 @@ def apply_for_job(job: JobPost) -> ApplyResult:
 
         # 等待页面稳定
         page.wait_for_timeout(2000)
+        # region agent log
+        append_debug_log(
+            location="applier.py:post_goto",
+            message="page snapshot before simplify",
+            data={
+                "job_id": job.id,
+                "url": page.url,
+                "form_count": _safe_count(page, "form"),
+                "password_input_count": _safe_count(page, "input[type='password']"),
+                "apply_button_count": _safe_count_by_text(page, "button, a", "apply"),
+                "captcha_like_count": _safe_count(page, "[id*='captcha' i], [class*='captcha' i], iframe[src*='recaptcha']"),
+            },
+            run_id="pre-fix-debug",
+            hypothesis_id="H3",
+        )
+        # endregion
 
         # 1.5 提取 JD + 匹配最佳简历（阶段A）
         _log(job.id, "\n--- 步骤 1.5: JD 提取与简历匹配 ---")
@@ -98,23 +115,87 @@ def apply_for_job(job: JobPost) -> ApplyResult:
         else:
             _log(job.id, "未匹配到可用简历，后续上传将使用默认候选顺序", "warn")
 
-        # 2. Simplify 自动填表（可选）
-        if session.simplify_loaded:
-            _log(job.id, "\n--- 步骤 2: Simplify 自动填表 ---")
-            simplify_result = run_simplify(page)
-            if simplify_result.autofilled:
-                _log(job.id, "✓ Simplify 填表完成")
+        # 2. 预导航：非申请页时只负责进入申请页（不做填表/提交）
+        if not _looks_like_application_page(page):
+            _log(job.id, "ℹ 当前非申请页，先执行预导航进入申请页")
+            # region agent log
+            append_debug_log(
+                location="applier.py:simplify_gate",
+                message="skip simplify before application page",
+                data={
+                    "job_id": job.id,
+                    "url": page.url,
+                    "looks_like_application_page": _looks_like_application_page(page),
+                    "form_count": _safe_count(page, "form"),
+                },
+                run_id="pre-fix-debug",
+                hypothesis_id="H7",
+            )
+            # endregion
+            _ = run_browser_agent(page, job, max_steps=8, pre_nav_only=True)
+
+        # 2.5 到达申请页后优先检测/利用 Simplify
+        simplify_applied = False
+        if session.simplify_loaded and _looks_like_application_page(page):
+            _log(job.id, "\n--- 步骤 2.5: 申请页 Simplify 状态检测 ---")
+            simplify_state = probe_simplify_state(page)
+            _log(
+                job.id,
+                f"ℹ Simplify 状态: {simplify_state.status} ({simplify_state.message or 'n/a'})",
+            )
+            # region agent log
+            append_debug_log(
+                location="applier.py:simplify_state_probe",
+                message="simplify state probe on application page",
+                data={
+                    "job_id": job.id,
+                    "url": page.url,
+                    "simplify_state": simplify_state.status,
+                    "simplify_message": simplify_state.message,
+                    "observations": (simplify_state.observations or [])[:10],
+                },
+                run_id="pre-fix-debug",
+                hypothesis_id="H7",
+            )
+            # endregion
+
+            if simplify_state.status in ("ready", "running"):
+                _log(job.id, "\n--- 步骤 2.6: Simplify 自动填表 ---")
+                simplify_result = run_simplify(page)
+                if simplify_result.autofilled:
+                    _log(job.id, "✓ Simplify 填表完成（申请页）")
+                    simplify_applied = True
+                else:
+                    _log(job.id, f"⚠ Simplify: {simplify_result.message}", "warn")
+                page.wait_for_timeout(1000)
+                # region agent log
+                append_debug_log(
+                    location="applier.py:post_simplify_after_navigation",
+                    message="page snapshot after simplify on application page",
+                    data={
+                        "job_id": job.id,
+                        "url": page.url,
+                        "looks_like_application_page": _looks_like_application_page(page),
+                        "form_count": _safe_count(page, "form"),
+                        "password_input_count": _safe_count(page, "input[type='password']"),
+                    },
+                    run_id="pre-fix-debug",
+                    hypothesis_id="H7",
+                )
+                # endregion
+            elif simplify_state.status == "completed":
+                simplify_applied = True
+                _log(job.id, "✓ Simplify 已完成当前页自动填写")
             else:
-                _log(job.id, f"⚠ Simplify: {simplify_result.message}", "warn")
+                _log(job.id, "ℹ Simplify 当前不可用，交由 Agent 继续填写")
 
-            # 等待 Simplify 完成
-            page.wait_for_timeout(1000)
-
-        # 3. AI Agent 接管
+        # 3. AI Agent 接管（补全 + 提交）
         _log(job.id, "\n--- 步骤 3: AI Agent 智能操作 ---")
         _log(
             job.id, "AI Agent 已启用：上传白名单校验 + 前进门控（避免盲点 Next/Submit）"
         )
+        if simplify_applied:
+            _log(job.id, "ℹ 已完成 Simplify，AI Agent 将专注补全与提交")
         agent_success = run_browser_agent(page, job)  # 使用默认 max_steps=50
 
         # 4. 保存最终页面截图
@@ -217,3 +298,34 @@ def _persist_job_resume_used(job_id: int, resume_path: str) -> None:
         db_job.resume_used = resume_path
         session.add(db_job)
         session.commit()
+
+
+def _safe_count(page: Page, selector: str) -> int:
+    try:
+        return page.locator(selector).count()
+    except Exception:
+        return -1
+
+
+def _safe_count_by_text(page: Page, selector: str, text_keyword: str) -> int:
+    try:
+        return page.locator(selector).filter(has_text=text_keyword).count()
+    except Exception:
+        return -1
+
+
+def _looks_like_application_page(page: Page) -> bool:
+    """轻量判断是否已进入申请页（用于控制 Simplify 执行时机）。"""
+    try:
+        current_url = (page.url or "").lower()
+    except Exception:
+        current_url = ""
+    if "/application" in current_url or "/apply" in current_url:
+        return True
+    # URL 不可靠时用结构兜底：表单字段 + submit/apply 按钮同时出现
+    form_fields = _safe_count(
+        page, "input, textarea, select, [role='textbox'], [role='combobox'], [role='file_input']"
+    )
+    submit_like = _safe_count_by_text(page, "button, input[type='submit']", "submit")
+    apply_like = _safe_count_by_text(page, "button, input[type='submit']", "apply")
+    return form_fields >= 3 and (submit_like > 0 or apply_like > 0)

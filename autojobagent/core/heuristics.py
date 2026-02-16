@@ -27,6 +27,7 @@ def assess_manual_required(
     *,
     password_input_count: int = 0,
     captcha_element_count: int = 0,
+    has_captcha_challenge_text: bool = False,
     has_login_button: bool = False,
     has_apply_cta: bool = False,
 ) -> ManualRequiredAssessment:
@@ -35,6 +36,7 @@ def assess_manual_required(
     evidence: dict[str, int | bool] = {
         "password_input_count": max(password_input_count, 0),
         "captcha_element_count": max(captcha_element_count, 0),
+        "has_captcha_challenge_text": bool(has_captcha_challenge_text),
         "has_login_button": bool(has_login_button),
         "has_apply_cta": bool(has_apply_cta),
     }
@@ -48,12 +50,22 @@ def assess_manual_required(
 
     captcha_keywords = [
         "captcha",
-        "recaptcha",
         "verify you are human",
         "i am not a robot",
+        "security check",
+        "complete the challenge",
+        "select all images",
+        "are you human",
     ]
     has_captcha_text = any(k in text for k in captcha_keywords)
-    if captcha_element_count > 0 or has_captcha_text:
+    is_recaptcha_legal_notice = (
+        "protected by recaptcha" in text
+        and "privacy policy" in text
+        and "terms of service" in text
+    )
+    if is_recaptcha_legal_notice:
+        has_captcha_text = False
+    if captcha_element_count > 0 or has_captcha_challenge_text or has_captcha_text:
         return ManualRequiredAssessment(
             manual_required=True,
             reason="captcha_detected",

@@ -23,6 +23,73 @@ class SimplifyResult:
     observations: list[str] | None = None
 
 
+@dataclass
+class SimplifyState:
+    status: str  # ready | running | completed | unavailable
+    message: str | None = None
+    observations: list[str] | None = None
+
+
+def probe_simplify_state(page: Page) -> SimplifyState:
+    """探测 Simplify 当前状态（不点击）。"""
+    observations: list[str] = []
+
+    def _frames(p: Page):
+        yield p.main_frame
+        for f in p.frames:
+            yield f
+
+    saw_ready = False
+    saw_running = False
+    saw_completed = False
+    ready_text = ""
+
+    for frame in _frames(page):
+        try:
+            body = frame.inner_text("body")
+        except Exception:
+            continue
+        lower = (body or "").lower()
+        if "autofill complete" in lower:
+            saw_completed = True
+            observations.append("probe:complete_text")
+        if "filling" in lower and "question" in lower:
+            saw_running = True
+            observations.append("probe:running_text")
+        if "autofill this page again" in lower:
+            saw_ready = True
+            ready_text = "Autofill this page again"
+            observations.append("probe:ready_again")
+        elif "autofill this page" in lower:
+            saw_ready = True
+            ready_text = "Autofill this page"
+            observations.append("probe:ready_page")
+
+    if saw_completed:
+        return SimplifyState(
+            status="completed",
+            message="Simplify already completed on current page",
+            observations=observations,
+        )
+    if saw_running:
+        return SimplifyState(
+            status="running",
+            message="Simplify is currently autofilling",
+            observations=observations,
+        )
+    if saw_ready:
+        return SimplifyState(
+            status="ready",
+            message=f"Simplify ready: {ready_text}",
+            observations=observations,
+        )
+    return SimplifyState(
+        status="unavailable",
+        message="Simplify controls not detected",
+        observations=observations,
+    )
+
+
 def run_simplify(page: Page, config: Optional[SimplifyConfig] = None) -> SimplifyResult:
     """
     轮询 Simplify 按钮，点击一次，等待完成信号。
@@ -47,6 +114,19 @@ def run_simplify(page: Page, config: Optional[SimplifyConfig] = None) -> Simplif
         for f in p.frames:
             yield f
 
+    # 先探测当前状态，避免重复点击/重复等待
+    state = probe_simplify_state(page)
+    observations.extend(state.observations or [])
+    if state.status == "completed":
+        return SimplifyResult(
+            found=True,
+            autofilled=True,
+            message=state.message or "Already completed",
+            observations=observations,
+        )
+    if state.status == "running":
+        observations.append("state_running_wait_for_completion")
+
     while time.time() < deadline:
         for frame in _frames(page):
             # 记录按钮文本
@@ -55,7 +135,7 @@ def run_simplify(page: Page, config: Optional[SimplifyConfig] = None) -> Simplif
                 if btn and btn.is_visible():
                     last_seen = btn.inner_text().strip()
                     observations.append(f"see_btn:{last_seen}")
-                    if not clicked:
+                    if not clicked and state.status != "running":
                         btn.click()
                         clicked_handle = btn
                         observations.append(f"clicked:{last_seen}")
