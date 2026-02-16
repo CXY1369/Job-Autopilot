@@ -53,7 +53,12 @@ def test_progression_gate_allows_file_invalid_with_uploaded_signal():
         "error_snippets": [],
         "invalid_field_samples": [{"type": "file", "name": "Resume"}],
         "submit_candidates": [
-            {"text": "Submit Application", "disabled": False, "aria_disabled": "", "type": ""}
+            {
+                "text": "Submit Application",
+                "disabled": False,
+                "aria_disabled": "",
+                "type": "",
+            }
         ],
         "file_upload_state_samples": [
             {"has_replace_text": True, "has_uploaded_file_name": False}
@@ -77,7 +82,12 @@ def test_progression_gate_blocks_file_invalid_without_uploaded_signal():
         "error_snippets": [],
         "invalid_field_samples": [{"type": "file", "name": "Resume"}],
         "submit_candidates": [
-            {"text": "Submit Application", "disabled": False, "aria_disabled": "", "type": ""}
+            {
+                "text": "Submit Application",
+                "disabled": False,
+                "aria_disabled": "",
+                "type": "",
+            }
         ],
         "file_upload_state_samples": [
             {"has_replace_text": False, "has_uploaded_file_name": False}

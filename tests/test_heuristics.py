@@ -56,9 +56,7 @@ def test_assess_manual_required_captcha_dom_signal():
 
 
 def test_assess_manual_required_recaptcha_legal_notice_not_blocking():
-    text = (
-        "This site is protected by reCAPTCHA and the Google Privacy Policy and Terms of Service apply."
-    )
+    text = "This site is protected by reCAPTCHA and the Google Privacy Policy and Terms of Service apply."
     result = assess_manual_required(
         text,
         password_input_count=0,

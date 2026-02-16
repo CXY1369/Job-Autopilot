@@ -84,7 +84,10 @@ def apply_for_job(job: JobPost) -> ApplyResult:
                 "form_count": _safe_count(page, "form"),
                 "password_input_count": _safe_count(page, "input[type='password']"),
                 "apply_button_count": _safe_count_by_text(page, "button, a", "apply"),
-                "captcha_like_count": _safe_count(page, "[id*='captcha' i], [class*='captcha' i], iframe[src*='recaptcha']"),
+                "captcha_like_count": _safe_count(
+                    page,
+                    "[id*='captcha' i], [class*='captcha' i], iframe[src*='recaptcha']",
+                ),
             },
             run_id="pre-fix-debug",
             hypothesis_id="H3",
@@ -175,9 +178,13 @@ def apply_for_job(job: JobPost) -> ApplyResult:
                     data={
                         "job_id": job.id,
                         "url": page.url,
-                        "looks_like_application_page": _looks_like_application_page(page),
+                        "looks_like_application_page": _looks_like_application_page(
+                            page
+                        ),
                         "form_count": _safe_count(page, "form"),
-                        "password_input_count": _safe_count(page, "input[type='password']"),
+                        "password_input_count": _safe_count(
+                            page, "input[type='password']"
+                        ),
                     },
                     run_id="pre-fix-debug",
                     hypothesis_id="H7",
@@ -324,7 +331,8 @@ def _looks_like_application_page(page: Page) -> bool:
         return True
     # URL 不可靠时用结构兜底：表单字段 + submit/apply 按钮同时出现
     form_fields = _safe_count(
-        page, "input, textarea, select, [role='textbox'], [role='combobox'], [role='file_input']"
+        page,
+        "input, textarea, select, [role='textbox'], [role='combobox'], [role='file_input']",
     )
     submit_like = _safe_count_by_text(page, "button, input[type='submit']", "submit")
     apply_like = _safe_count_by_text(page, "button, input[type='submit']", "apply")

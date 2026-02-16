@@ -57,13 +57,17 @@ def test_apply_for_job_runs_pre_nav_then_simplify_then_main_agent(monkeypatch):
 
     monkeypatch.setattr(applier, "_log", lambda *args, **kwargs: None)
     monkeypatch.setattr(applier, "BrowserManager", _FakeManager)
-    monkeypatch.setattr(applier, "_save_final_screenshot", lambda *_args, **_kwargs: "x.png")
+    monkeypatch.setattr(
+        applier, "_save_final_screenshot", lambda *_args, **_kwargs: "x.png"
+    )
     monkeypatch.setattr(applier, "extract_jd_text_from_page", lambda _p: "jd text")
     monkeypatch.setattr(applier, "list_upload_candidates", lambda max_files=50: [])
     monkeypatch.setattr(
         applier,
         "choose_best_resume_for_jd",
-        lambda **_kwargs: _MatchResult(selected_resume_path=None, score=0, reason="n/a"),
+        lambda **_kwargs: _MatchResult(
+            selected_resume_path=None, score=0, reason="n/a"
+        ),
     )
     monkeypatch.setattr(
         applier,
@@ -73,7 +77,9 @@ def test_apply_for_job_runs_pre_nav_then_simplify_then_main_agent(monkeypatch):
     monkeypatch.setattr(
         applier,
         "run_simplify",
-        lambda _p: SimplifyResult(found=True, autofilled=True, message="ok", observations=[]),
+        lambda _p: SimplifyResult(
+            found=True, autofilled=True, message="ok", observations=[]
+        ),
     )
 
     def _fake_run_browser_agent(page, job, max_steps=50, pre_nav_only=False):

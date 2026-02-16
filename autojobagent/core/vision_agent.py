@@ -115,9 +115,7 @@ def evaluate_progression_block_reason(
             text = str(item.get("text", "")).lower()
             item_type = str(item.get("type", "")).lower()
             is_submit_like = (
-                ("submit" in text)
-                or ("apply" in text)
-                or item_type == "submit"
+                ("submit" in text) or ("apply" in text) or item_type == "submit"
             )
             if not is_submit_like:
                 continue
@@ -131,8 +129,7 @@ def evaluate_progression_block_reason(
     all_invalid_are_file = False
     if isinstance(invalid_field_samples, list) and invalid_field_samples:
         all_invalid_are_file = all(
-            isinstance(it, dict)
-            and str(it.get("type", "")).lower() == "file"
+            isinstance(it, dict) and str(it.get("type", "")).lower() == "file"
             for it in invalid_field_samples
         )
     has_upload_ready_signal = False
@@ -162,8 +159,7 @@ def evaluate_progression_block_reason(
         # 对“仅 invalid 单信号”做保护：若提交按钮可用且无其它错误证据，不阻塞提交流程
         if (
             not all_invalid_are_file
-            and
-            required_empty_count <= 0
+            and required_empty_count <= 0
             and error_container_hits <= 0
             and red_error_hits <= 0
             and local_error_keyword_hits <= 0
@@ -496,7 +492,9 @@ class BrowserAgent:
             current_url_for_fp = self.page.url
         except Exception:
             current_url_for_fp = "unknown"
-        page_fingerprint = self._build_page_fingerprint(current_url_for_fp, snapshot_map)
+        page_fingerprint = self._build_page_fingerprint(
+            current_url_for_fp, snapshot_map
+        )
         self._last_observed_fingerprint = page_fingerprint
         self._last_snapshot_intents = self._infer_snapshot_intents(
             snapshot_map, visible_text
@@ -656,7 +654,9 @@ class BrowserAgent:
             and cached_state.next_action is not None
             and cached_state.status == "continue"
         ):
-            cache_key = self._action_fail_key(page_fingerprint, cached_state.next_action)
+            cache_key = self._action_fail_key(
+                page_fingerprint, cached_state.next_action
+            )
             if (
                 self._action_fail_counts.get(cache_key, 0) == 0
                 and self._action_cache_use_counts.get(cache_key, 0) < 1
@@ -1085,7 +1085,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         )
         if result_state.status == "continue" and result_state.next_action is not None:
             self._state_cache_by_fingerprint[page_fingerprint] = result_state
-            cache_key = self._action_fail_key(page_fingerprint, result_state.next_action)
+            cache_key = self._action_fail_key(
+                page_fingerprint, result_state.next_action
+            )
             self._action_cache_use_counts[cache_key] = 0
         return result_state
 
@@ -1308,7 +1310,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             "select all images",
             "are you human",
         ]
-        has_captcha_challenge_text = any(p in lower_text for p in captcha_challenge_phrases)
+        has_captcha_challenge_text = any(
+            p in lower_text for p in captcha_challenge_phrases
+        )
 
         has_login_button = any(
             ref in snapshot_map
