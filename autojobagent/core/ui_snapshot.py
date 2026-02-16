@@ -20,6 +20,8 @@ class SnapshotItem:
     tag: str | None = None
     required: bool = False
     in_form: bool = False
+    checked: bool | None = None
+    value_hint: str = ""
 
 
 ROLE_ORDER = [
@@ -62,7 +64,20 @@ def build_ui_snapshot(
                   const tag = (el.tagName || "").toLowerCase();
                   const required = !!(el.required || el.getAttribute("aria-required") === "true");
                   const inForm = !!el.closest("form");
-                  return { label, aria, placeholder, text, name, type, tag, required, inForm };
+                  // Toggle / value state for fingerprinting
+                  let checked = null;
+                  if (type === "checkbox" || type === "radio") {
+                    checked = !!el.checked;
+                  } else if (el.getAttribute("aria-pressed") !== null) {
+                    checked = el.getAttribute("aria-pressed") === "true";
+                  } else if (el.getAttribute("aria-selected") !== null) {
+                    checked = el.getAttribute("aria-selected") === "true";
+                  } else if (el.getAttribute("aria-checked") !== null) {
+                    checked = el.getAttribute("aria-checked") === "true";
+                  }
+                  const rawVal = el.value || "";
+                  const valueHint = rawVal.length > 20 ? rawVal.substring(0, 20) : rawVal;
+                  return { label, aria, placeholder, text, name, type, tag, required, inForm, checked, valueHint };
                 }
                 """
             )
@@ -77,6 +92,8 @@ def build_ui_snapshot(
                 "tag": "",
                 "required": False,
                 "inForm": False,
+                "checked": None,
+                "valueHint": "",
             }
 
     for role in ROLE_ORDER:
@@ -109,6 +126,7 @@ def build_ui_snapshot(
                 key = (role, name)
                 nth = name_counters.get(key, 0)
                 name_counters[key] = nth + 1
+                raw_checked = meta.get("checked")
                 item = SnapshotItem(
                     ref="",
                     role=role,
@@ -118,6 +136,8 @@ def build_ui_snapshot(
                     tag=meta.get("tag") or None,
                     required=bool(meta.get("required")),
                     in_form=bool(meta.get("inForm")),
+                    checked=bool(raw_checked) if raw_checked is not None else None,
+                    value_hint=str(meta.get("valueHint") or ""),
                 )
                 items.append(item)
             except Exception:
@@ -156,6 +176,8 @@ def build_ui_snapshot(
                 tag=meta.get("tag") or "input",
                 required=bool(meta.get("required")),
                 in_form=bool(meta.get("inForm")),
+                checked=None,
+                value_hint=str(meta.get("valueHint") or ""),
             )
             items.append(item)
         except Exception:

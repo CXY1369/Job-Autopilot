@@ -226,3 +226,75 @@ def test_sanitize_simplify_claims_when_unavailable(monkeypatch):
     sanitized = agent._sanitize_simplify_claims(text)
     assert sanitized is not None
     assert "Simplify" not in sanitized
+
+
+def test_fingerprint_changes_when_checkbox_toggled(monkeypatch):
+    """Fingerprint must differ when a checkbox changes from unchecked to checked."""
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    base_items = {
+        "e1": SnapshotItem(
+            ref="e1", role="checkbox", name="Boston", nth=0, checked=False
+        ),
+        "e2": SnapshotItem(
+            ref="e2", role="textbox", name="Name", nth=0, value_hint="Xingyu"
+        ),
+    }
+    fp_unchecked = agent._build_page_fingerprint("https://example.com", base_items)
+
+    toggled_items = {
+        "e1": SnapshotItem(
+            ref="e1", role="checkbox", name="Boston", nth=0, checked=True
+        ),
+        "e2": SnapshotItem(
+            ref="e2", role="textbox", name="Name", nth=0, value_hint="Xingyu"
+        ),
+    }
+    fp_checked = agent._build_page_fingerprint("https://example.com", toggled_items)
+
+    assert fp_unchecked != fp_checked, "Fingerprints must differ after checkbox toggle"
+
+
+def test_fingerprint_changes_when_input_value_changes(monkeypatch):
+    """Fingerprint must differ when an input value changes."""
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    items_empty = {
+        "e1": SnapshotItem(
+            ref="e1", role="textbox", name="Email", nth=0, value_hint=""
+        ),
+    }
+    items_filled = {
+        "e1": SnapshotItem(
+            ref="e1", role="textbox", name="Email", nth=0, value_hint="user@example.com"
+        ),
+    }
+    fp_empty = agent._build_page_fingerprint("https://example.com", items_empty)
+    fp_filled = agent._build_page_fingerprint("https://example.com", items_filled)
+    assert fp_empty != fp_filled, "Fingerprints must differ when value changes"
+
+
+def test_fingerprint_stable_for_same_state(monkeypatch):
+    """Fingerprint must be identical for same element state."""
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    items = {
+        "e1": SnapshotItem(
+            ref="e1", role="checkbox", name="Boston", nth=0, checked=True
+        ),
+    }
+    fp1 = agent._build_page_fingerprint("https://example.com", items)
+    fp2 = agent._build_page_fingerprint("https://example.com", items)
+    assert fp1 == fp2, "Same state must produce same fingerprint"

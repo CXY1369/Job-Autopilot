@@ -707,11 +707,22 @@ class BrowserAgent:
             and cached_state.next_action is not None
             and cached_state.status == "continue"
         ):
+            # Guard: never replay click on toggle elements (checkbox/radio/toggle button)
+            _ca = cached_state.next_action
+            _is_toggle_replay = False
+            if _ca.action == "click" and _ca.ref:
+                _target = snapshot_map.get(_ca.ref)
+                if _target and _target.role in ("checkbox", "radio", "switch"):
+                    _is_toggle_replay = True
+                elif _target and _target.checked is not None:
+                    _is_toggle_replay = True
+
             cache_key = self._action_fail_key(
                 page_fingerprint, cached_state.next_action
             )
             if (
-                self._action_fail_counts.get(cache_key, 0) == 0
+                not _is_toggle_replay
+                and self._action_fail_counts.get(cache_key, 0) == 0
                 and self._action_cache_use_counts.get(cache_key, 0) < 1
             ):
                 self._action_cache_use_counts[cache_key] = (
@@ -2367,14 +2378,17 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         # endregion
         try:
             for item in sorted_items:
-                top_items.append(
-                    {
-                        "r": item.role,
-                        "n": (item.name or "")[:60],
-                        "t": item.input_type or "",
-                        "req": bool(item.required),
-                    }
-                )
+                entry: dict = {
+                    "r": item.role,
+                    "n": (item.name or "")[:60],
+                    "t": item.input_type or "",
+                    "req": bool(item.required),
+                }
+                if item.checked is not None:
+                    entry["chk"] = item.checked
+                if item.value_hint:
+                    entry["vh"] = item.value_hint
+                top_items.append(entry)
         except Exception as e:
             # region agent log
             append_debug_log(
@@ -2609,10 +2623,12 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             lambda: self.page.get_by_role("textbox", name=selector).first,
             lambda: self.page.get_by_role("textbox", name=clean_selector).first,
             # 通过 label 文本找相邻输入框
-            lambda: self.page.locator(f"label:has-text('{clean_selector}')")
-            .locator("..")
-            .locator("input")
-            .first,
+            lambda: (
+                self.page.locator(f"label:has-text('{clean_selector}')")
+                .locator("..")
+                .locator("input")
+                .first
+            ),
         ]
         # 注意：不要用 get_by_placeholder 这种宽泛匹配，容易定位到错误字段
 
@@ -2656,10 +2672,12 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             lambda: self.page.get_by_role("textbox", name=selector).first,
             lambda: self.page.get_by_role("textbox", name=clean_selector).first,
             # 5. 通过包含 selector 文本的 label 元素找相邻输入框
-            lambda: self.page.locator(f"label:has-text('{clean_selector}')")
-            .locator("..")
-            .locator("input, [role='combobox']")
-            .first,
+            lambda: (
+                self.page.locator(f"label:has-text('{clean_selector}')")
+                .locator("..")
+                .locator("input, [role='combobox']")
+                .first
+            ),
             # 6. 直接通过 aria-label
             lambda: self.page.locator(f"[aria-label*='{clean_selector}' i]").first,
         ]
