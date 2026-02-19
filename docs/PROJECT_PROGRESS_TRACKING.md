@@ -3,7 +3,7 @@
 ## Metadata
 
 - `project_name`: `Job Autopilot - Auto Application Agent`
-- `last_updated_utc`: `2026-02-14`
+- `last_updated_utc`: `2026-02-19`
 - `primary_language`: `Python`
 - `runtime_stack`: `FastAPI + Playwright + OpenAI + SQLite`
 - `document_purpose`: `维护进度、实现细节与后续规划（AI/人类共读）`
@@ -12,9 +12,9 @@
 
 - 当前状态：`Active / Usable`
 - CI 状态：`Green`（`Lint + Core Tests + Full Tests`）
-- 自动化测试：`11 passed`
+- 自动化测试：`40 passed`
 - 架构定位：`AI 决策 + 规则护栏`
-- 关键新增能力：`refresh 动作与卡页重试、简历匹配 Stage A、上传白名单、前进门控`
+- 关键新增能力：`refresh 动作与卡页重试、简历匹配 Stage A、上传白名单、前进门控、问题定向点击与语义循环熔断`
 
 ## Scope and Goals
 
@@ -81,6 +81,9 @@
 - 完成态二次验证（避免“误判已提交”）
 - 连续失败恢复：卡住自动刷新，最多 2 次
 - 刷新耗尽后给出明确人工原因
+- 新增同名 `Yes/No` 的问题定向点击（`target_question` 绑定）
+- 新增语义重复动作熔断（replan -> alternate -> stop）
+- 前进门控新增修复提示联动日志（避免 submit 循环）
 
 ### 4) Resume Matching (Stage A)
 

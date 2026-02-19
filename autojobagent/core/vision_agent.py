@@ -73,6 +73,7 @@ class AgentAction:
     ref: Optional[str] = None  # 目标元素 ref（优先）
     selector: Optional[str] = None  # 目标元素的文本/描述
     value: Optional[str] = None  # 填入的值
+    target_question: Optional[str] = None  # 回答题绑定的问题文本（用于 Yes/No 等同名选项）
     element_type: Optional[str] = (
         None  # 元素类型：button, link, checkbox, radio, input, option, text
     )
@@ -283,6 +284,9 @@ class BrowserAgent:
         self._action_fail_counts: dict[str, int] = {}
         self._action_cache_use_counts: dict[str, int] = {}
         self._repeated_skip_counts: dict[str, int] = {}
+        self._semantic_fail_counts: dict[str, int] = {}
+        self._last_progression_block_reason: str | None = None
+        self._last_progression_block_snippets: list[str] = []
 
     # region agent log
     def _ndjson_log(self, hypothesis_id: str, location: str, message: str, data: dict):
@@ -369,6 +373,34 @@ class BrowserAgent:
             if state.next_action:
                 action = state.next_action
                 fp = state.page_fingerprint or self._last_observed_fingerprint
+                semantic_guard = self._semantic_loop_guard_decision(fp, action)
+                if semantic_guard == "replan":
+                    if fp:
+                        self._state_cache_by_fingerprint.pop(fp, None)
+                    self.history.append(
+                        f"步骤{self.step_count}: 语义动作重复失败，清理缓存并强制重规划 {action.action}({action.ref or action.selector or ''})"
+                    )
+                    self.consecutive_failures += 1
+                    continue
+                if semantic_guard == "alternate":
+                    alternate_action = self._build_alternate_action(action)
+                    if alternate_action is not None:
+                        self._log("⚠ 语义动作重复失败，改用替代动作", "warn")
+                        action = alternate_action
+                    else:
+                        if fp:
+                            self._state_cache_by_fingerprint.pop(fp, None)
+                        self.history.append(
+                            f"步骤{self.step_count}: 语义动作重复失败，暂无替代动作，强制重规划 {action.action}({action.ref or action.selector or ''})"
+                        )
+                        self.consecutive_failures += 1
+                        continue
+                if semantic_guard == "stop":
+                    hint = self._build_semantic_loop_manual_reason(action)
+                    self._set_manual_reason_hint(hint)
+                    self._log("⚠ 语义动作重复失败超过阈值，停止执行并转人工处理", "warn")
+                    self._log("========== AI Agent 运行结束（语义循环熔断）==========")
+                    return False
                 if self._should_skip_repeated_action(fp, action):
                     skip_key = self._action_fail_key(fp, action)
                     skip_count = self._repeated_skip_counts.get(skip_key, 0) + 1
@@ -411,6 +443,8 @@ class BrowserAgent:
                 self._log(
                     f"🎯 计划: {action.action} {ref_info}{elem_info} {action.selector or ''} {action.value or ''}"
                 )
+                if action.target_question:
+                    self._log(f"   绑定问题: {action.target_question}")
                 if action.reason:
                     self._log(f"   原因: {action.reason}")
 
@@ -422,6 +456,8 @@ class BrowserAgent:
                 action_desc = f"{action.action}({target_desc}"
                 if action.value:
                     action_desc += f", {action.value}"
+                if action.target_question:
+                    action_desc += f", q={action.target_question}"
                 action_desc += ")"
 
                 if success:
@@ -716,6 +752,28 @@ class BrowserAgent:
                     _is_toggle_replay = True
                 elif _target and _target.checked is not None:
                     _is_toggle_replay = True
+                # region agent log
+                append_debug_log(
+                    location="vision_agent.py:_observe_and_think:cache_toggle_guard",
+                    message="cache hit toggle guard evaluation",
+                    data={
+                        "job_id": self.job_id,
+                        "step": self.step_count,
+                        "cached_action": _ca.action,
+                        "cached_ref": _ca.ref,
+                        "cached_element_type": _ca.element_type,
+                        "target_found": _target is not None,
+                        "target_role": _target.role if _target else None,
+                        "target_name": (_target.name or "")[:60] if _target else None,
+                        "target_checked": _target.checked if _target else "N/A",
+                        "target_input_type": _target.input_type if _target else None,
+                        "_is_toggle_replay": _is_toggle_replay,
+                        "page_fingerprint": page_fingerprint[:32],
+                    },
+                    run_id="debug-v2",
+                    hypothesis_id="H1",
+                )
+                # endregion
 
             cache_key = self._action_fail_key(
                 page_fingerprint, cached_state.next_action
@@ -728,6 +786,22 @@ class BrowserAgent:
                 self._action_cache_use_counts[cache_key] = (
                     self._action_cache_use_counts.get(cache_key, 0) + 1
                 )
+                # region agent log
+                append_debug_log(
+                    location="vision_agent.py:_observe_and_think:cache_replay_accepted",
+                    message="cache replay ACCEPTED",
+                    data={
+                        "job_id": self.job_id,
+                        "step": self.step_count,
+                        "action": _ca.action,
+                        "ref": _ca.ref,
+                        "element_type": _ca.element_type,
+                        "page_fingerprint": page_fingerprint[:32],
+                    },
+                    run_id="debug-v2",
+                    hypothesis_id="H1",
+                )
+                # endregion
                 self._log("⚡ 页面稳定，复用上一步计划缓存")
                 return replace(
                     cached_state,
@@ -875,6 +949,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 - Yes/No 按钮 → 用 **click**，selector 填 "Yes" 或 "No"
 - 文本输入框 → 用 fill 或 type
 - 看到 "Start typing..." → 用 type
+- 同名 Yes/No 出现多个时，必须返回 target_question 绑定到对应问题
 
 ## 返回 JSON（优先使用 ref）
 {{
@@ -890,6 +965,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
     "element_type": "button/link/checkbox/radio/input/option",
     "selector": "目标",
     "value": "值",
+    "target_question": "若是 Yes/No 等回答型按钮，填写对应问题文本（可选）",
     "reason": "为什么"
   }}
 }}
@@ -900,6 +976,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 3. 已上传的文件不重复上传
 4. 只有在页面存在上传信号时才允许使用 upload 动作
 5. refresh 最多使用 2 次；若两次后仍无进展，返回 stuck
+6. 若提交被阻止，先修复报错字段，不要连续重复点击 Submit
 
 ## 什么时候返回 stuck？（重要！不要轻易放弃！）
 
@@ -1141,11 +1218,15 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         next_action = None
         if status == "continue" and data.get("next_action"):
             act = data["next_action"]
+            target_question = act.get("target_question")
+            if target_question is not None and not isinstance(target_question, str):
+                target_question = str(target_question)
             next_action = AgentAction(
                 action=act.get("action", ""),
                 ref=act.get("ref"),
                 selector=act.get("selector"),
                 value=act.get("value"),
+                target_question=target_question,
                 element_type=act.get("element_type"),
                 reason=act.get("reason"),
             )
@@ -1180,6 +1261,12 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 return self._execute_ref_action(action)
 
             if action.action == "click":
+                if self._is_answer_click_action(action):
+                    bound = self._try_answer_binding_click(action)
+                    if bound is True:
+                        return True
+                    if bound is False:
+                        return False
                 if self._is_progression_action(action):
                     blocked_reason = self._get_progression_block_reason()
                     if blocked_reason:
@@ -1235,6 +1322,20 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 
         try:
             if action.action == "click":
+                if self._is_answer_click_action(action, item=item):
+                    bound = self._try_answer_binding_click(action)
+                    if bound is True:
+                        self._step_log(
+                            "action_verify",
+                            {"action": action.action, "ref": action.ref, "ok": True},
+                        )
+                        return True
+                    if bound is False:
+                        self._step_log(
+                            "action_verify",
+                            {"action": action.action, "ref": action.ref, "ok": False},
+                        )
+                        return False
                 if self._is_progression_action(action, item=item):
                     blocked_reason = self._get_progression_block_reason()
                     if blocked_reason:
@@ -1887,6 +1988,13 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             evidence, llm_confirms_context_error=False
         )
         if reason:
+            self._last_progression_block_reason = reason
+            snippets = evidence.get("error_snippets", [])
+            if isinstance(snippets, list):
+                self._last_progression_block_snippets = [str(s)[:180] for s in snippets]
+            else:
+                self._last_progression_block_snippets = []
+            self._record_progression_block_fix_hint(reason, evidence)
             # region agent log
             append_debug_log(
                 location="vision_agent.py:_get_progression_block_reason:decision",
@@ -1927,6 +2035,14 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         final_reason = evaluate_progression_block_reason(
             evidence, llm_confirms_context_error=llm_confirm
         )
+        if final_reason:
+            self._last_progression_block_reason = final_reason
+            snippets = evidence.get("error_snippets", [])
+            if isinstance(snippets, list):
+                self._last_progression_block_snippets = [str(s)[:180] for s in snippets]
+            else:
+                self._last_progression_block_snippets = []
+            self._record_progression_block_fix_hint(final_reason, evidence)
         # region agent log
         append_debug_log(
             location="vision_agent.py:_get_progression_block_reason:decision",
@@ -2172,6 +2288,31 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 
         return base
 
+    def _record_progression_block_fix_hint(
+        self,
+        blocked_reason: str,
+        evidence: dict[str, int | list[str]],
+    ) -> None:
+        snippets = evidence.get("error_snippets", [])
+        snippet_list: list[str] = []
+        if isinstance(snippets, list):
+            snippet_list = [str(s)[:180] for s in snippets[:3]]
+        hint = "请先修复报错字段后再继续提交"
+        if snippet_list:
+            hint = f"{hint}；错误摘要: {' | '.join(snippet_list)}"
+        self.history.append(
+            f"步骤{self.step_count}: 提交门控拦截 -> {blocked_reason}；{hint}"
+        )
+        self._step_log(
+            "progression_block_with_fix_hint",
+            {
+                "step": self.step_count,
+                "reason": blocked_reason,
+                "hint": hint,
+                "error_snippets": snippet_list,
+            },
+        )
+
     def _verify_error_context_with_llm(
         self,
         evidence: dict[str, int | list[str]],
@@ -2273,6 +2414,15 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             if action.action == "click":
                 if item.role in ("checkbox", "radio"):
                     return locator.is_checked()
+                if self._is_answer_click_action(action, item=item):
+                    if action.target_question:
+                        expected = self._normalize_answer_label(
+                            action.selector or item.name
+                        )
+                        return self._verify_question_answer_state(
+                            action.target_question, expected
+                        )
+                    return False
                 return True
             if action.action in ("fill", "type", "select"):
                 if action.value is None:
@@ -2342,6 +2492,203 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         except Exception:
             return False
 
+    def _normalize_answer_label(self, text: str | None) -> str:
+        normalized = (text or "").strip().lower()
+        if normalized in ("yes", "y"):
+            return "yes"
+        if normalized in ("no", "n"):
+            return "no"
+        return ""
+
+    def _is_answer_click_action(
+        self, action: AgentAction, item: SnapshotItem | None = None
+    ) -> bool:
+        if action.action != "click":
+            return False
+        label = action.selector or ""
+        if not label and item is not None:
+            label = item.name or ""
+        if not label and action.ref:
+            snapshot_item = self._last_snapshot_map.get(action.ref)
+            if snapshot_item:
+                label = snapshot_item.name or ""
+        return self._normalize_answer_label(label) in ("yes", "no")
+
+    def _try_answer_binding_click(self, action: AgentAction) -> bool | None:
+        """
+        对同名 Yes/No 优先执行“问题绑定点击”。
+        返回：
+        - True：绑定点击成功且后验通过
+        - False：绑定点击已执行但后验失败
+        - None：不适用或定位失败，回退原有点击路径
+        """
+        answer = self._normalize_answer_label(action.selector)
+        question = (action.target_question or "").strip()
+        if not answer or not question:
+            return None
+        payload = self._click_answer_with_question_binding(question, answer)
+        self._step_log(
+            "answer_binding_attempt",
+            {
+                "step": self.step_count,
+                "question": question,
+                "answer": answer,
+                "ok": bool(payload.get("ok", False)),
+                "reason": payload.get("reason", ""),
+            },
+        )
+        if not bool(payload.get("ok", False)):
+            return None
+        verified = self._verify_question_answer_state(question, answer)
+        return bool(verified)
+
+    def _click_answer_with_question_binding(
+        self, question: str, answer: str
+    ) -> dict[str, str | bool]:
+        """
+        在包含问题文本的容器内点击指定答案（yes/no）。
+        """
+        try:
+            result = self.page.evaluate(
+                """
+                ({ question, answer }) => {
+                  const norm = (v) => String(v || "").toLowerCase().replace(/\\s+/g, " ").trim();
+                  const q = norm(question);
+                  const a = norm(answer);
+                  if (!q || !a) return { ok: false, reason: "missing_question_or_answer" };
+                  const isVisible = (el) => {
+                    if (!el) return false;
+                    const st = window.getComputedStyle(el);
+                    if (!st) return false;
+                    if (st.display === "none" || st.visibility === "hidden") return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                  };
+                  const textOf = (el) => {
+                    if (!el) return "";
+                    return norm(el.innerText || el.textContent || el.getAttribute("aria-label") || el.value || "");
+                  };
+                  const answerNodes = Array.from(
+                    document.querySelectorAll("button, [role='button'], label, input[type='radio'], input[type='checkbox']")
+                  ).filter((el) => isVisible(el));
+                  const answerCandidates = answerNodes.filter((el) => {
+                    const t = textOf(el);
+                    return t === a || t.startsWith(a + " ");
+                  });
+                  if (!answerCandidates.length) {
+                    return { ok: false, reason: "answer_candidates_not_found" };
+                  }
+                  const containerHints = ["fieldset", "[role='group']", "[role='radiogroup']", "form", ".question", ".application-question", "section", "li", "div"];
+                  let best = null;
+                  let bestScore = -1;
+                  for (const candidate of answerCandidates) {
+                    let cur = candidate;
+                    let depth = 0;
+                    while (cur && depth < 8) {
+                      const scoreText = textOf(cur);
+                      if (scoreText.includes(q)) {
+                        const score = 100 - depth;
+                        if (score > bestScore) {
+                          bestScore = score;
+                          best = candidate;
+                        }
+                        break;
+                      }
+                      let next = null;
+                      for (const sel of containerHints) {
+                        const found = cur.closest(sel);
+                        if (found && found !== cur) {
+                          next = found.parentElement;
+                          break;
+                        }
+                      }
+                      cur = next || cur.parentElement;
+                      depth += 1;
+                    }
+                  }
+                  if (!best) return { ok: false, reason: "question_container_not_found" };
+                  try {
+                    best.click();
+                  } catch (_) {
+                    const input = best.querySelector && best.querySelector("input[type='radio'],input[type='checkbox']");
+                    if (input) input.click();
+                    else return { ok: false, reason: "click_failed" };
+                  }
+                  return { ok: true, reason: "clicked_in_question_container" };
+                }
+                """,
+                {"question": question, "answer": answer},
+            )
+        except Exception as e:
+            return {"ok": False, "reason": f"binding_eval_error:{type(e).__name__}"}
+        if isinstance(result, dict):
+            return {
+                "ok": bool(result.get("ok", False)),
+                "reason": str(result.get("reason", ""))[:120],
+            }
+        return {"ok": False, "reason": "binding_eval_unexpected_payload"}
+
+    def _verify_question_answer_state(
+        self, question: str, expected_answer: str
+    ) -> bool:
+        """
+        校验目标问题的答案是否已落在预期选项上。
+        """
+        if not question or expected_answer not in ("yes", "no"):
+            return False
+        try:
+            result = self.page.evaluate(
+                """
+                ({ question, expected }) => {
+                  const norm = (v) => String(v || "").toLowerCase().replace(/\\s+/g, " ").trim();
+                  const q = norm(question);
+                  const expectedNorm = norm(expected);
+                  if (!q) return { matched: false, selected: [] };
+                  const isVisible = (el) => {
+                    if (!el) return false;
+                    const st = window.getComputedStyle(el);
+                    if (!st) return false;
+                    if (st.display === "none" || st.visibility === "hidden") return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                  };
+                  const textOf = (el) => norm(el?.innerText || el?.textContent || el?.getAttribute("aria-label") || "");
+                  const selected = [];
+                  let matched = false;
+                  const scopes = Array.from(document.querySelectorAll("fieldset,[role='group'],[role='radiogroup'],form,section,li,div"))
+                    .filter((el) => isVisible(el) && textOf(el).includes(q));
+                  for (const scope of scopes.slice(0, 12)) {
+                    matched = true;
+                    const checkedInputs = Array.from(scope.querySelectorAll("input[type='radio']:checked,input[type='checkbox']:checked"));
+                    for (const el of checkedInputs) {
+                      const label = textOf(el.closest("label")) || textOf(el);
+                      if (label) selected.push(label);
+                    }
+                    const pressed = Array.from(scope.querySelectorAll("button,[role='button']"))
+                      .filter((el) => {
+                        const pressed = String(el.getAttribute("aria-pressed") || "").toLowerCase();
+                        const checked = String(el.getAttribute("aria-checked") || "").toLowerCase();
+                        const cls = String(el.className || "").toLowerCase();
+                        return pressed === "true" || checked === "true" || cls.includes("selected") || cls.includes("active") || cls.includes("checked");
+                      });
+                    for (const el of pressed) {
+                      const t = textOf(el);
+                      if (t) selected.push(t);
+                    }
+                  }
+                  const dedup = Array.from(new Set(selected));
+                  const ok = dedup.some((s) => s === expectedNorm || s.startsWith(expectedNorm + " "));
+                  return { matched, selected: dedup, ok };
+                }
+                """,
+                {"question": question, "expected": expected_answer},
+            )
+        except Exception:
+            return False
+        if not isinstance(result, dict):
+            return False
+        return bool(result.get("matched")) and bool(result.get("ok"))
+
     def _build_page_fingerprint(
         self, current_url: str, snapshot_map: dict[str, SnapshotItem]
     ) -> str:
@@ -2375,6 +2722,26 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             run_id="pre-fix-debug",
             hypothesis_id="H8",
         )
+        # endregion
+        # region agent log
+        _btn_checked_samples = []
+        for _si in sorted_items:
+            if _si.role == "button" and "yes" in (_si.name or "").lower():
+                _btn_checked_samples.append(
+                    {"ref": _si.ref, "name": (_si.name or "")[:40], "checked": _si.checked, "input_type": _si.input_type}
+                )
+        if _btn_checked_samples:
+            append_debug_log(
+                location="vision_agent.py:_build_page_fingerprint:button_checked",
+                message="Yes/No button checked states in fingerprint",
+                data={
+                    "job_id": self.job_id,
+                    "step": self.step_count,
+                    "button_samples": _btn_checked_samples,
+                },
+                run_id="debug-v2",
+                hypothesis_id="H1",
+            )
         # endregion
         try:
             for item in sorted_items:
@@ -2416,7 +2783,28 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             raise
         payload = {"url": (current_url or "").split("#")[0], "items": top_items}
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+        fp_hash = hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+        # region agent log
+        append_debug_log(
+            location="vision_agent.py:_build_page_fingerprint:result",
+            message="fingerprint hash computed",
+            data={
+                "job_id": self.job_id,
+                "step": self.step_count,
+                "fingerprint": fp_hash[:32],
+                "item_count": len(top_items),
+                "has_any_chk": any("chk" in it for it in top_items),
+                "chk_entries": [
+                    {"n": it.get("n", "")[:30], "r": it.get("r"), "chk": it.get("chk")}
+                    for it in top_items
+                    if "chk" in it
+                ][:10],
+            },
+            run_id="debug-v2",
+            hypothesis_id="H2",
+        )
+        # endregion
+        return fp_hash
 
     def _action_fail_key(self, page_fingerprint: str, action: AgentAction) -> str:
         return "|".join(
@@ -2426,7 +2814,71 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 action.ref or "",
                 action.selector or "",
                 str(action.value or ""),
+                str(action.target_question or ""),
             ]
+        )
+
+    def _normalized_action_intent(self, action: AgentAction) -> str | None:
+        if action.action != "click":
+            return None
+        label = self._normalize_answer_label(action.selector)
+        if not label and action.ref:
+            item = self._last_snapshot_map.get(action.ref)
+            if item:
+                label = self._normalize_answer_label(item.name)
+        if label in ("yes", "no"):
+            question = (action.target_question or "").strip().lower()
+            return f"answer::{question or 'unknown'}::{label}"
+        source_item = self._last_snapshot_map.get(action.ref or "")
+        if self._is_progression_action(action, item=source_item):
+            return "progression::submit_apply"
+        return None
+
+    def _semantic_action_key(self, page_fingerprint: str, action: AgentAction) -> str:
+        intent = self._normalized_action_intent(action)
+        if not intent:
+            return ""
+        return f"{page_fingerprint or ''}|{intent}"
+
+    def _semantic_loop_guard_decision(
+        self, page_fingerprint: str, action: AgentAction
+    ) -> str:
+        key = self._semantic_action_key(page_fingerprint, action)
+        if not key:
+            return "none"
+        fail_count = self._semantic_fail_counts.get(key, 0)
+        decision = "none"
+        if fail_count == 1:
+            decision = "replan"
+        elif fail_count == 2:
+            decision = "alternate"
+        elif fail_count >= 3:
+            decision = "stop"
+        if decision != "none":
+            self._step_log(
+                "semantic_loop_guard",
+                {
+                    "step": self.step_count,
+                    "decision": decision,
+                    "semantic_key": key,
+                    "fail_count": fail_count,
+                    "action": action.action,
+                    "selector": action.selector,
+                    "ref": action.ref,
+                    "target_question": action.target_question,
+                },
+            )
+        return decision
+
+    def _build_semantic_loop_manual_reason(self, action: AgentAction) -> str:
+        snippets = " | ".join(self._last_progression_block_snippets[:2])
+        blocker = self._last_progression_block_reason or "无明确门控错误摘要"
+        suffix = f"；最近门控: {blocker}"
+        if snippets:
+            suffix += f"；错误片段: {snippets}"
+        return (
+            "同一语义动作重复失败达到上限（已触发重规划与替代动作）"
+            f"；动作={action.action}:{action.selector or action.ref or 'unknown'}{suffix}"
         )
 
     def _should_skip_repeated_action(
@@ -2439,11 +2891,18 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         self, page_fingerprint: str, action: AgentAction, success: bool
     ) -> None:
         key = self._action_fail_key(page_fingerprint, action)
+        semantic_key = self._semantic_action_key(page_fingerprint, action)
         if success:
             self._action_fail_counts[key] = 0
             self._repeated_skip_counts[key] = 0
+            if semantic_key:
+                self._semantic_fail_counts[semantic_key] = 0
             return
         self._action_fail_counts[key] = self._action_fail_counts.get(key, 0) + 1
+        if semantic_key:
+            self._semantic_fail_counts[semantic_key] = (
+                self._semantic_fail_counts.get(semantic_key, 0) + 1
+            )
 
     def _sanitize_simplify_claims(self, text: str | None) -> str | None:
         if not text:
@@ -2905,6 +3364,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             self._action_fail_counts.clear()
             self._action_cache_use_counts.clear()
             self._repeated_skip_counts.clear()
+            self._semantic_fail_counts.clear()
             self._error_gate_cache.clear()
             self._last_observed_fingerprint = ""
             self.history.append(

@@ -259,6 +259,75 @@ def test_fingerprint_changes_when_checkbox_toggled(monkeypatch):
     assert fp_unchecked != fp_checked, "Fingerprints must differ after checkbox toggle"
 
 
+def test_answer_binding_click_prefers_question_context(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    payload = {"ok": True, "reason": "clicked_in_question_container"}
+    monkeypatch.setattr(
+        agent,
+        "_click_answer_with_question_binding",
+        lambda question, answer: payload,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_verify_question_answer_state",
+        lambda question, expected: True,
+    )
+    action = AgentAction(
+        action="click",
+        selector="Yes",
+        target_question="Are you legally authorized to work in the United States?",
+    )
+    assert agent._try_answer_binding_click(action) is True
+
+
+def test_answer_click_verification_fails_without_state_change(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    monkeypatch.setattr(
+        agent,
+        "_verify_question_answer_state",
+        lambda question, expected: False,
+    )
+    action = AgentAction(
+        action="click",
+        selector="Yes",
+        target_question="Are you legally authorized to work in the United States?",
+    )
+    item = SnapshotItem(ref="e1", role="button", name="Yes", nth=0)
+    assert agent._verify_ref_action_effect(action, locator=object(), item=item) is False
+
+
+def test_semantic_loop_guard_escalates_replan_alternate_stop(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    action = AgentAction(
+        action="click",
+        selector="Yes",
+        target_question="Are you legally authorized to work in the United States?",
+    )
+    key = agent._semantic_action_key("fp1", action)
+    assert key
+    agent._semantic_fail_counts[key] = 1
+    assert agent._semantic_loop_guard_decision("fp1", action) == "replan"
+    agent._semantic_fail_counts[key] = 2
+    assert agent._semantic_loop_guard_decision("fp1", action) == "alternate"
+    agent._semantic_fail_counts[key] = 3
+    assert agent._semantic_loop_guard_decision("fp1", action) == "stop"
+
+
 def test_fingerprint_changes_when_input_value_changes(monkeypatch):
     """Fingerprint must differ when an input value changes."""
     monkeypatch.setattr(
