@@ -127,10 +127,7 @@ def infer_label_intents_with_llm(
     if not client:
         return None
 
-    payload = [
-        {"id": f"l{i + 1}", "text": text}
-        for i, text in enumerate(labels[:40])
-    ]
+    payload = [{"id": f"l{i + 1}", "text": text} for i, text in enumerate(labels[:40])]
     if not payload:
         return {}
 

@@ -54,4 +54,6 @@ def record_loop_action_result(
         return
     action_fail_counts[action_key] = action_fail_counts.get(action_key, 0) + 1
     if semantic_key:
-        semantic_fail_counts[semantic_key] = semantic_fail_counts.get(semantic_key, 0) + 1
+        semantic_fail_counts[semantic_key] = (
+            semantic_fail_counts.get(semantic_key, 0) + 1
+        )

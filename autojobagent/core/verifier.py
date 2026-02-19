@@ -58,7 +58,9 @@ def verify_ref_action_effect(
             if is_answer_click_action(action, item):
                 if action.target_question:
                     expected = normalize_answer_label(action.selector or item.name)
-                    return verify_question_answer_state(action.target_question, expected)
+                    return verify_question_answer_state(
+                        action.target_question, expected
+                    )
                 # 对未绑定问题文本的回答型按钮，至少确认该按钮出现可见选中态
                 try:
                     if item.role in ("checkbox", "radio"):

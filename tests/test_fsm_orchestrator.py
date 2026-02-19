@@ -20,8 +20,13 @@ def test_decide_semantic_guard_path():
 
 
 def test_decide_repeated_skip_path():
-    assert decide_repeated_skip_path(skip_count=1, has_alternate_action=True) == "alternate"
-    assert decide_repeated_skip_path(skip_count=1, has_alternate_action=False) == "replan"
+    assert (
+        decide_repeated_skip_path(skip_count=1, has_alternate_action=True)
+        == "alternate"
+    )
+    assert (
+        decide_repeated_skip_path(skip_count=1, has_alternate_action=False) == "replan"
+    )
     assert decide_repeated_skip_path(skip_count=2, has_alternate_action=False) == "none"
     assert decide_repeated_skip_path(skip_count=3, has_alternate_action=False) == "stop"
 

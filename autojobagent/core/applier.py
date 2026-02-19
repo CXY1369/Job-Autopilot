@@ -151,7 +151,9 @@ def apply_for_job(job: JobPost) -> ApplyResult:
             _log(job.id, "\n--- 步骤 2.5: 申请页 Simplify 状态检测 ---")
             simplify_state = probe_simplify_state(page)
             prefill_before = _collect_required_fill_metrics(page)
-            setattr(job, "assist_required_before", prefill_before.get("required_filled", 0))
+            setattr(
+                job, "assist_required_before", prefill_before.get("required_filled", 0)
+            )
             setattr(job, "simplify_state", simplify_state.status)
             setattr(
                 job,
@@ -188,7 +190,10 @@ def apply_for_job(job: JobPost) -> ApplyResult:
                 delta = filled_after - filled_before
                 verified_prefill = bool(
                     delta > 0
-                    or (required_total > 0 and prefill_after.get("required_empty", 0) == 0)
+                    or (
+                        required_total > 0
+                        and prefill_after.get("required_empty", 0) == 0
+                    )
                 )
                 setattr(job, "assist_required_after", filled_after)
                 setattr(job, "assist_prefill_delta", delta)

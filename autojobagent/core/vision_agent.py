@@ -641,15 +641,21 @@ class BrowserAgent:
                             self.consecutive_failures = 0
                             continue
                     elif failure_path == "stop_refresh_exhausted":
-                        self._set_manual_reason_hint("页面刷新两次后仍无进展，需要人工处理")
+                        self._set_manual_reason_hint(
+                            "页面刷新两次后仍无进展，需要人工处理"
+                        )
                         self._log(
                             "⚠ 页面刷新次数已用尽，停止执行并标记待人工处理",
                             "warn",
                         )
-                        self._log("========== AI Agent 运行结束（刷新重试耗尽）==========")
+                        self._log(
+                            "========== AI Agent 运行结束（刷新重试耗尽）=========="
+                        )
                         return False
                     elif failure_path == "stop_max_failures":
-                        self._set_manual_reason_hint("连续操作失败达到上限，需要人工处理")
+                        self._set_manual_reason_hint(
+                            "连续操作失败达到上限，需要人工处理"
+                        )
                         self._log(
                             f"⚠ 连续 {self.consecutive_failures} 次操作失败，停止执行",
                             "warn",
