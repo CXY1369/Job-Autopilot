@@ -73,7 +73,9 @@ class AgentAction:
     ref: Optional[str] = None  # 目标元素 ref（优先）
     selector: Optional[str] = None  # 目标元素的文本/描述
     value: Optional[str] = None  # 填入的值
-    target_question: Optional[str] = None  # 回答题绑定的问题文本（用于 Yes/No 等同名选项）
+    target_question: Optional[str] = (
+        None  # 回答题绑定的问题文本（用于 Yes/No 等同名选项）
+    )
     element_type: Optional[str] = (
         None  # 元素类型：button, link, checkbox, radio, input, option, text
     )
@@ -398,7 +400,9 @@ class BrowserAgent:
                 if semantic_guard == "stop":
                     hint = self._build_semantic_loop_manual_reason(action)
                     self._set_manual_reason_hint(hint)
-                    self._log("⚠ 语义动作重复失败超过阈值，停止执行并转人工处理", "warn")
+                    self._log(
+                        "⚠ 语义动作重复失败超过阈值，停止执行并转人工处理", "warn"
+                    )
                     self._log("========== AI Agent 运行结束（语义循环熔断）==========")
                     return False
                 if self._should_skip_repeated_action(fp, action):
@@ -2728,7 +2732,12 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         for _si in sorted_items:
             if _si.role == "button" and "yes" in (_si.name or "").lower():
                 _btn_checked_samples.append(
-                    {"ref": _si.ref, "name": (_si.name or "")[:40], "checked": _si.checked, "input_type": _si.input_type}
+                    {
+                        "ref": _si.ref,
+                        "name": (_si.name or "")[:40],
+                        "checked": _si.checked,
+                        "input_type": _si.input_type,
+                    }
                 )
         if _btn_checked_samples:
             append_debug_log(
