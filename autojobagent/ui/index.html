@@ -446,6 +446,40 @@
         max-height: 72px;
         overflow: auto;
       }
+
+      .diag-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+
+      .diag-kv {
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: rgba(2, 6, 23, 0.55);
+        padding: 7px 8px;
+      }
+
+      .diag-kv .k {
+        font-size: 10px;
+        color: var(--text-muted);
+      }
+
+      .diag-kv .v {
+        margin-top: 4px;
+        font-size: 13px;
+        color: #e2e8f0;
+        word-break: break-word;
+      }
+
+      .diag-list {
+        margin-top: 8px;
+        font-size: 11px;
+        color: rgba(226, 232, 240, 0.92);
+        line-height: 1.45;
+        max-height: 120px;
+        overflow: auto;
+      }
     </style>
   </head>
   <body>
@@ -577,6 +611,31 @@
           </div>
         </div>
         <div class="card" style="padding: 10px 12px 10px">
+          <div class="section-title">Job Diagnostics</div>
+          <div class="section-subtitle">
+            点击任一岗位的“诊断”按钮，查看失败治理与视觉预算摘要。
+          </div>
+          <div class="diag-grid">
+            <div class="diag-kv">
+              <div class="k">job_id</div>
+              <div class="v" id="diag-job-id">-</div>
+            </div>
+            <div class="diag-kv">
+              <div class="k">failure_class</div>
+              <div class="v" id="diag-failure-class">-</div>
+            </div>
+            <div class="diag-kv">
+              <div class="k">retry_count</div>
+              <div class="v" id="diag-retry-count">-</div>
+            </div>
+            <div class="diag-kv">
+              <div class="k">visual_fallback</div>
+              <div class="v" id="diag-visual">-</div>
+            </div>
+          </div>
+          <div class="diag-list" id="diag-recent">暂无诊断数据</div>
+        </div>
+        <div class="card" style="padding: 10px 12px 10px">
           <div class="section-title">历史已申请</div>
           <div class="section-subtitle">最近申请的岗位及链接</div>
           <div class="job-list" id="applied-history"></div>
@@ -587,6 +646,7 @@
     <script>
       const apiBase = "";
       let currentFailureFilter = "all";
+      let selectedDiagJobId = null;
 
       function log(type, message) {
         const logEl = document.getElementById("log");
@@ -751,6 +811,14 @@
           const title = document.createElement("div");
           title.className = "title";
           title.textContent = job.title || "未命名岗位";
+          const diagBtn = document.createElement("button");
+          diagBtn.className = "btn-clear";
+          diagBtn.style.marginTop = "4px";
+          diagBtn.textContent = "诊断";
+          diagBtn.onclick = async (e) => {
+            e.stopPropagation();
+            await fetchJobDiagnostics(job.id);
+          };
           const meta = document.createElement("div");
           meta.className = "meta";
           const spans = [];
@@ -766,6 +834,7 @@
 
           div.appendChild(deleteBtn);
           div.appendChild(title);
+          div.appendChild(diagBtn);
           div.appendChild(meta);
 
           // 显示失败/人工处理原因
@@ -819,6 +888,51 @@
         document.getElementById("manual-count").textContent = manualAll.length;
 
         renderAppliedHistory(byStatus.applied);
+      }
+
+      async function fetchJobDiagnostics(jobId) {
+        try {
+          selectedDiagJobId = jobId;
+          const res = await fetch(apiBase + "/api/jobs/" + jobId + "/diagnostics");
+          const data = await res.json();
+          if (!data.ok) {
+            log("error", "获取诊断失败：" + (data.error || "未知错误"));
+            return;
+          }
+          renderDiagnostics(data);
+          log("info", `诊断已加载 job_id=${jobId}`);
+        } catch (e) {
+          log("error", "诊断接口异常：" + e.message);
+        }
+      }
+
+      function renderDiagnostics(data) {
+        const job = data.job || {};
+        const vf = data.visual_fallback || {};
+        document.getElementById("diag-job-id").textContent = job.id || "-";
+        document.getElementById("diag-failure-class").textContent =
+          job.failure_class || job.last_outcome_class || "unknown";
+        document.getElementById("diag-retry-count").textContent =
+          typeof job.retry_count === "number" ? String(job.retry_count) : "-";
+        const used = Number(vf.vision_used_count || 0);
+        const budget = vf.budget;
+        const semanticOnly = Number(vf.semantic_only_count || 0);
+        const exhausted = vf.budget_exhausted ? "exhausted" : "ok";
+        document.getElementById("diag-visual").textContent =
+          `used=${used}/${budget ?? "-"} | semantic_only=${semanticOnly} | ${exhausted}`;
+
+        const recent = (vf.recent_decisions || [])
+          .slice(-6)
+          .map((x) => {
+            const p = x.payload || {};
+            const step = p.step ?? "?";
+            const mode = p.use_vision ? "vision" : "semantic";
+            const reason = p.reason || "n/a";
+            return `step ${step}: ${mode} (${reason})`;
+          });
+        document.getElementById("diag-recent").innerHTML = recent.length
+          ? recent.join("<br>")
+          : "暂无诊断数据";
       }
 
       function renderAppliedHistory(appliedJobs) {

@@ -469,3 +469,204 @@ def test_semantic_key_not_reset_by_page_fingerprint(monkeypatch):
     k1 = agent._semantic_action_key("fp-one", action)
     k2 = agent._semantic_action_key("fp-two", action)
     assert k1 == k2
+
+
+def test_semantic_guard_promote_advances_stage(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _OutcomePage(
+        "body text", url="https://jobs.ashbyhq.com/suno/jobs/123/application"
+    )
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    action = AgentAction(action="click", selector="Submit Application")
+    key = agent._semantic_action_key("fp-one", action)
+    assert key
+    agent._semantic_fail_counts[key] = 1
+    agent._promote_semantic_guard("fp-one", action, stage="replan")
+    assert agent._semantic_fail_counts[key] == 2
+    assert agent._semantic_loop_guard_decision("fp-one", action) == "alternate"
+
+
+def test_build_semantic_snapshot_extracts_required_and_submit(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    snapshot_map = {
+        "e1": SnapshotItem(
+            ref="e1",
+            role="textbox",
+            name="Email",
+            nth=0,
+            required=True,
+            value_hint="",
+        ),
+        "e2": SnapshotItem(
+            ref="e2",
+            role="button",
+            name="Submit Application",
+            nth=0,
+        ),
+    }
+    semantic = agent._build_semantic_snapshot(
+        "https://jobs.ashbyhq.com/suno/1e23/application",
+        snapshot_map,
+        "Please complete this required field before submit.",
+    )
+    assert semantic.domain == "jobs.ashbyhq.com"
+    assert semantic.normalized_path.startswith("/suno")
+    assert len(semantic.required_unfilled) == 1
+    assert semantic.submit_candidates
+    assert semantic.errors
+
+
+def test_selector_action_logs_action_verified(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        agent,
+        "_step_log",
+        lambda event, payload: events.append((event, payload)),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_smart_fill",
+        lambda selector, value: True,
+    )
+    ok = agent._execute_action(
+        AgentAction(action="fill", selector="Email", value="cxy1368@gmail.com")
+    )
+    assert ok is True
+    assert any(event == "action_executed" for event, _ in events)
+    assert any(
+        event == "action_verified" and bool(payload.get("ok")) is True
+        for event, payload in events
+    )
+
+
+def test_visual_fallback_budget_exhausted(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    agent.visual_fallback_budget = 1
+    agent.visual_fallback_used = 1
+    use_vision, reason = agent._should_use_vision_fallback(
+        page_state="application_or_form_page",
+        snapshot_map={},
+        visible_text="",
+    )
+    assert use_vision is False
+    assert reason == "budget_exhausted"
+
+
+def test_visual_fallback_semantic_only_when_stable(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    agent.step_count = 6
+    snapshot_map = {
+        f"e{i}": SnapshotItem(ref=f"e{i}", role="textbox", name=f"Field {i}", nth=i)
+        for i in range(1, 9)
+    }
+    use_vision, reason = agent._should_use_vision_fallback(
+        page_state="application_or_form_page",
+        snapshot_map=snapshot_map,
+        visible_text="normal application form text",
+    )
+    assert use_vision is False
+    assert reason == "semantic_only"
+
+
+def test_step_screenshot_mode_vision_only(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    agent.step_screenshot_mode = "vision_only"
+    assert agent._should_capture_step_screenshot(use_vision=False) is False
+    assert agent._should_capture_step_screenshot(use_vision=True) is True
+
+
+def test_step_screenshot_mode_off(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    agent.step_screenshot_mode = "off"
+    assert agent._should_capture_step_screenshot(use_vision=True) is False
+
+
+def test_replay_stuut_external_blocked_stops_with_structured_reason(monkeypatch):
+    """回放场景：提交被 anti-spam 阻断，最多 3 次后停止并保留结构化证据。"""
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _OutcomePage(
+        "We couldn't submit your application. Your submission was flagged as possible spam."
+    )
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    action = AgentAction(action="click", selector="Submit Application")
+    monkeypatch.setattr(
+        agent,
+        "_classify_submission_outcome",
+        lambda _action, _ok: SubmissionOutcome(
+            classification="external_blocked",
+            reason_code="anti_spam_flagged",
+            evidence_snippet="flagged as possible spam",
+        ),
+    )
+    assert agent._handle_submission_outcome(action, False) == (False, False)
+    assert agent._handle_submission_outcome(action, False) == (False, False)
+    assert agent._handle_submission_outcome(action, False) == (False, True)
+    reason = agent._build_submission_manual_reason(action)
+    assert "classification=external_blocked" in reason
+    assert "code=anti_spam_flagged" in reason
+
+
+def test_replay_suno_yes_no_oscillation_escalates_to_stop(monkeypatch):
+    """回放场景：同语义 Yes/No 动作反复失败，需从 replan 升级到 stop。"""
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _OutcomePage(
+        "application form",
+        url="https://jobs.ashbyhq.com/suno/1e23d125-d72c-49b6-891d-77d62c96cd13/application",
+    )
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    action = AgentAction(
+        action="click",
+        selector="Yes",
+        target_question="Are you legally authorized to work in the United States?",
+    )
+    key = agent._semantic_action_key("ignored-fp", action)
+    assert key
+    agent._semantic_fail_counts[key] = 1
+    assert agent._semantic_loop_guard_decision("ignored-fp", action) == "replan"
+    agent._promote_semantic_guard("ignored-fp", action, stage="replan")
+    assert agent._semantic_loop_guard_decision("ignored-fp", action) == "alternate"
+    agent._promote_semantic_guard("ignored-fp", action, stage="alternate")
+    assert agent._semantic_loop_guard_decision("ignored-fp", action) == "stop"

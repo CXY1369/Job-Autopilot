@@ -4,6 +4,7 @@ UI 快照：生成可交互元素列表，提供 ref 供 LLM 选择。
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -20,6 +21,7 @@ class SnapshotItem:
     tag: str | None = None
     required: bool = False
     in_form: bool = False
+    in_assist_panel: bool = False
     checked: bool | None = None
     value_hint: str = ""
 
@@ -64,6 +66,35 @@ def build_ui_snapshot(
                   const tag = (el.tagName || "").toLowerCase();
                   const required = !!(el.required || el.getAttribute("aria-required") === "true");
                   const inForm = !!el.closest("form");
+                  const hasAssistKeyword = (v) => {
+                    const t = String(v || "").toLowerCase();
+                    return t.includes("simplify") || t.includes("autofill") || t.includes("copilot");
+                  };
+                  const inAssistPanel = (() => {
+                    let cur = el;
+                    for (let i = 0; i < 8 && cur; i++) {
+                      const attrs = [
+                        cur.id || "",
+                        cur.className || "",
+                        cur.getAttribute("data-testid") || "",
+                        cur.getAttribute("aria-label") || "",
+                        cur.getAttribute("title") || "",
+                        cur.getAttribute("name") || ""
+                      ].join(" ");
+                      const text = String(cur.innerText || "").slice(0, 180);
+                      const st = window.getComputedStyle(cur);
+                      const rect = cur.getBoundingClientRect();
+                      const fixedRightPanel =
+                        (st.position === "fixed" || st.position === "sticky") &&
+                        rect.width > 120 &&
+                        rect.width <= 460 &&
+                        rect.left > window.innerWidth * 0.45;
+                      if (hasAssistKeyword(attrs)) return true;
+                      if (fixedRightPanel && hasAssistKeyword(text)) return true;
+                      cur = cur.parentElement;
+                    }
+                    return false;
+                  })();
                   // Toggle / value state for fingerprinting
                   let checked = null;
                   if (type === "checkbox" || type === "radio") {
@@ -77,7 +108,7 @@ def build_ui_snapshot(
                   }
                   const rawVal = el.value || "";
                   const valueHint = rawVal.length > 20 ? rawVal.substring(0, 20) : rawVal;
-                  return { label, aria, placeholder, text, name, type, tag, required, inForm, checked, valueHint };
+                  return { label, aria, placeholder, text, name, type, tag, required, inForm, inAssistPanel, checked, valueHint };
                 }
                 """
             )
@@ -92,6 +123,7 @@ def build_ui_snapshot(
                 "tag": "",
                 "required": False,
                 "inForm": False,
+                "inAssistPanel": False,
                 "checked": None,
                 "valueHint": "",
             }
@@ -136,6 +168,7 @@ def build_ui_snapshot(
                     tag=meta.get("tag") or None,
                     required=bool(meta.get("required")),
                     in_form=bool(meta.get("inForm")),
+                    in_assist_panel=bool(meta.get("inAssistPanel")),
                     checked=bool(raw_checked) if raw_checked is not None else None,
                     value_hint=str(meta.get("valueHint") or ""),
                 )
@@ -176,12 +209,20 @@ def build_ui_snapshot(
                 tag=meta.get("tag") or "input",
                 required=bool(meta.get("required")),
                 in_form=bool(meta.get("inForm")),
+                in_assist_panel=bool(meta.get("inAssistPanel")),
                 checked=None,
                 value_hint=str(meta.get("valueHint") or ""),
             )
             items.append(item)
         except Exception:
             continue
+
+    assist_filter_mode = os.getenv("SNAPSHOT_ASSIST_FILTER_MODE", "exclude").lower()
+    # 默认排除插件侧面板（例如 Simplify）元素，避免污染主页面决策
+    if assist_filter_mode in {"exclude", "on", "1", "true"}:
+        non_assist_items = [item for item in items if not item.in_assist_panel]
+        if non_assist_items:
+            items = non_assist_items
 
     # 优先保留表单内元素（若存在）
     in_form_items = [item for item in items if item.in_form]

@@ -315,6 +315,7 @@ def get_job_diagnostics(job_id: int):
         reverse=True,
     )
     trace_events: list[dict] = []
+    visual_events: list[dict] = []
     if trace_files:
         try:
             lines = trace_files[0].read_text(encoding="utf-8").splitlines()
@@ -323,16 +324,49 @@ def get_job_diagnostics(job_id: int):
                     evt = json.loads(raw)
                 except Exception:
                     continue
+                if evt.get("event") == "visual_fallback_decision":
+                    visual_events.append(evt)
                 if evt.get("event") in {
                     "submission_outcome_classified",
                     "retry_policy_applied",
                     "semantic_loop_guard",
                     "answer_binding_attempt",
                     "progression_block_with_fix_hint",
+                    "action_executed",
+                    "action_verified",
                 }:
                     trace_events.append(evt)
         except Exception:
             trace_events = []
+            visual_events = []
+
+    visual_budget = None
+    visual_used = 0
+    visual_semantic_only = 0
+    for evt in visual_events:
+        payload = evt.get("payload") if isinstance(evt, dict) else {}
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("use_vision") is True:
+            visual_used += 1
+        else:
+            visual_semantic_only += 1
+        try:
+            b = payload.get("budget")
+            if b is not None:
+                visual_budget = int(b)
+        except Exception:
+            pass
+    visual_summary = {
+        "decisions_count": len(visual_events),
+        "vision_used_count": visual_used,
+        "semantic_only_count": visual_semantic_only,
+        "budget": visual_budget,
+        "budget_exhausted": bool(
+            visual_budget is not None and visual_used >= visual_budget
+        ),
+        "recent_decisions": visual_events[-12:],
+    }
 
     return {
         "ok": True,
@@ -344,6 +378,7 @@ def get_job_diagnostics(job_id: int):
         "screenshots": screenshot_paths,
         "trace_file": str(trace_files[0]) if trace_files else None,
         "trace_events": trace_events[-40:],
+        "visual_fallback": visual_summary,
     }
 
 

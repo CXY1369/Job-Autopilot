@@ -12,9 +12,10 @@
 
 - 当前状态：`Active / Usable`
 - CI 状态：`Green`（`Lint + Core Tests + Full Tests`）
-- 自动化测试：`46 passed`
+- 自动化测试：`60 passed`
 - 架构定位：`AI 决策 + 规则护栏`
 - 关键新增能力：`提交结果分类、有限重试状态机、稳定语义熔断键、失败治理字段/API/看板`
+- V2.1 蓝图：`docs/V2_ARCHITECTURE_BLUEPRINT.md`（语义优先、视觉兜底、Assist 可选）
 
 ## Scope and Goals
 
@@ -200,6 +201,121 @@
 - DB 增加失败治理字段并在启动时幂等补列（无 Alembic）
 - API 新增：`/api/stats/failures`、`/api/jobs/{id}/diagnostics`
 - 前端新增失败分类卡片、TopN 原因、失败筛选
+
+### Milestone G - V2.1 Blueprint Baseline
+
+- 输出架构蓝图：`docs/V2_ARCHITECTURE_BLUEPRINT.md`
+- 明确“语义优先 + 视觉关键节点兜底”的执行原则
+- 保留终端叙事链路（摘要/分析/计划/决策/结果）
+- 将 Simplify 定位为 `opportunistic assist`（可选辅助，不是主依赖）
+
+### Milestone H - Phase A Kickoff (Incremental)
+
+- 新增 `SemanticSnapshot` / `SemanticElement` 内部结构并接入 `snapshot_generated` 事件
+- 新增标准化步骤事件：`action_executed`、`action_verified`（保留 `action_verify` 兼容）
+- 修复语义熔断在 `replan` 分支不升级的问题（新增 guard promote）
+- 增加视觉兜底预算决策（`visual_fallback_decision`，默认预算 8）
+- 快照层增加 Assist 面板降权隔离（避免 Simplify 侧栏污染主页面决策）
+- 回归测试新增覆盖并通过（总计 `54 passed`）
+
+### Milestone I - Diagnostics and Replay Hardening
+
+- `GET /api/jobs/{id}/diagnostics` 新增 `visual_fallback` 统计摘要（used/budget/exhausted/recent decisions）
+- `selector` 路径动作执行同样产出 `action_verified`，与 `ref` 路径对齐
+- Assist 面板隔离支持环境变量开关：`SNAPSHOT_ASSIST_FILTER_MODE=exclude|off`
+- 新增失败回放测试：
+  - Stuut anti-spam 场景（3 次内停止并保留结构化原因）
+  - Suno Yes/No 语义振荡场景（replan -> alternate -> stop）
+
+### Milestone J - V2 Semantic-First Tightening
+
+- 观察环节调整为“先语义、后按预算截图”，默认不做非必要截图采集
+- 新增截图策略开关：`STEP_SCREENSHOT_MODE=vision_only|always|off`（默认 `vision_only`）
+- Assist 预填加入字段增量验证（required filled before/after/delta），无效果时自动降级回 Agent 主流程
+- 前端新增 Job Diagnostics 面板，可查看视觉预算摘要与最近决策原因
+- 回归测试扩展到 `57 passed`
+
+### Milestone K - V2 Module Split Kickoff
+
+- 新增 `autojobagent/core/semantic_perception.py`：
+  - `SemanticSnapshot/SemanticElement`
+  - 语义快照构建与错误摘要提取
+- 新增 `autojobagent/core/verifier.py`：
+  - 动作后验校验工具与输入状态读取
+- `vision_agent.py` 保留兼容包装并委托新模块，行为不变
+- 全量回归验证通过（`57 passed`）
+
+### Milestone L - V2 Module Split (Second Cut)
+
+- 新增 `autojobagent/core/outcome_classifier.py`：
+  - `SubmissionOutcome` 结构
+  - 提交结果分类与 manual reason 组装
+- 新增 `autojobagent/core/loop_guard.py`：
+  - 稳定页面 scope 计算
+  - 语义熔断决策与 fail_count 推进
+  - 动作结果记账
+- `vision_agent.py` 的提交分类与语义熔断逻辑改为模块委托，外部行为与测试保持一致
+- 全量回归验证通过（`57 passed`）
+
+### Milestone M - V2 Module Split (Third Cut)
+
+- 新增 `autojobagent/core/executor.py`：
+  - `smart_click/smart_fill/smart_type/do_select`
+  - upload 辅助：`locate_file_input/verify_upload_success`
+  - `do_scroll`
+- 新增 `autojobagent/core/planner.py`：
+  - `safe_parse_json`
+  - `sanitize_simplify_claims`
+- `vision_agent.py` 的执行细节与解析/清洗逻辑改为模块委托，保留兼容包装
+- 全量回归验证通过（`57 passed`）
+
+### Milestone N - V2 Module Split (Fourth Cut)
+
+- 新增 `autojobagent/core/prompt_builder.py`：
+  - `build_system_prompt`
+  - `build_user_prompt`
+- 新增 `autojobagent/core/state_parser.py`：
+  - `parse_agent_response_payload`
+- `vision_agent.py` 的 prompt 构建与响应解析逻辑改为模块委托
+- 主 Agent 继续收敛为编排层，外部行为与测试保持一致
+- 全量回归验证通过（`57 passed`）
+
+### Milestone O - V2 Module Split (Fifth Cut)
+
+- 新增 `autojobagent/core/fsm_orchestrator.py`：
+  - `decide_semantic_guard_path`
+  - `decide_repeated_skip_path`
+  - `decide_failure_recovery_path`
+- `vision_agent.py` 的主循环关键分支（semantic guard / repeated skip / failure recovery）改为状态机决策函数委托
+- 新增 `tests/test_fsm_orchestrator.py` 覆盖状态机决策优先级
+- 全量回归验证通过（`60 passed`）
+
+### Milestone P - V2 Module Split (Sixth Cut)
+
+- 新增 `autojobagent/core/llm_runtime.py`：
+  - `run_chat_with_fallback`
+  - `LLMCallResult`
+- `vision_agent.py` 的模型回退/限流/能力不匹配处理改为模块委托
+- 新增 `tests/test_llm_runtime.py`，覆盖：
+  - 限流触发模型切换
+  - 普通错误快速失败
+  - 能力不匹配耗尽后终止
+- 全量回归验证通过（`63 passed`）
+
+### Milestone Q - V2 Module Split (Seventh Cut)
+
+- 新增 `autojobagent/core/intent_engine.py`：
+  - label/text 意图推断与缓存键生成
+  - 快照 ref->intent 映射
+- 新增 `autojobagent/core/manual_gate.py`：
+  - manual-required 证据采集
+  - 页面状态分类
+  - Apply 入口候选筛选
+- `vision_agent.py` 对应逻辑改为模块委托，继续收敛为编排层
+- 新增测试：
+  - `tests/test_intent_engine.py`
+  - `tests/test_manual_gate.py`
+- 全量回归验证通过（`70 passed`）
 
 ## Suggested Next Steps
 

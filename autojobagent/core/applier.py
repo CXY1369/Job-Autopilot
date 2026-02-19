@@ -150,6 +150,8 @@ def apply_for_job(job: JobPost) -> ApplyResult:
         if session.simplify_loaded and _looks_like_application_page(page):
             _log(job.id, "\n--- 步骤 2.5: 申请页 Simplify 状态检测 ---")
             simplify_state = probe_simplify_state(page)
+            prefill_before = _collect_required_fill_metrics(page)
+            setattr(job, "assist_required_before", prefill_before.get("required_filled", 0))
             setattr(job, "simplify_state", simplify_state.status)
             setattr(
                 job,
@@ -179,13 +181,44 @@ def apply_for_job(job: JobPost) -> ApplyResult:
             if simplify_state.status in ("ready", "running"):
                 _log(job.id, "\n--- 步骤 2.6: Simplify 自动填表 ---")
                 simplify_result = run_simplify(page)
+                prefill_after = _collect_required_fill_metrics(page)
+                filled_before = int(prefill_before.get("required_filled", 0) or 0)
+                filled_after = int(prefill_after.get("required_filled", 0) or 0)
+                required_total = int(prefill_after.get("required_total", 0) or 0)
+                delta = filled_after - filled_before
+                verified_prefill = bool(
+                    delta > 0
+                    or (required_total > 0 and prefill_after.get("required_empty", 0) == 0)
+                )
+                setattr(job, "assist_required_after", filled_after)
+                setattr(job, "assist_prefill_delta", delta)
+                setattr(job, "assist_prefill_verified", verified_prefill)
+                _log(
+                    job.id,
+                    (
+                        "ℹ Assist 预填效果: "
+                        f"required_filled {filled_before}->{filled_after}, delta={delta}, "
+                        f"verified={verified_prefill}"
+                    ),
+                )
                 if simplify_result.autofilled:
-                    _log(job.id, "✓ Simplify 填表完成（申请页）")
-                    simplify_applied = True
-                    setattr(job, "simplify_state", "completed")
-                    setattr(
-                        job, "simplify_message", simplify_result.message or "autofilled"
-                    )
+                    if verified_prefill:
+                        _log(job.id, "✓ Simplify 填表完成（申请页）")
+                        simplify_applied = True
+                        setattr(job, "simplify_state", "completed")
+                        setattr(
+                            job,
+                            "simplify_message",
+                            simplify_result.message or "autofilled_verified",
+                        )
+                    else:
+                        _log(
+                            job.id,
+                            "⚠ Simplify 返回已执行，但未检测到有效字段增量，降级交由 Agent 处理",
+                            "warn",
+                        )
+                        setattr(job, "simplify_state", "ready")
+                        setattr(job, "simplify_message", "autofill_no_effect_delta")
                 else:
                     _log(job.id, f"⚠ Simplify: {simplify_result.message}", "warn")
                     setattr(job, "simplify_state", "ready")
@@ -216,6 +249,7 @@ def apply_for_job(job: JobPost) -> ApplyResult:
                 # endregion
             elif simplify_state.status == "completed":
                 simplify_applied = True
+                setattr(job, "assist_prefill_verified", True)
                 _log(job.id, "✓ Simplify 已完成当前页自动填写")
             else:
                 _log(job.id, "ℹ Simplify 当前不可用，交由 Agent 继续填写")
@@ -363,6 +397,55 @@ def _safe_count_by_text(page: Page, selector: str, text_keyword: str) -> int:
         return page.locator(selector).filter(has_text=text_keyword).count()
     except Exception:
         return -1
+
+
+def _collect_required_fill_metrics(page: Page) -> dict[str, int]:
+    """
+    统计申请页 required 字段填充效果，用于 Assist 预填效果验证。
+    """
+    try:
+        payload = page.evaluate(
+            """
+            () => {
+              const isVisible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (!st) return false;
+                if (st.display === "none" || st.visibility === "hidden") return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+              };
+              const nodes = Array.from(
+                document.querySelectorAll("input, textarea, select, [role='textbox'], [role='combobox']")
+              ).filter((el) => isVisible(el));
+              const required = nodes.filter(
+                (el) => el.required || el.getAttribute("aria-required") === "true"
+              );
+              let filled = 0;
+              for (const el of required) {
+                const val = "value" in el ? String(el.value || "").trim() : "";
+                if (val.length > 0) filled += 1;
+              }
+              return {
+                required_total: required.length,
+                required_filled: filled,
+                required_empty: Math.max(0, required.length - filled),
+              };
+            }
+            """
+        )
+        if isinstance(payload, dict):
+            total = int(payload.get("required_total", 0) or 0)
+            filled = int(payload.get("required_filled", 0) or 0)
+            empty = int(payload.get("required_empty", max(0, total - filled)) or 0)
+            return {
+                "required_total": max(0, total),
+                "required_filled": max(0, filled),
+                "required_empty": max(0, empty),
+            }
+    except Exception:
+        pass
+    return {"required_total": 0, "required_filled": 0, "required_empty": 0}
 
 
 def _looks_like_application_page(page: Page) -> bool:

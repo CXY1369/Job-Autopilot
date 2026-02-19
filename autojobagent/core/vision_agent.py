@@ -23,7 +23,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Literal
-from urllib.parse import urlsplit
 
 from openai import OpenAI
 from playwright.sync_api import Page
@@ -42,6 +41,69 @@ from .browser_manager import BrowserManager
 from .debug_probe import append_debug_log
 from .ui_snapshot import build_ui_snapshot, SnapshotItem
 from .heuristics import assess_manual_required
+from .semantic_perception import (
+    SemanticSnapshot,
+    build_semantic_snapshot,
+    extract_semantic_error_snippets,
+)
+from .outcome_classifier import (
+    SubmissionOutcome,
+    build_submission_manual_reason as oc_build_submission_manual_reason,
+    classify_submission_outcome as oc_classify_submission_outcome,
+    looks_like_completion_text as oc_looks_like_completion_text,
+)
+from .loop_guard import (
+    promote_semantic_fail_count as lg_promote_semantic_fail_count,
+    record_loop_action_result as lg_record_loop_action_result,
+    semantic_loop_guard_decision as lg_semantic_loop_guard_decision,
+    stable_page_scope as lg_stable_page_scope,
+)
+from .executor import (
+    do_scroll as exec_do_scroll,
+    do_select as exec_do_select,
+    locate_file_input as exec_locate_file_input,
+    smart_click as exec_smart_click,
+    smart_fill as exec_smart_fill,
+    smart_type as exec_smart_type,
+    verify_upload_success as exec_verify_upload_success,
+)
+from .planner import (
+    safe_parse_json as planner_safe_parse_json,
+    sanitize_simplify_claims as planner_sanitize_simplify_claims,
+)
+from .intent_engine import (
+    fallback_label_intents as ie_fallback_label_intents,
+    infer_label_intents as ie_infer_label_intents,
+    infer_label_intents_with_llm as ie_infer_label_intents_with_llm,
+    infer_snapshot_intents as ie_infer_snapshot_intents,
+    infer_text_intents as ie_infer_text_intents,
+    intent_cache_key as ie_intent_cache_key,
+)
+from .manual_gate import (
+    classify_page_state as mg_classify_page_state,
+    collect_manual_required_evidence as mg_collect_manual_required_evidence,
+    collect_selector_details as mg_collect_selector_details,
+    count_visible_captcha_challenge as mg_count_visible_captcha_challenge,
+    safe_locator_count as mg_safe_locator_count,
+    select_apply_entry_candidate as mg_select_apply_entry_candidate,
+)
+from .fsm_orchestrator import (
+    decide_failure_recovery_path as fsm_decide_failure_recovery_path,
+    decide_repeated_skip_path as fsm_decide_repeated_skip_path,
+    decide_semantic_guard_path as fsm_decide_semantic_guard_path,
+)
+from .llm_runtime import run_chat_with_fallback
+from .prompt_builder import (
+    build_system_prompt,
+    build_user_prompt,
+)
+from .state_parser import parse_agent_response_payload
+from .verifier import (
+    get_input_value as verifier_get_input_value,
+    is_dropdown_open as verifier_is_dropdown_open,
+    normalize_answer_label as verifier_normalize_answer_label,
+    verify_ref_action_effect as verifier_verify_ref_action_effect,
+)
 
 
 # 截图保存目录
@@ -97,19 +159,6 @@ class AgentState:
     action_plan: Optional[list[str]] = None
     risk_or_blocker: Optional[str] = None
     page_fingerprint: Optional[str] = None
-
-
-@dataclass
-class SubmissionOutcome:
-    classification: Literal[
-        "success_confirmed",
-        "validation_error",
-        "external_blocked",
-        "transient_network",
-        "unknown_blocked",
-    ]
-    reason_code: str
-    evidence_snippet: str
 
 
 def evaluate_progression_block_reason(
@@ -293,6 +342,14 @@ class BrowserAgent:
             getattr(job, "simplify_state", "unknown") or "unknown"
         )
         self.simplify_message = str(getattr(job, "simplify_message", "") or "")
+        self.assist_required_before = int(
+            getattr(job, "assist_required_before", 0) or 0
+        )
+        self.assist_required_after = int(getattr(job, "assist_required_after", 0) or 0)
+        self.assist_prefill_delta = int(getattr(job, "assist_prefill_delta", 0) or 0)
+        self.assist_prefill_verified = bool(
+            getattr(job, "assist_prefill_verified", False)
+        )
         self._intent_cache: dict[str, dict[str, list[str]]] = {}
         self._last_snapshot_intents: dict[str, set[str]] = {}
         self._error_gate_cache: dict[str, bool] = {}
@@ -315,6 +372,16 @@ class BrowserAgent:
         self.last_error_snippet_hint: str | None = None
         self.last_outcome_class_hint: str | None = None
         self.last_outcome_at_hint: datetime | None = None
+        try:
+            self.visual_fallback_budget = max(
+                0, int(os.getenv("VISION_FALLBACK_BUDGET", "8"))
+            )
+        except Exception:
+            self.visual_fallback_budget = 8
+        self.visual_fallback_used = 0
+        self.step_screenshot_mode = (
+            os.getenv("STEP_SCREENSHOT_MODE", "vision_only").strip().lower()
+        )
 
     # region agent log
     def _ndjson_log(self, hypothesis_id: str, location: str, message: str, data: dict):
@@ -402,7 +469,15 @@ class BrowserAgent:
                 action = state.next_action
                 fp = state.page_fingerprint or self._last_observed_fingerprint
                 semantic_guard = self._semantic_loop_guard_decision(fp, action)
-                if semantic_guard == "replan":
+                precomputed_alternate = None
+                if semantic_guard == "alternate":
+                    precomputed_alternate = self._build_alternate_action(action)
+                guard_path = fsm_decide_semantic_guard_path(
+                    semantic_guard,
+                    has_alternate_action=precomputed_alternate is not None,
+                )
+                if guard_path == "replan":
+                    self._promote_semantic_guard(fp, action, stage="replan")
                     if fp:
                         self._state_cache_by_fingerprint.pop(fp, None)
                     self.history.append(
@@ -410,20 +485,19 @@ class BrowserAgent:
                     )
                     self.consecutive_failures += 1
                     continue
-                if semantic_guard == "alternate":
-                    alternate_action = self._build_alternate_action(action)
-                    if alternate_action is not None:
-                        self._log("⚠ 语义动作重复失败，改用替代动作", "warn")
-                        action = alternate_action
-                    else:
-                        if fp:
-                            self._state_cache_by_fingerprint.pop(fp, None)
-                        self.history.append(
-                            f"步骤{self.step_count}: 语义动作重复失败，暂无替代动作，强制重规划 {action.action}({action.ref or action.selector or ''})"
-                        )
-                        self.consecutive_failures += 1
-                        continue
-                if semantic_guard == "stop":
+                if guard_path == "alternate":
+                    self._log("⚠ 语义动作重复失败，改用替代动作", "warn")
+                    action = precomputed_alternate or action
+                elif guard_path == "alternate_missing_replan":
+                    self._promote_semantic_guard(fp, action, stage="alternate")
+                    if fp:
+                        self._state_cache_by_fingerprint.pop(fp, None)
+                    self.history.append(
+                        f"步骤{self.step_count}: 语义动作重复失败，暂无替代动作，强制重规划 {action.action}({action.ref or action.selector or ''})"
+                    )
+                    self.consecutive_failures += 1
+                    continue
+                if guard_path == "stop":
                     if not self._last_submission_outcome:
                         self._sync_failure_hints(
                             SubmissionOutcome(
@@ -449,10 +523,14 @@ class BrowserAgent:
                         "warn",
                     )
                     alternate_action = self._build_alternate_action(action)
-                    if alternate_action is not None:
+                    skip_path = fsm_decide_repeated_skip_path(
+                        skip_count=skip_count,
+                        has_alternate_action=alternate_action is not None,
+                    )
+                    if skip_path == "alternate":
                         self._log("   ↪ 尝试同页替代动作以打破循环")
-                        action = alternate_action
-                    elif skip_count == 1:
+                        action = alternate_action or action
+                    elif skip_path == "replan":
                         # 第一次跳过时清理该页缓存，强制下一步重规划。
                         if fp:
                             self._state_cache_by_fingerprint.pop(fp, None)
@@ -461,7 +539,7 @@ class BrowserAgent:
                         )
                         self.consecutive_failures += 1
                         continue
-                    elif skip_count >= 3:
+                    elif skip_path == "stop":
                         self._set_manual_reason_hint(
                             "同页面重复失败且无可执行替代动作，需要人工处理"
                         )
@@ -546,34 +624,32 @@ class BrowserAgent:
                     except Exception:
                         pass
 
-                    # 智能终止：连续失败次数过多
-                    if self.consecutive_failures >= 3:
-                        if self.refresh_attempts < self.max_refresh_attempts:
-                            self._log(
-                                f"⚠ 连续失败达到 {self.consecutive_failures} 次，触发页面刷新重试",
-                                "warn",
-                            )
-                            refreshed = self._do_refresh(trigger="auto_stuck_recovery")
-                            if refreshed:
-                                self.consecutive_failures = 0
-                                continue
-                        elif self.refresh_exhausted:
-                            self._set_manual_reason_hint(
-                                "页面刷新两次后仍无进展，需要人工处理"
-                            )
-                            self._log(
-                                "⚠ 页面刷新次数已用尽，停止执行并标记待人工处理",
-                                "warn",
-                            )
-                            self._log(
-                                "========== AI Agent 运行结束（刷新重试耗尽）=========="
-                            )
-                            return False
-
-                    if self.consecutive_failures >= self.max_consecutive_failures:
-                        self._set_manual_reason_hint(
-                            "连续操作失败达到上限，需要人工处理"
+                    failure_path = fsm_decide_failure_recovery_path(
+                        consecutive_failures=self.consecutive_failures,
+                        max_consecutive_failures=self.max_consecutive_failures,
+                        refresh_attempts=self.refresh_attempts,
+                        max_refresh_attempts=self.max_refresh_attempts,
+                        refresh_exhausted=self.refresh_exhausted,
+                    )
+                    if failure_path == "refresh":
+                        self._log(
+                            f"⚠ 连续失败达到 {self.consecutive_failures} 次，触发页面刷新重试",
+                            "warn",
                         )
+                        refreshed = self._do_refresh(trigger="auto_stuck_recovery")
+                        if refreshed:
+                            self.consecutive_failures = 0
+                            continue
+                    elif failure_path == "stop_refresh_exhausted":
+                        self._set_manual_reason_hint("页面刷新两次后仍无进展，需要人工处理")
+                        self._log(
+                            "⚠ 页面刷新次数已用尽，停止执行并标记待人工处理",
+                            "warn",
+                        )
+                        self._log("========== AI Agent 运行结束（刷新重试耗尽）==========")
+                        return False
+                    elif failure_path == "stop_max_failures":
+                        self._set_manual_reason_hint("连续操作失败达到上限，需要人工处理")
                         self._log(
                             f"⚠ 连续 {self.consecutive_failures} 次操作失败，停止执行",
                             "warn",
@@ -596,32 +672,8 @@ class BrowserAgent:
         """
         观察当前页面状态，让 LLM 思考下一步。
         """
-        # 1. 截图（压缩优化）
+        # 1. 先走语义观察（文本 + 可交互快照），截图仅按预算兜底
         screenshot_b64 = None
-        try:
-            png_bytes = self.page.screenshot(full_page=True)
-            original_size = len(png_bytes) / 1024
-
-            # 压缩截图：PNG → JPEG，并限制宽度
-            compressed_bytes = self._compress_screenshot(png_bytes)
-            screenshot_b64 = base64.b64encode(compressed_bytes).decode("utf-8")
-            compressed_size = len(compressed_bytes) / 1024
-
-            # 保存截图到 job 专属目录
-            self._last_screenshot_bytes = compressed_bytes
-            screenshot_path = self.screenshot_dir / f"step_{self.step_count:02d}.jpg"
-            screenshot_path.write_bytes(compressed_bytes)
-
-            ratio = (
-                (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
-            )
-            self._log(
-                f"📸 截图成功: {original_size:.1f} KB → {compressed_size:.1f} KB (压缩 {ratio:.0f}%)"
-            )
-            self._log(f"   💾 已保存: {screenshot_path.name}")
-        except Exception as e:
-            self._log(f"❌ 截图失败: {e}", "error")
-            return AgentState(status="error", summary=f"截图失败: {e}")
 
         # 2. 获取页面文本
         try:
@@ -642,6 +694,25 @@ class BrowserAgent:
         self._last_observed_fingerprint = page_fingerprint
         self._last_snapshot_intents = self._infer_snapshot_intents(
             snapshot_map, visible_text
+        )
+        semantic_snapshot = self._build_semantic_snapshot(
+            current_url_for_fp,
+            snapshot_map,
+            visible_text,
+        )
+        self._step_log(
+            event="snapshot_generated",
+            payload={
+                "step": self.step_count,
+                "url": semantic_snapshot.url,
+                "domain": semantic_snapshot.domain,
+                "normalized_path": semantic_snapshot.normalized_path,
+                "page_id": semantic_snapshot.page_id,
+                "element_count": len(semantic_snapshot.elements),
+                "required_unfilled_count": len(semantic_snapshot.required_unfilled),
+                "submit_candidate_count": len(semantic_snapshot.submit_candidates),
+                "error_preview": semantic_snapshot.errors[:3],
+            },
         )
         # region agent log
         append_debug_log(
@@ -878,261 +949,67 @@ class BrowserAgent:
         # 获取用户个人信息和操作规范
         user_info = get_user_info_for_prompt()
         agent_guidelines = load_agent_guidelines()
-
-        system_prompt = f"""你是一个浏览器自动化 AI Agent，正在帮用户填写英文求职申请表单。
-
-## ⚖️ 合规声明
-
-本工具是用户授权的合法求职辅助系统。用户已明确授权 AI 代为填写求职申请表单。
-- 所有操作均基于用户提供的真实个人信息
-- 遵守 EEOC（美国平等就业机会委员会）指南
-- 自愿披露字段（如残疾、退伍军人身份、种族、性别）：
-  - 这些是合法的 EEOC 合规表单，用于统计目的
-  - 如果用户没有明确指定，默认选择 "Decline to self-identify" 或 "Prefer not to disclose"
-  - 不要跳过这些字段，选择合适的拒绝披露选项即可
-
-{user_info}
-
-## 📖 操作规范手册
-
-请严格遵循以下规范进行页面浏览、理解和操作：
-
-{agent_guidelines}
-
-## 🔍 观察页面的标准步骤（按顺序执行！）
-
-**第一步：识别页面布局**
-- 左侧/顶部通常是**职位信息区**（只读，显示职位地点、薪资等）→ 不要操作！
-- 中间/右侧是**表单区域**（有输入框、checkbox）→ 这才是你要填的
-
-**第二步：区分不同的"位置"信息**
-- 左侧显示 "Location: Boston, NYC" → 这是**职位的工作地点**，只读，不管它！
-- 表单中的 "Location*" 输入框 → 这是问**用户住哪里**，要填写
-- 表单中的 "Which office" checkbox → 这是问**用户愿意在哪工作**，要选择
-
-**第三步：聚焦表单区域**
-- 只操作表单区域的字段
-- 不要被职位信息区的内容干扰
-
-**第四步：检查上一步结果**
-- 上一步改错了？→ 先修正！
-- 上一步正确？→ 继续下一步
-
-## ⚠️ autocomplete 字段必须两步完成！（最常见错误！）
-
-对于 Location 等 autocomplete 字段（placeholder 是 "Start typing..."）：
-
-**必须完成两步，缺一不可：**
-1. `type` 输入内容 → 等待下拉框出现
-2. `click` 选择下拉选项 → 字段才算填写完成
-
-**❌ 错误流程（会导致字段为空）：**
-```
-type(Location, Dallas) → 下拉框出现 → 直接去操作其他字段 → Location 变空！
-```
-
-**✅ 正确流程：**
-```
-type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United States) → 完成！
-```
-
-**🔍 关键判断规则：**
-| 你看到什么 | 下一步必须做什么 |
-|-----------|-----------------|
-| 下拉框出现，有选项列表 | **必须 click 选择选项！不能跳过！** |
-| autocomplete 字段显示 "Start typing..." | 需要 type 输入 |
-| autocomplete 字段显示完整地址（如 "Dallas, Texas, United States"） | 已完成，可以跳过 |
-
-**⚠️ 绝对禁止：在下拉框出现时去操作其他字段或点击 Submit！**
-
-## checkbox 多选逻辑（重要！）
-
-**取交集原则：**
-1. 查看页面提供的所有选项
-2. 对比用户偏好（从用户信息中获取）
-3. 交集 = 用户偏好中有的 AND 页面也提供的
-
-**模糊匹配：**
-- Boston = Boston (Cambridge) ✓
-- New York = New York City (Chelsea) = NYC ✓
-- SF = San Francisco ✓
-- 推理判断是同一事物 → 使用**页面显示的完整名称**
-
-**示例：**
-```
-用户偏好: [Boston, New York, SF, LA, Dallas]
-页面选项: [Boston (Cambridge), NYC (Chelsea), LA (Venice), SF, Remote only]
-交集: Boston (Cambridge), NYC (Chelsea), LA (Venice), SF
-→ 排除 Remote only（用户偏好里没有）
-```
-
-**全部执行规则：**
-- 交集有 N 个选项，就必须勾选 N 个
-- 规划了选 4 个城市 → 全部勾选后再继续
-- 不要选一个就认为完成！
-
-## 开放式问题处理
-
-当页面只有问题没有选项（如"你的技能是什么？"）：
-- 从用户资料提取相关信息
-- 默认填写 3 个有效值
-- 用逗号分隔
-- 示例：fill("Python, Machine Learning, Deep Learning")
-
-## 观察当前截图并决定操作
-
-- **下拉框出现** → **立即点击正确选项**（最高优先级！）
-- **空的必填字段** → 填写内容
-- **checkbox 多选** → 按交集规划**逐个勾选**，全部完成再继续
-- **Submit 按钮且没有错误提示** → 点击提交
-- **感谢信息** → 返回 done
-
-## 可用操作
-
-| 操作 | 使用场景 | selector/ref | value |
-|------|----------|--------------|-------|
-| click | 按钮、Yes/No选项、checkbox、radio、下拉选项 | 元素文本或 ref | - |
-| fill | 普通输入框（Name、Email等） | 字段标签或 ref | 内容 |
-| type | autocomplete 输入框（Location等） | 字段标签或 ref | 内容 |
-| upload | 上传简历/附件（仅在页面有上传信号时） | 上传控件文本或 ref | 候选文件名或完整路径 |
-| scroll | 滚动页面 | - | up/down |
-| refresh | 当前页面卡住/多次无进展时刷新重试 | - | - |
-| done | 任务完成 | - | - |
-| stuck | 无法继续 | - | - |
-
-**重要区分：**
-- Yes/No 按钮 → 用 **click**，selector 填 "Yes" 或 "No"
-- 文本输入框 → 用 fill 或 type
-- 看到 "Start typing..." → 用 type
-- 同名 Yes/No 出现多个时，必须返回 target_question 绑定到对应问题
-
-## 返回 JSON（优先使用 ref）
-{{
-  "status": "continue/done/stuck",
-  "summary": "当前看到什么（中文）",
-  "page_overview": "页面结构与关键信息概览（可选）",
-  "field_audit": "必填项已完成/未完成清单（可选）",
-  "action_plan": ["计划步骤1", "计划步骤2"],
-  "risk_or_blocker": "当前潜在风险或阻塞（可选）",
-  "next_action": {{
-    "action": "操作",
-    "ref": "可交互元素 ref（优先使用）",
-    "element_type": "button/link/checkbox/radio/input/option",
-    "selector": "目标",
-    "value": "值",
-    "target_question": "若是 Yes/No 等回答型按钮，填写对应问题文本（可选）",
-    "reason": "为什么"
-  }}
-}}
-
-## 规则
-1. 使用用户真实信息，不编造
-2. 所有内容用英文填写
-3. 已上传的文件不重复上传
-4. 只有在页面存在上传信号时才允许使用 upload 动作
-5. refresh 最多使用 2 次；若两次后仍无进展，返回 stuck
-6. 同名 Yes/No 出现多个时，必须先绑定 target_question 后再点击
-7. 若提交被阻止，先修复报错字段，不得立即重复提交
-
-## 什么时候返回 stuck？（重要！不要轻易放弃！）
-
-**只有这些情况才返回 stuck：**
-- 需要登录但没有账号
-- 出现验证码（CAPTCHA）
-- 页面完全无法加载
-- 需要付费
-- 只有看到 sign in/login 文案还不够，必须有密码框或验证码等强证据
-
-**这些情况不是 stuck，要继续操作：**
-- 某个字段填错了 → 点击正确选项修复
-- checkbox 选错了 → 点击正确的 checkbox
-- 有错误提示 → 修复对应字段
-- 页面有多个选项 → 选择最合适的
-
-**核心原则：能操作就操作，不要轻易放弃！**"""
-
-        # 构建 user_prompt（根据是否是新页面调整引导）
-        new_page_hint = "[新页面] " if is_new_page else ""
-
-        user_prompt = f"""历史:
-{history_text}
-
-## 页面可见文本（截断）
-{visible_text}
-
-## 可交互元素快照（ref → 元素）
-{snapshot_text}
-
-## 上传信号检测
-{upload_signal_text}
-
-## Simplify 系统探针状态（以此为准）
-- state: {self.simplify_state}
-- message: {self.simplify_message or "n/a"}
-- 规则：若 state 为 unavailable/unknown，不得声称“Simplify 已自动填写”
-
-## 白名单可上传候选文件（仅可从以下文件中选择）
-{upload_candidates_text}
-
-## {new_page_hint}请按以下步骤处理当前页面：
-
-**1. 完整扫描并规划（列出所有空缺！）**
-- 仅当上方 Simplify state=completed/running 时，才能提及 Simplify 已填写
-- 列出**所有**空缺必填字段，不要只说第一个！
-- 每个字段给出**具体值**（从用户信息查找）
-- checkbox 多选：取"用户偏好 ∩ 页面选项"的交集（模糊匹配）
-- 开放式问题（无选项）：默认填 3 个相关值
-- 示例：" 空缺 3 项：1. Location → Dallas；2. Which office → 交集4个(Boston/NYC/LA/SF)；3. Skills → Python, ML, DL"
-
-**规则：规划的选项必须全部执行！**
-- checkbox 规划了 4 个 → 选完 4 个再继续
-- 不要选一个就认为完成
-
-**2. 检查下拉框（最高优先级！）**
-- 有下拉框出现？→ **立即 click 选择！**
-- 不要跳过下拉框去操作其他字段
-
-**3. 识别页面布局**
-- 左侧/顶部的职位信息区（只读）→ 不管它！
-- 中间的表单区域 → 这才是要操作的
-
-**4. 区分位置信息（最容易混淆！）**
-- 左侧 "Location: XXX" → 这是**职位地点**，不管它！
-- 表单 "Location*" 输入框 → 问**用户住哪里**
-- 表单 "Which office" checkbox → 问**用户愿意在哪工作**
-
-**5. 检查上一步结果**
-- 上一步操作的字段是否正确？
-- autocomplete 下拉框出现但没选中？→ 必须先 click 选择！
-- 如果改错了 → 先修正！
-
-**6. 按规划顺序执行**
-- **下拉框出现** → 立即 click 选择
-- autocomplete 显示 "Start typing..." → type 输入
-- 空的普通必填字段 → fill 填写
-- 页面有上传信号且需要简历/CV 时 → 使用 upload（value 填候选文件名或完整路径）
-- checkbox 多选 → 按规划**逐个勾选**，全部完成再继续
-- 如果当前是职位详情页且有“进入申请流程”的按钮/链接（同义表达也算）→ 先点击进入申请页，不要误判 stuck
-- 都填好了且无错误提示 → Submit
-- 感谢/确认信息 → done"""
+        system_prompt = build_system_prompt(
+            user_info=user_info,
+            agent_guidelines=agent_guidelines,
+        )
+        user_prompt = build_user_prompt(
+            history_text=history_text,
+            visible_text=visible_text,
+            snapshot_text=snapshot_text,
+            upload_signal_text=upload_signal_text,
+            simplify_state=self.simplify_state,
+            simplify_message=self.simplify_message,
+            assist_required_before=self.assist_required_before,
+            assist_required_after=self.assist_required_after,
+            assist_prefill_delta=self.assist_prefill_delta,
+            assist_prefill_verified=self.assist_prefill_verified,
+            upload_candidates_text=upload_candidates_text,
+            is_new_page=is_new_page,
+        )
 
         # 5. 调用 LLM（带模型降级机制）
         self._log(f"🤔 正在思考... (模型: {self.model})")
+        use_vision, vision_reason = self._should_use_vision_fallback(
+            page_state=page_state,
+            snapshot_map=snapshot_map,
+            visible_text=visible_text,
+        )
+        self._step_log(
+            "visual_fallback_decision",
+            {
+                "step": self.step_count,
+                "use_vision": use_vision,
+                "reason": vision_reason,
+                "used": self.visual_fallback_used,
+                "budget": self.visual_fallback_budget,
+            },
+        )
+        should_capture = self._should_capture_step_screenshot(use_vision=use_vision)
+        self._step_log(
+            "screenshot_capture_decision",
+            {
+                "step": self.step_count,
+                "mode": self.step_screenshot_mode,
+                "should_capture": should_capture,
+                "use_vision": use_vision,
+            },
+        )
+        if should_capture:
+            screenshot_b64 = self._capture_step_screenshot()
 
+        user_content: list[dict] = [{"type": "text", "text": user_prompt}]
+        if use_vision and screenshot_b64:
+            user_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"},
+                }
+            )
+            self.visual_fallback_used += 1
         messages = [
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{screenshot_b64}"
-                        },
-                    },
-                ],
-            },
+            {"role": "user", "content": user_content},
         ]
         # region agent log
         self._ndjson_log(
@@ -1142,6 +1019,10 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             data={
                 "model": self.model,
                 "step": self.step_count,
+                "use_vision": use_vision,
+                "vision_reason": vision_reason,
+                "vision_used": self.visual_fallback_used,
+                "vision_budget": self.visual_fallback_budget,
                 "screenshot_b64_len": len(screenshot_b64 or ""),
                 "visible_text_len": len(visible_text),
                 "upload_signals": upload_signals[:5],
@@ -1150,80 +1031,40 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         )
         # endregion
 
-        raw = None
-        while self.model_index < len(self.fallback_models):
-            try:
-                completion = self.client.chat.completions.create(
-                    model=self.model,
-                    temperature=self.llm_cfg.get("temperature", 0.2),
-                    top_p=0.8,
-                    max_tokens=self.llm_cfg.get("max_tokens", 1000),
-                    messages=messages,
-                )
-                raw = completion.choices[0].message.content or ""
-                # region agent log
-                self._ndjson_log(
-                    hypothesis_id="H2",
-                    location="vision_agent:_observe_and_think:after_llm",
-                    message="llm raw response",
-                    data={
-                        "model": self.model,
-                        "step": self.step_count,
-                        "raw_prefix": raw[:200],
-                    },
-                )
-                # endregion
-                break  # 成功则跳出
-            except Exception as e:
-                error_str = str(e)
-                error_lower = error_str.lower()
-                # 检测 429 Rate Limit 错误
-                if "429" in error_str or "rate_limit" in error_lower:
-                    self._log(f"⚠️ 模型 {self.model} 遇到速率限制", "warn")
-                    # 尝试切换到下一个模型
-                    self.model_index += 1
-                    if self.model_index < len(self.fallback_models):
-                        self.model = self.fallback_models[self.model_index]
-                        self._log(f"🔄 切换到模型: {self.model}")
-                        time.sleep(1)  # 短暂等待后重试
-                    else:
-                        self._log("❌ 所有模型都遇到速率限制，请稍后重试", "error")
-                        return AgentState(
-                            status="error", summary="所有模型都遇到速率限制"
-                        )
-                # 模型能力不匹配（如不支持图片输入）时也尝试回退到下一个模型
-                elif any(
-                    kw in error_lower
-                    for kw in [
-                        "does not support",
-                        "unsupported",
-                        "multimodal",
-                        "vision",
-                        "image_url",
-                        "invalid model",
-                        "model_not_found",
-                        "not found",
-                    ]
-                ):
-                    self._log(
-                        f"⚠️ 模型 {self.model} 能力不匹配或不可用，尝试回退", "warn"
-                    )
-                    self.model_index += 1
-                    if self.model_index < len(self.fallback_models):
-                        self.model = self.fallback_models[self.model_index]
-                        self._log(f"🔄 切换到模型: {self.model}")
-                        time.sleep(1)
-                    else:
-                        self._log("❌ 所有候选模型都不支持当前请求", "error")
-                        return AgentState(
-                            status="error", summary="所有候选模型都不支持当前请求"
-                        )
-                else:
-                    self._log(f"❌ LLM 调用失败: {e}", "error")
-                    return AgentState(status="error", summary=f"LLM 调用失败: {e}")
-
-        if raw is None:
-            return AgentState(status="error", summary="LLM 未返回结果")
+        call_result = run_chat_with_fallback(
+            client=self.client,
+            fallback_models=self.fallback_models,
+            start_model_index=self.model_index,
+            messages=messages,
+            temperature=self.llm_cfg.get("temperature", 0.2),
+            max_tokens=self.llm_cfg.get("max_tokens", 1000),
+            on_log=lambda level, msg: self._log(
+                msg,
+                "warn" if level == "warn" else "info",
+            ),
+            sleep_seconds=1.0,
+        )
+        self.model_index = call_result.model_index
+        self.model = call_result.model or self.fallback_models[self.model_index]
+        if not call_result.ok:
+            self._log(f"❌ {call_result.error_summary or 'LLM 调用失败'}", "error")
+            return AgentState(
+                status="error",
+                summary=call_result.error_summary or "LLM 调用失败",
+            )
+        raw = call_result.raw
+        # region agent log
+        self._ndjson_log(
+            hypothesis_id="H2",
+            location="vision_agent:_observe_and_think:after_llm",
+            message="llm raw response",
+            data={
+                "model": self.model,
+                "step": self.step_count,
+                "raw_prefix": raw[:200],
+            },
+        )
+        # endregion
 
         # 6. 解析返回
         data = self._safe_parse_json(raw)
@@ -1245,57 +1086,35 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 status="error", summary="LLM 返回格式错误", raw_response=raw
             )
 
-        status = data.get("status", "continue")
-        summary = data.get("summary", "")
-        page_overview = data.get("page_overview")
-        field_audit = data.get("field_audit")
-        action_plan = data.get("action_plan")
-        risk_or_blocker = data.get("risk_or_blocker")
-        if not isinstance(page_overview, str):
-            page_overview = None
-        if not isinstance(field_audit, str):
-            field_audit = None
-        if not isinstance(action_plan, list):
-            action_plan = None
-        else:
-            action_plan = [str(x) for x in action_plan[:8]]
-        if not isinstance(risk_or_blocker, str):
-            risk_or_blocker = None
-        if self.simplify_state.lower() in ("unavailable", "unknown"):
-            summary = self._sanitize_simplify_claims(summary)
-            page_overview = self._sanitize_simplify_claims(page_overview)
-            field_audit = self._sanitize_simplify_claims(field_audit)
-            risk_or_blocker = self._sanitize_simplify_claims(risk_or_blocker)
-            if action_plan:
-                action_plan = [
-                    self._sanitize_simplify_claims(x) or "" for x in action_plan
-                ]
-
+        parsed = parse_agent_response_payload(
+            data,
+            simplify_state=self.simplify_state,
+            assist_prefill_verified=self.assist_prefill_verified,
+            assist_prefill_delta=self.assist_prefill_delta,
+            sanitize_claims=self._sanitize_simplify_claims,
+        )
         next_action = None
-        if status == "continue" and data.get("next_action"):
-            act = data["next_action"]
-            target_question = act.get("target_question")
-            if target_question is not None and not isinstance(target_question, str):
-                target_question = str(target_question)
+        next_action_payload = parsed.get("next_action")
+        if isinstance(next_action_payload, dict):
             next_action = AgentAction(
-                action=act.get("action", ""),
-                ref=act.get("ref"),
-                selector=act.get("selector"),
-                value=act.get("value"),
-                target_question=target_question,
-                element_type=act.get("element_type"),
-                reason=act.get("reason"),
+                action=next_action_payload.get("action", ""),
+                ref=next_action_payload.get("ref"),
+                selector=next_action_payload.get("selector"),
+                value=next_action_payload.get("value"),
+                target_question=next_action_payload.get("target_question"),
+                element_type=next_action_payload.get("element_type"),
+                reason=next_action_payload.get("reason"),
             )
 
         result_state = AgentState(
-            status=status,
-            summary=summary,
+            status=str(parsed.get("status", "continue")),
+            summary=str(parsed.get("summary", "")),
             next_action=next_action,
             raw_response=raw,
-            page_overview=page_overview,
-            field_audit=field_audit,
-            action_plan=action_plan,
-            risk_or_blocker=risk_or_blocker,
+            page_overview=parsed.get("page_overview"),
+            field_audit=parsed.get("field_audit"),
+            action_plan=parsed.get("action_plan"),
+            risk_or_blocker=parsed.get("risk_or_blocker"),
             page_fingerprint=page_fingerprint,
         )
         if result_state.status == "continue" and result_state.next_action is not None:
@@ -1315,58 +1134,114 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             # 优先使用 ref 执行，降低误定位
             if action.ref:
                 return self._execute_ref_action(action)
+            self._log_action_executed(action, source="selector")
+            success = False
 
             if action.action == "click":
                 if self._is_answer_click_action(action):
                     bound = self._try_answer_binding_click(action)
                     if bound is True:
-                        return True
+                        success = True
+                        self._log_action_verified(action, ok=success)
+                        return success
                     if bound is False:
-                        return False
+                        success = False
+                        self._log_action_verified(action, ok=success)
+                        return success
                 if self._is_progression_action(action):
                     blocked_reason = self._get_progression_block_reason()
                     if blocked_reason:
                         self._log(f"⚠ 阻止盲目前进：{blocked_reason}", "warn")
-                        return False
-                return self._smart_click(action.selector, action.element_type)
+                        success = False
+                        self._log_action_verified(action, ok=success)
+                        return success
+                success = self._smart_click(action.selector, action.element_type)
+                self._log_action_verified(action, ok=success)
+                return success
 
             elif action.action == "fill":
-                return self._smart_fill(action.selector, action.value)
+                success = self._smart_fill(action.selector, action.value)
+                self._log_action_verified(action, ok=success)
+                return success
 
             elif action.action == "type":
-                return self._smart_type(action.selector, action.value)
+                success = self._smart_type(action.selector, action.value)
+                self._log_action_verified(action, ok=success)
+                return success
 
             elif action.action == "select":
-                return self._do_select(action.selector, action.value)
+                success = self._do_select(action.selector, action.value)
+                self._log_action_verified(action, ok=success)
+                return success
 
             elif action.action == "upload":
-                return self._do_upload(action)
+                success = self._do_upload(action)
+                self._log_action_verified(action, ok=success)
+                return success
 
             elif action.action == "scroll":
                 direction = action.value or action.selector or "down"
-                return self._do_scroll(direction)
+                success = self._do_scroll(direction)
+                self._log_action_verified(action, ok=success)
+                return success
 
             elif action.action == "refresh":
-                return self._do_refresh(trigger="llm_action")
+                success = self._do_refresh(trigger="llm_action")
+                self._log_action_verified(action, ok=success)
+                return success
 
             elif action.action == "wait":
                 seconds = int(action.value or 2)
                 self.page.wait_for_timeout(seconds * 1000)
-                return True
+                success = True
+                self._log_action_verified(action, ok=success)
+                return success
 
             elif action.action in ("done", "stuck"):
-                return True
+                success = True
+                self._log_action_verified(action, ok=success)
+                return success
 
             else:
                 self._log(f"未知操作类型: {action.action}", "warn")
-                return False
+                success = False
+                self._log_action_verified(action, ok=success)
+                return success
 
         except Exception as e:
             self._log(f"执行异常: {e}", "error")
+            self._log_action_verified(action, ok=False)
             return False
+
+    def _log_action_executed(self, action: AgentAction, *, source: str) -> None:
+        self._step_log(
+            "action_executed",
+            {
+                "step": self.step_count,
+                "action": action.action,
+                "ref": action.ref,
+                "selector": action.selector,
+                "target_question": action.target_question,
+                "source": source,
+            },
+        )
+
+    def _log_action_verified(self, action: AgentAction, *, ok: bool) -> None:
+        payload = {
+            "step": self.step_count,
+            "action": action.action,
+            "ref": action.ref,
+            "selector": action.selector,
+            "target_question": action.target_question,
+            "ok": bool(ok),
+        }
+        # backward compatibility with existing log consumers
+        self._step_log("action_verify", payload)
+        self._step_log("action_verified", payload)
 
     def _execute_ref_action(self, action: AgentAction) -> bool:
         """基于快照 ref 执行动作（确定性定位）。"""
+        self._log_action_executed(action, source="ref")
         item = self._last_snapshot_map.get(action.ref or "")
         if not item:
             self._log(f"ref 不存在: {action.ref}", "warn")
@@ -1381,16 +1256,10 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 if self._is_answer_click_action(action, item=item):
                     bound = self._try_answer_binding_click(action)
                     if bound is True:
-                        self._step_log(
-                            "action_verify",
-                            {"action": action.action, "ref": action.ref, "ok": True},
-                        )
+                        self._log_action_verified(action, ok=True)
                         return True
                     if bound is False:
-                        self._step_log(
-                            "action_verify",
-                            {"action": action.action, "ref": action.ref, "ok": False},
-                        )
+                        self._log_action_verified(action, ok=False)
                         return False
                 if self._is_progression_action(action, item=item):
                     blocked_reason = self._get_progression_block_reason()
@@ -1399,32 +1268,20 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                         return False
                 locator.click(timeout=1500)
                 if self._verify_ref_action_effect(action, locator, item):
-                    self._step_log(
-                        "action_verify",
-                        {"action": action.action, "ref": action.ref, "ok": True},
-                    )
+                    self._log_action_verified(action, ok=True)
                     return True
                 ok = self._retry_ref_action(action, locator, item)
-                self._step_log(
-                    "action_verify",
-                    {"action": action.action, "ref": action.ref, "ok": ok},
-                )
+                self._log_action_verified(action, ok=ok)
                 return ok
             if action.action == "fill":
                 if action.value is None:
                     return False
                 locator.fill(str(action.value), timeout=1500)
                 if self._verify_ref_action_effect(action, locator, item):
-                    self._step_log(
-                        "action_verify",
-                        {"action": action.action, "ref": action.ref, "ok": True},
-                    )
+                    self._log_action_verified(action, ok=True)
                     return True
                 ok = self._retry_ref_action(action, locator, item)
-                self._step_log(
-                    "action_verify",
-                    {"action": action.action, "ref": action.ref, "ok": ok},
-                )
+                self._log_action_verified(action, ok=ok)
                 return ok
             if action.action == "type":
                 if action.value is None:
@@ -1432,16 +1289,10 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 locator.click(timeout=800)
                 locator.type(str(action.value), delay=40)
                 if self._verify_ref_action_effect(action, locator, item):
-                    self._step_log(
-                        "action_verify",
-                        {"action": action.action, "ref": action.ref, "ok": True},
-                    )
+                    self._log_action_verified(action, ok=True)
                     return True
                 ok = self._retry_ref_action(action, locator, item)
-                self._step_log(
-                    "action_verify",
-                    {"action": action.action, "ref": action.ref, "ok": ok},
-                )
+                self._log_action_verified(action, ok=ok)
                 return ok
             if action.action == "select":
                 if action.value is None:
@@ -1451,16 +1302,10 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 except Exception:
                     locator.click(timeout=1500)
                 if self._verify_ref_action_effect(action, locator, item):
-                    self._step_log(
-                        "action_verify",
-                        {"action": action.action, "ref": action.ref, "ok": True},
-                    )
+                    self._log_action_verified(action, ok=True)
                     return True
                 ok = self._retry_ref_action(action, locator, item)
-                self._step_log(
-                    "action_verify",
-                    {"action": action.action, "ref": action.ref, "ok": ok},
-                )
+                self._log_action_verified(action, ok=ok)
                 return ok
             if action.action == "upload":
                 return self._do_upload(action, locator=locator)
@@ -1526,45 +1371,14 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         snapshot_intents: dict[str, set[str]],
     ) -> dict[str, int | bool]:
         """收集登录/验证码判定所需 DOM+文本证据。"""
-        password_input_count = self._safe_locator_count("input[type='password']")
-        captcha_selectors = [
-            "iframe[src*='recaptcha']",
-            ".g-recaptcha",
-            "iframe[src*='hcaptcha']",
-            ".h-captcha",
-            "[data-sitekey][data-callback]",
-            "iframe[title*='captcha' i]",
-        ]
-        captcha_element_count = self._count_visible_captcha_challenge(captcha_selectors)
-        lower_text = (visible_text or "").lower()
-        captcha_challenge_phrases = [
-            "i am not a robot",
-            "verify you are human",
-            "security check",
-            "complete the challenge",
-            "select all images",
-            "are you human",
-        ]
-        has_captcha_challenge_text = any(
-            p in lower_text for p in captcha_challenge_phrases
-        )
-
-        has_login_button = any(
-            ref in snapshot_map
-            and snapshot_map[ref].role in ("button", "link")
-            and "login_action" in intents
-            for ref, intents in snapshot_intents.items()
-        )
-        has_apply_cta = any(
-            ref in snapshot_map
-            and snapshot_map[ref].role in ("button", "link")
-            and "apply_entry" in intents
-            for ref, intents in snapshot_intents.items()
-        )
         page_text_intents = self._infer_text_intents(visible_text, limit=1200)
-        has_login_button = has_login_button or ("login_action" in page_text_intents)
-
-        captcha_selector_details = self._collect_selector_details(captcha_selectors)
+        evidence, details = mg_collect_manual_required_evidence(
+            page=self.page,
+            visible_text=visible_text,
+            snapshot_map=snapshot_map,
+            snapshot_intents=snapshot_intents,
+            page_text_intents=page_text_intents,
+        )
         # region agent log
         append_debug_log(
             location="vision_agent.py:_collect_manual_required_evidence:captcha",
@@ -1572,25 +1386,20 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             data={
                 "job_id": self.job_id,
                 "url": getattr(self.page, "url", ""),
-                "captcha_selector_details": captcha_selector_details,
-                "password_input_count": password_input_count,
-                "has_captcha_challenge_text": has_captcha_challenge_text,
-                "has_login_button": has_login_button,
-                "has_apply_cta": has_apply_cta,
-                "page_text_intents": sorted(page_text_intents),
+                "captcha_selector_details": details.get("captcha_selector_details", {}),
+                "password_input_count": evidence.get("password_input_count", 0),
+                "has_captcha_challenge_text": evidence.get(
+                    "has_captcha_challenge_text", False
+                ),
+                "has_login_button": evidence.get("has_login_button", False),
+                "has_apply_cta": evidence.get("has_apply_cta", False),
+                "page_text_intents": details.get("page_text_intents", []),
             },
             run_id="pre-fix-debug",
             hypothesis_id="H1",
         )
         # endregion
-
-        return {
-            "password_input_count": password_input_count,
-            "captcha_element_count": captcha_element_count,
-            "has_captcha_challenge_text": has_captcha_challenge_text,
-            "has_login_button": has_login_button,
-            "has_apply_cta": has_apply_cta,
-        }
+        return evidence
 
     def _classify_page_state(
         self,
@@ -1599,26 +1408,15 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         manual_assessment,
     ) -> str:
         """轻量页面状态分类：login/captcha、职位详情页、申请页。"""
-        if manual_assessment.manual_required:
-            return "manual_gate"
-
-        form_roles = {"textbox", "combobox", "checkbox", "radio", "file_input"}
-        form_item_count = sum(
-            1
-            for item in snapshot_map.values()
-            if item.role in form_roles and (item.in_form or item.required)
-        )
-        has_form_fields = form_item_count >= 2
-        has_apply_cta = bool(evidence.get("has_apply_cta", False))
-        current_url = ""
         try:
-            current_url = (self.page.url or "").lower()
+            current_url = self.page.url or ""
         except Exception:
             current_url = ""
-        looks_like_application_url = (
-            "/application" in current_url
-            or "/apply" in current_url
-            or "greenhouse.io" in current_url
+        page_state, stats = mg_classify_page_state(
+            snapshot_map=snapshot_map,
+            evidence=evidence,
+            manual_required=manual_assessment.manual_required,
+            current_url=current_url,
         )
         # region agent log
         append_debug_log(
@@ -1626,23 +1424,13 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             message="page state classification inputs",
             data={
                 "job_id": self.job_id,
-                "url": current_url,
-                "form_item_count": form_item_count,
-                "has_form_fields": has_form_fields,
-                "has_apply_cta": has_apply_cta,
-                "looks_like_application_url": looks_like_application_url,
+                **stats,
             },
             run_id="pre-fix-debug",
             hypothesis_id="H5",
         )
         # endregion
-
-        if looks_like_application_url:
-            return "application_or_form_page"
-
-        if has_apply_cta and not has_form_fields:
-            return "job_detail_with_apply"
-        return "application_or_form_page"
+        return page_state
 
     def _build_apply_entry_action(
         self,
@@ -1650,46 +1438,17 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         snapshot_intents: dict[str, set[str]],
     ) -> AgentAction | None:
         """在职位详情页中优先定位进入申请流程的 Apply 按钮。"""
-        current_url = ""
         try:
-            current_url = (self.page.url or "").lower()
+            current_url = self.page.url or ""
         except Exception:
             current_url = ""
-        if "/application" in current_url or "/apply" in current_url:
-            return None
-
-        candidates: list[SnapshotItem] = []
-        for ref, item in snapshot_map.items():
-            if item.role not in ("button", "link"):
-                continue
-            intents = snapshot_intents.get(ref, set())
-            if "apply_entry" in intents:
-                label = (item.name or "").lower()
-                # 明确排除非“进入申请页”的按钮，避免把 Replace/Upload 当作 Apply
-                if any(
-                    bad in label
-                    for bad in [
-                        "replace",
-                        "upload",
-                        "autofill",
-                        "tailor",
-                        "settings",
-                        "profile",
-                        "close",
-                    ]
-                ):
-                    continue
-                candidates.append(item)
-        if not candidates:
-            return None
-        # 优先 button，名称更具体者优先，避免点到噪声链接
-        candidates.sort(
-            key=lambda it: (
-                it.role != "button",
-                len(it.name),
-            )
+        picked = mg_select_apply_entry_candidate(
+            snapshot_map=snapshot_map,
+            snapshot_intents=snapshot_intents,
+            current_url=current_url,
         )
-        picked = candidates[0]
+        if not picked:
+            return None
         return AgentAction(
             action="click",
             ref=picked.ref,
@@ -1699,86 +1458,14 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         )
 
     def _safe_locator_count(self, selector: str) -> int:
-        try:
-            return self.page.locator(selector).count()
-        except Exception:
-            return 0
+        return mg_safe_locator_count(self.page, selector)
 
     def _collect_selector_details(self, selectors: list[str]) -> dict[str, dict]:
-        out: dict[str, dict] = {}
-        for selector in selectors:
-            try:
-                details = self.page.evaluate(
-                    """
-                    (sel) => {
-                      const nodes = Array.from(document.querySelectorAll(sel));
-                      const isVisible = (el) => {
-                        const st = window.getComputedStyle(el);
-                        if (!st) return false;
-                        if (st.display === "none" || st.visibility === "hidden") return false;
-                        const r = el.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0;
-                      };
-                      const samples = nodes.slice(0, 3).map((el) => ({
-                        tag: (el.tagName || "").toLowerCase(),
-                        id: el.id || "",
-                        className: String(el.className || "").slice(0, 80),
-                        text: String(el.textContent || "").trim().slice(0, 120),
-                        visible: isVisible(el),
-                        rect: (() => {
-                          const r = el.getBoundingClientRect();
-                          return { w: Math.round(r.width), h: Math.round(r.height) };
-                        })()
-                      }));
-                      return {
-                        total: nodes.length,
-                        visible: samples.filter((s) => s.visible).length,
-                        samples,
-                      };
-                    }
-                    """,
-                    selector,
-                )
-            except Exception as exc:
-                details = {"error": str(exc)}
-            out[selector] = details
-        return out
+        return mg_collect_selector_details(self.page, selectors)
 
     def _count_visible_captcha_challenge(self, selectors: list[str]) -> int:
         """只统计可见验证码挑战节点，排除 recaptcha 法律声明文本。"""
-        total = 0
-        for selector in selectors:
-            try:
-                count = self.page.evaluate(
-                    """
-                    (sel) => {
-                      const nodes = Array.from(document.querySelectorAll(sel));
-                      const isVisible = (el) => {
-                        const st = window.getComputedStyle(el);
-                        if (!st) return false;
-                        if (st.display === "none" || st.visibility === "hidden") return false;
-                        const r = el.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0;
-                      };
-                      const isLegalNotice = (el) => {
-                        const cls = String(el.className || "").toLowerCase();
-                        const text = String(el.textContent || "").toLowerCase();
-                        return (
-                          cls.includes("recaptchalegal") ||
-                          (text.includes("protected by recaptcha") &&
-                           text.includes("privacy policy") &&
-                           text.includes("terms of service"))
-                        );
-                      };
-                      return nodes.filter((el) => isVisible(el) && !isLegalNotice(el)).length;
-                    }
-                    """,
-                    selector,
-                )
-                total += int(count or 0)
-            except Exception:
-                continue
-        return total
+        return mg_count_visible_captcha_challenge(self.page, selectors)
 
     def _infer_snapshot_intents(
         self,
@@ -1786,26 +1473,11 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         visible_text: str,
     ) -> dict[str, set[str]]:
         """为当前快照中的按钮/链接推断语义意图。"""
-        ref_to_label: dict[str, str] = {}
-        for ref, item in snapshot_map.items():
-            if item.role not in ("button", "link"):
-                continue
-            name = (item.name or "").strip()
-            if not name:
-                continue
-            ref_to_label[ref] = name
-
-        if not ref_to_label:
-            return {}
-
-        label_intents = self._infer_label_intents(
-            list(ref_to_label.values()),
-            context=visible_text[:800],
+        return ie_infer_snapshot_intents(
+            snapshot_map,
+            visible_text,
+            infer_label_intents_fn=self._infer_label_intents,
         )
-        ref_intents: dict[str, set[str]] = {}
-        for ref, label in ref_to_label.items():
-            ref_intents[ref] = label_intents.get(label, set())
-        return ref_intents
 
     def _infer_label_intents(
         self,
@@ -1816,192 +1488,46 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         对一组 UI 文本做语义意图分类。
         优先使用低成本文本模型，失败回退到强共识关键词。
         """
-        cleaned = []
-        seen = set()
-        for label in labels:
-            text = (label or "").strip()
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            cleaned.append(text)
-        if not cleaned:
-            return {}
-
-        cache_key = self._intent_cache_key(cleaned, context)
-        cached = self._intent_cache.get(cache_key)
-        if cached is not None:
-            return {k: set(v) for k, v in cached.items()}
-
-        result = self._infer_label_intents_with_llm(cleaned, context)
-        if result is None:
-            result = {label: self._fallback_label_intents(label) for label in cleaned}
-        else:
-            for label in cleaned:
-                result.setdefault(label, self._fallback_label_intents(label))
-
-        # 存 list 以便 JSON 可序列化和轻量缓存
-        self._intent_cache[cache_key] = {k: sorted(v) for k, v in result.items()}
-        return result
+        return ie_infer_label_intents(
+            labels,
+            context=context,
+            intent_cache=self._intent_cache,
+            infer_label_intents_with_llm_fn=self._infer_label_intents_with_llm,
+        )
 
     def _infer_label_intents_with_llm(
         self,
         labels: list[str],
         context: str,
     ) -> dict[str, set[str]] | None:
-        if not self.client:
-            return None
-
-        payload = [
-            {"id": f"l{i + 1}", "text": text}
-            for i, text in enumerate(labels[:40])  # 控制成本
-        ]
-        if not payload:
-            return {}
-
-        system_prompt = (
-            "You classify browser UI label intents for job application automation. "
-            "Return strict JSON only."
+        return ie_infer_label_intents_with_llm(
+            client=self.client,
+            intent_model=self.intent_model,
+            labels=labels,
+            context=context,
+            safe_parse_json_fn=self._safe_parse_json,
         )
-        user_prompt = (
-            "Classify each UI label into zero or more intents.\n"
-            "Allowed intents:\n"
-            "- apply_entry: enter/start job application\n"
-            "- login_action: sign in/authenticate/account access\n"
-            "- progression_action: next/continue/review/submit/proceed steps\n"
-            "- upload_request: upload/attach file or resume\n"
-            "Rules:\n"
-            "1) Use semantic meaning, not literal keyword matching.\n"
-            "2) Support variants and other languages.\n"
-            "3) Be conservative; if uncertain, return empty intents for that label.\n"
-            f"Page context (may help): {context[:600]}\n"
-            f"Labels JSON:\n{json.dumps(payload, ensure_ascii=False)}\n"
-            'Return JSON: {"items":[{"id":"l1","intents":["apply_entry"]}]}'
-        )
-        try:
-            completion = self.client.chat.completions.create(
-                model=self.intent_model,
-                temperature=0.0,
-                max_tokens=500,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            raw = completion.choices[0].message.content or ""
-            data = self._safe_parse_json(raw)
-            if not data or not isinstance(data.get("items"), list):
-                return None
-            id_to_text = {item["id"]: item["text"] for item in payload}
-            allowed = {
-                "apply_entry",
-                "login_action",
-                "progression_action",
-                "upload_request",
-            }
-            out: dict[str, set[str]] = {v: set() for v in id_to_text.values()}
-            for item in data["items"]:
-                if not isinstance(item, dict):
-                    continue
-                label_id = str(item.get("id", "")).strip()
-                text = id_to_text.get(label_id)
-                if not text:
-                    continue
-                intents = item.get("intents", [])
-                if not isinstance(intents, list):
-                    continue
-                normalized = {str(x).strip() for x in intents}
-                out[text].update(i for i in normalized if i in allowed)
-            return out
-        except Exception:
-            return None
 
     def _infer_text_intents(self, text: str, limit: int = 1200) -> set[str]:
         """
         对整页文本做语义意图分类（低频、可缓存）。
         只输出少量全局意图。
         """
-        snippet = (text or "").strip()
-        if not snippet:
-            return set()
-        snippet = snippet[:limit]
-        cache_key = f"text::{hashlib.sha1(snippet.encode('utf-8')).hexdigest()}"
-        cached = self._intent_cache.get(cache_key)
-        if cached is not None:
-            intents = cached.get("__text__", [])
-            return set(intents)
-
-        intents: set[str] = set()
-        if self.client:
-            try:
-                completion = self.client.chat.completions.create(
-                    model=self.intent_model,
-                    temperature=0.0,
-                    max_tokens=220,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "Classify page text intents for job application flow. "
-                                "Return strict JSON."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "Allowed intents: login_action, upload_request.\n"
-                                "Use semantic meaning and multilingual understanding.\n"
-                                f"Text:\n{snippet}\n"
-                                'Return JSON: {"intents":["login_action"]}'
-                            ),
-                        },
-                    ],
-                )
-                raw = completion.choices[0].message.content or ""
-                data = self._safe_parse_json(raw)
-                if data and isinstance(data.get("intents"), list):
-                    allowed = {"login_action", "upload_request"}
-                    intents = {
-                        str(x).strip()
-                        for x in data["intents"]
-                        if str(x).strip() in allowed
-                    }
-            except Exception:
-                intents = set()
-
-        # LLM 不可用/失败时回退到强共识词（兜底）
-        if not intents:
-            lower = snippet.lower()
-            if any(k in lower for k in ["upload", "attach", "resume", "cv"]):
-                intents.add("upload_request")
-            if any(k in lower for k in ["sign in", "log in", "login"]):
-                intents.add("login_action")
-
-        self._intent_cache[cache_key] = {"__text__": sorted(intents)}
-        return intents
+        return ie_infer_text_intents(
+            text,
+            limit=limit,
+            intent_cache=self._intent_cache,
+            client=self.client,
+            intent_model=self.intent_model,
+            safe_parse_json_fn=self._safe_parse_json,
+        )
 
     def _fallback_label_intents(self, label: str) -> set[str]:
         """当语义模型不可用时，使用极小硬规则集合兜底。"""
-        text = (label or "").strip().lower()
-        intents: set[str] = set()
-        if not text:
-            return intents
-
-        # 强共识短词，仅做兜底，不作为主策略
-        if any(k in text for k in ["apply", "application", "candidature"]):
-            intents.add("apply_entry")
-            intents.add("progression_action")
-        if any(k in text for k in ["next", "continue", "submit", "proceed", "review"]):
-            intents.add("progression_action")
-        if any(k in text for k in ["sign in", "log in", "login", "authenticate"]):
-            intents.add("login_action")
-        if any(k in text for k in ["upload", "attach", "resume", "cv", "file"]):
-            intents.add("upload_request")
-        return intents
+        return ie_fallback_label_intents(label)
 
     def _intent_cache_key(self, labels: list[str], context: str = "") -> str:
-        stable = "\n".join(sorted(labels))
-        base = f"{stable}\n--ctx--\n{context[:600]}"
-        return f"labels::{hashlib.sha1(base.encode('utf-8')).hexdigest()}"
+        return ie_intent_cache_key(labels, context)
 
     def _is_progression_action(
         self,
@@ -2469,42 +1995,13 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         self, action: AgentAction, locator, item: SnapshotItem
     ) -> bool:
         """对 ref 动作进行基础后验校验，失败则返回 False 触发重试。"""
-        try:
-            if action.action == "click":
-                if item.role in ("checkbox", "radio"):
-                    return locator.is_checked()
-                if self._is_answer_click_action(action, item=item):
-                    if action.target_question:
-                        expected = self._normalize_answer_label(
-                            action.selector or item.name
-                        )
-                        return self._verify_question_answer_state(
-                            action.target_question, expected
-                        )
-                    return False
-                return True
-            if action.action in ("fill", "type", "select"):
-                if action.value is None:
-                    return True
-                current = self._get_input_value(locator)
-                target = str(action.value).strip()
-                if target and target in (current or ""):
-                    return True
-                if action.action == "type" and item.role in ("combobox", "textbox"):
-                    return self._is_dropdown_open(locator)
-                return False
-            if action.action == "upload":
-                # upload 的 value 可能是文件名或完整路径；由 _verify_upload_success 统一确认
-                if action.value:
-                    ordered = resolve_upload_candidate(
-                        action.value, self.upload_candidates
-                    )
-                    if ordered:
-                        return self._verify_upload_success(ordered[0])
-                return False
-        except Exception:
-            return False
-        return True
+        return verifier_verify_ref_action_effect(
+            action,
+            locator,
+            item,
+            is_answer_click_action=self._is_answer_click_action,
+            verify_question_answer_state=self._verify_question_answer_state,
+        )
 
     def _retry_ref_action(
         self, action: AgentAction, locator, item: SnapshotItem
@@ -2535,29 +2032,14 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 
     def _get_input_value(self, locator) -> str:
         """尽力获取输入框当前值。"""
-        try:
-            return locator.input_value(timeout=500)
-        except Exception:
-            try:
-                return locator.evaluate("(el) => el.value || el.textContent || ''")
-            except Exception:
-                return ""
+        return verifier_get_input_value(locator)
 
     def _is_dropdown_open(self, locator) -> bool:
         """检测 autocomplete 下拉是否打开（aria-expanded）。"""
-        try:
-            expanded = locator.get_attribute("aria-expanded")
-            return str(expanded).lower() == "true"
-        except Exception:
-            return False
+        return verifier_is_dropdown_open(locator)
 
     def _normalize_answer_label(self, text: str | None) -> str:
-        normalized = (text or "").strip().lower()
-        if normalized in ("yes", "y"):
-            return "yes"
-        if normalized in ("no", "n"):
-            return "no"
-        return ""
+        return verifier_normalize_answer_label(text)
 
     def _is_answer_click_action(
         self, action: AgentAction, item: SnapshotItem | None = None
@@ -2755,66 +2237,12 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         self, action: AgentAction, action_success: bool
     ) -> SubmissionOutcome:
         evidence = self._extract_outcome_text_evidence()
-        lower = evidence.lower()
-        if self._looks_like_completion_text(lower):
-            return SubmissionOutcome(
-                classification="success_confirmed",
-                reason_code="completion_detected",
-                evidence_snippet=evidence[:220],
-            )
-        if any(
-            k in lower
-            for k in [
-                "flagged as possible spam",
-                "suspicious activity",
-                "anti-spam",
-                "risk",
-                "rate limit",
-                "too many requests",
-                "try again later",
-            ]
-        ):
-            return SubmissionOutcome(
-                classification="external_blocked",
-                reason_code="anti_spam_or_risk_blocked",
-                evidence_snippet=evidence[:220],
-            )
-        if any(
-            k in lower
-            for k in [
-                "network error",
-                "temporarily unavailable",
-                "timeout",
-                "timed out",
-                "connection error",
-                "server error",
-                "5xx",
-            ]
-        ):
-            return SubmissionOutcome(
-                classification="transient_network",
-                reason_code="network_or_server_transient",
-                evidence_snippet=evidence[:220],
-            )
         block_reason = self._get_progression_block_reason()
-        if block_reason:
-            snippets = " | ".join(self._last_progression_block_snippets[:2])
-            snippet = snippets or block_reason
-            return SubmissionOutcome(
-                classification="validation_error",
-                reason_code="missing_required_field",
-                evidence_snippet=snippet[:220],
-            )
-        if action_success:
-            return SubmissionOutcome(
-                classification="unknown_blocked",
-                reason_code="submit_clicked_without_confirmed_transition",
-                evidence_snippet=evidence[:220],
-            )
-        return SubmissionOutcome(
-            classification="unknown_blocked",
-            reason_code="submit_action_failed",
-            evidence_snippet=evidence[:220],
+        return oc_classify_submission_outcome(
+            evidence_text=evidence,
+            action_success=action_success,
+            progression_block_reason=block_reason,
+            progression_block_snippets=self._last_progression_block_snippets,
         )
 
     def _handle_submission_outcome(
@@ -2936,15 +2364,119 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 
     def _build_submission_manual_reason(self, action: AgentAction) -> str:
         outcome = self._last_submission_outcome
-        if not outcome:
-            return "提交连续失败达到重试上限，需要人工处理"
-        return (
-            "提交连续受阻达到重试上限；"
-            f"classification={outcome.classification}; "
-            f"code={outcome.reason_code}; "
-            f"action={action.action}:{action.selector or action.ref or 'unknown'}; "
-            f"evidence={outcome.evidence_snippet[:160]}"
+        return oc_build_submission_manual_reason(
+            outcome,
+            action_name=action.action,
+            action_target=action.selector or action.ref or "unknown",
         )
+
+    def _build_semantic_snapshot(
+        self,
+        current_url: str,
+        snapshot_map: dict[str, SnapshotItem],
+        visible_text: str,
+    ) -> SemanticSnapshot:
+        """从现有快照构建结构化语义快照（委托 semantic_perception 模块）。"""
+        try:
+            title = self.page.title()
+        except Exception:
+            title = ""
+        return build_semantic_snapshot(
+            current_url,
+            snapshot_map,
+            page_title=title,
+            visible_text=visible_text,
+            last_progression_block_snippets=self._last_progression_block_snippets,
+        )
+
+    def _extract_semantic_error_snippets(self, visible_text: str) -> list[str]:
+        return extract_semantic_error_snippets(
+            visible_text,
+            self._last_progression_block_snippets,
+        )
+
+    def _should_use_vision_fallback(
+        self,
+        *,
+        page_state: str,
+        snapshot_map: dict[str, SnapshotItem],
+        visible_text: str,
+    ) -> tuple[bool, str]:
+        """
+        视觉兜底预算控制：
+        - 默认语义优先（文本 + 结构化快照）
+        - 仅在关键节点使用视觉输入
+        """
+        if self.visual_fallback_budget <= 0:
+            return False, "budget_disabled"
+        if self.visual_fallback_used >= self.visual_fallback_budget:
+            return False, "budget_exhausted"
+        if self.step_count <= 2:
+            return True, "early_step_bootstrap"
+        if self.consecutive_failures > 0:
+            return True, "failure_recovery"
+        if self._last_progression_block_reason:
+            return True, "progression_blocked"
+        if self._last_submission_outcome and (
+            self._last_submission_outcome.classification != "success_confirmed"
+        ):
+            return True, "post_submit_verify"
+        if page_state == "manual_gate":
+            return True, "manual_gate_detection"
+        if len(snapshot_map) < 6:
+            return True, "low_semantic_density"
+        lower = (visible_text or "").lower()
+        if any(
+            token in lower
+            for token in (
+                "captcha",
+                "verify you are human",
+                "security check",
+                "flagged as possible spam",
+            )
+        ):
+            return True, "risk_or_challenge_keyword"
+        return False, "semantic_only"
+
+    def _should_capture_step_screenshot(self, *, use_vision: bool) -> bool:
+        mode = (self.step_screenshot_mode or "vision_only").lower()
+        if mode in {"off", "0", "false", "none"}:
+            return False
+        if mode in {"always", "on", "1", "true"}:
+            return True
+        # default: vision_only
+        return bool(use_vision)
+
+    def _capture_step_screenshot(self) -> str | None:
+        """
+        按需采集当前步骤截图。
+        返回 base64（用于视觉输入）；采集失败时返回 None，但不阻断语义路径。
+        """
+        try:
+            png_bytes = self.page.screenshot(full_page=True)
+            original_size = len(png_bytes) / 1024
+            compressed_bytes = self._compress_screenshot(png_bytes)
+            compressed_size = len(compressed_bytes) / 1024
+            screenshot_b64 = base64.b64encode(compressed_bytes).decode("utf-8")
+
+            self._last_screenshot_bytes = compressed_bytes
+            screenshot_path = self.screenshot_dir / f"step_{self.step_count:02d}.jpg"
+            screenshot_path.write_bytes(compressed_bytes)
+            ratio = (
+                (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
+            )
+            self._log(
+                f"📸 截图成功: {original_size:.1f} KB → {compressed_size:.1f} KB (压缩 {ratio:.0f}%)"
+            )
+            self._log(f"   💾 已保存: {screenshot_path.name}")
+            return screenshot_b64
+        except Exception as e:
+            self._log(f"⚠️ 截图采集失败，降级语义路径: {e}", "warn")
+            self._step_log(
+                "screenshot_capture_error",
+                {"step": self.step_count, "error": f"{type(e).__name__}: {e}"},
+            )
+            return None
 
     def _build_page_fingerprint(
         self, current_url: str, snapshot_map: dict[str, SnapshotItem]
@@ -3101,12 +2633,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             current = self.page.url or ""
         except Exception:
             current = ""
-        parsed = urlsplit(current)
-        domain = (parsed.netloc or "unknown").lower()
-        path = (parsed.path or "/").lower()
-        stable_parts = [p for p in path.split("/") if p and p not in {"jobs", "job"}]
-        normalized_path = "/" + "/".join(stable_parts[:3]) if stable_parts else "/"
-        return f"{domain}{normalized_path}"
+        return lg_stable_page_scope(current)
 
     def _semantic_action_key(self, page_fingerprint: str, action: AgentAction) -> str:
         intent = self._normalized_action_intent(action)
@@ -3121,13 +2648,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         if not key:
             return "none"
         fail_count = self._semantic_fail_counts.get(key, 0)
-        decision = "none"
-        if fail_count == 1:
-            decision = "replan"
-        elif fail_count == 2:
-            decision = "alternate"
-        elif fail_count >= 3:
-            decision = "stop"
+        decision = lg_semantic_loop_guard_decision(fail_count)
         if decision != "none":
             self._step_log(
                 "semantic_loop_guard",
@@ -3147,6 +2668,34 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 },
             )
         return decision
+
+    def _promote_semantic_guard(
+        self, page_fingerprint: str, action: AgentAction, *, stage: str
+    ) -> None:
+        """
+        当 guard 仅触发重规划但未真正执行动作时，仍推进失败计数，避免一直停在 replan。
+        """
+        key = self._semantic_action_key(page_fingerprint, action)
+        if not key:
+            return
+        next_count = lg_promote_semantic_fail_count(self._semantic_fail_counts, key)
+        self._step_log(
+            "semantic_loop_guard",
+            {
+                "step": self.step_count,
+                "classification": "unknown_blocked",
+                "reason_code": "semantic_repeat_promoted",
+                "evidence_snippet": str(action.selector or action.ref or "")[:220],
+                "decision": f"{stage}_promote",
+                "semantic_key": key,
+                "stable_scope": self._stable_page_scope(),
+                "fail_count": next_count,
+                "action": action.action,
+                "selector": action.selector,
+                "ref": action.ref,
+                "target_question": action.target_question,
+            },
+        )
 
     def _build_semantic_loop_manual_reason(self, action: AgentAction) -> str:
         snippets = " | ".join(self._last_progression_block_snippets[:2])
@@ -3175,35 +2724,17 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
     ) -> None:
         key = self._action_fail_key(page_fingerprint, action)
         semantic_key = self._semantic_action_key(page_fingerprint, action)
-        if success:
-            self._action_fail_counts[key] = 0
-            self._repeated_skip_counts[key] = 0
-            if semantic_key:
-                self._semantic_fail_counts[semantic_key] = 0
-            return
-        self._action_fail_counts[key] = self._action_fail_counts.get(key, 0) + 1
-        if semantic_key:
-            self._semantic_fail_counts[semantic_key] = (
-                self._semantic_fail_counts.get(semantic_key, 0) + 1
-            )
+        lg_record_loop_action_result(
+            action_fail_counts=self._action_fail_counts,
+            repeated_skip_counts=self._repeated_skip_counts,
+            semantic_fail_counts=self._semantic_fail_counts,
+            action_key=key,
+            semantic_key=semantic_key,
+            success=success,
+        )
 
     def _sanitize_simplify_claims(self, text: str | None) -> str | None:
-        if not text:
-            return text
-        lowered = text.lower()
-        if "simplify" not in lowered:
-            return text
-        claim_markers = [
-            "已自动填写",
-            "自动填写完成",
-            "simplify 已",
-            "simplify已",
-            "autofill complete",
-            "autofilled",
-        ]
-        if any(marker in lowered for marker in claim_markers):
-            return text.replace("Simplify", "页面").replace("simplify", "页面")
-        return text
+        return planner_sanitize_simplify_claims(text)
 
     def _build_alternate_action(self, action: AgentAction) -> AgentAction | None:
         """为重复失败动作构建同页替代动作，优先尝试其他 submit/apply 按钮。"""
@@ -3244,249 +2775,26 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             pass
 
     def _smart_click(self, selector: str, element_type: str = None) -> bool:
-        """
-        智能点击：根据元素类型选择最佳策略。
-        支持模糊匹配和滚动重试。
-        """
-        if not selector:
-            return False
-
-        timeout = 1000  # 每个策略 1 秒
-        check_timeout = 200  # 可见性检查 200ms
-
-        # 清理 selector：去除重复词（如 "Dallas Dallas" → "Dallas"）
-        words = selector.split()
-        seen = set()
-        unique_words = []
-        for w in words:
-            if w.lower() not in seen:
-                seen.add(w.lower())
-                unique_words.append(w)
-        clean_selector = " ".join(unique_words)
-
-        # 从复杂 selector 中提取简短关键词（如 "Yes"、"No"）
-        short_selector = clean_selector
-        if " " in clean_selector and len(clean_selector) > 20:
-            # 如果 selector 很长，尝试取最后一个词（通常是 Yes/No）
-            if unique_words[-1] in ["Yes", "No", "yes", "no"]:
-                short_selector = unique_words[-1]
-
-        # 提取第一个关键词用于模糊匹配（如 "Dallas" 匹配 "Dallas, TX"）
-        first_word = unique_words[0] if unique_words else clean_selector
-
-        # 根据元素类型选择策略
-        if element_type == "button":
-            strategies = [
-                lambda: self.page.get_by_role("button", name=clean_selector).first,
-                lambda: self.page.get_by_text(clean_selector, exact=False).first,
-            ]
-        elif element_type == "link":
-            strategies = [
-                lambda: self.page.get_by_role("link", name=clean_selector).first,
-                lambda: self.page.get_by_text(clean_selector, exact=False).first,
-            ]
-        elif element_type in ("checkbox", "radio"):
-            # checkbox/radio 支持多种匹配方式
-            strategies = [
-                # 1. 直接点击短文本（Yes/No）
-                lambda: self.page.get_by_role("button", name=short_selector).first,
-                lambda: self.page.get_by_text(short_selector, exact=True).first,
-                # 2. 尝试 radio/checkbox 角色
-                lambda: self.page.get_by_role(element_type, name=short_selector).first,
-                lambda: self.page.get_by_label(short_selector).first,
-                # 3. 用清理后的 selector
-                lambda: self.page.get_by_text(clean_selector, exact=True).first,
-                lambda: self.page.get_by_text(clean_selector, exact=False).first,
-                # 4. 模糊匹配：用第一个词（如 Dallas 匹配 "Dallas, TX"）
-                lambda: self.page.get_by_text(first_word, exact=False).first,
-                lambda: self.page.get_by_label(first_word, exact=False).first,
-                # 5. CSS 选择器模糊匹配
-                lambda: self.page.locator(f"label:has-text('{first_word}')").first,
-                lambda: self.page.locator(f"[data-testid*='{first_word}' i]").first,
-            ]
-        elif element_type == "option":
-            strategies = [
-                lambda: self.page.get_by_role("option", name=clean_selector).first,
-                lambda: self.page.get_by_text(clean_selector, exact=True).first,
-                lambda: self.page.get_by_text(clean_selector, exact=False).first,
-                lambda: self.page.locator(f"li:has-text('{clean_selector}')").first,
-                # 模糊匹配
-                lambda: self.page.get_by_role("option", name=first_word).first,
-                lambda: self.page.get_by_text(first_word, exact=False).first,
-                lambda: self.page.locator(f"li:has-text('{first_word}')").first,
-            ]
-        else:
-            strategies = [
-                lambda: self.page.get_by_text(clean_selector, exact=True).first,
-                lambda: self.page.get_by_role("button", name=clean_selector).first,
-                lambda: self.page.get_by_text(clean_selector, exact=False).first,
-                # 模糊匹配
-                lambda: self.page.get_by_text(first_word, exact=False).first,
-            ]
-
-        # 尝试点击（带滚动重试）
-        max_scroll_attempts = 2
-        for scroll_attempt in range(max_scroll_attempts + 1):
-            for strategy in strategies:
-                try:
-                    locator = strategy()
-                    if locator and locator.is_visible(timeout=check_timeout):
-                        locator.click(timeout=timeout)
-                        return True
-                except Exception:
-                    continue
-
-            # 如果所有策略都失败，尝试滚动页面后重试
-            if scroll_attempt < max_scroll_attempts:
-                try:
-                    self.page.evaluate("window.scrollBy(0, 300)")
-                    self.page.wait_for_timeout(300)
-                    self._log(
-                        f"   🔄 滚动页面，重试定位 ({scroll_attempt + 1}/{max_scroll_attempts})"
-                    )
-                except Exception:
-                    break
-
-        return False
+        return exec_smart_click(
+            self.page,
+            selector,
+            element_type=element_type,
+            log_fn=lambda msg, lvl="info": self._log(msg, lvl),
+        )
 
     def _smart_fill(self, selector: str, value: str) -> bool:
-        """智能填写：通过 label 精确定位输入框并填写"""
-        if not selector or value is None:
-            return False
-
-        timeout = 1500
-        value_str = str(value)
-        clean_selector = selector.replace("*", "").strip()
-
-        # 只用基于 label 的精确定位，避免误定位到其他输入框
-        strategies = [
-            lambda: self.page.get_by_label(selector, exact=False).first,
-            lambda: self.page.get_by_label(clean_selector, exact=False).first,
-            lambda: self.page.get_by_role("textbox", name=selector).first,
-            lambda: self.page.get_by_role("textbox", name=clean_selector).first,
-            # 通过 label 文本找相邻输入框
-            lambda: (
-                self.page.locator(f"label:has-text('{clean_selector}')")
-                .locator("..")
-                .locator("input")
-                .first
-            ),
-        ]
-        # 注意：不要用 get_by_placeholder 这种宽泛匹配，容易定位到错误字段
-
-        for strategy in strategies:
-            try:
-                locator = strategy()
-                if locator.is_visible(timeout=200):
-                    locator.fill(value_str, timeout=timeout)
-                    return True
-            except Exception:
-                continue
-
-        return False
+        return exec_smart_fill(self.page, selector, value)
 
     def _smart_type(self, selector: str, value: str) -> bool:
-        """
-        智能输入：逐字输入触发 autocomplete 下拉框。
-
-        处理各种 autocomplete 输入框：
-        - 带 * 的 label（如 "Location*"）
-        - placeholder 提示（如 "Start typing..."）
-        - combobox 类型的输入框
-        """
-        if not selector or value is None:
-            return False
-
-        # 清理 selector（去掉可能的 * 和多余空格）
-        clean_selector = selector.replace("*", "").strip()
-
-        # 快速找到输入框 - 优先使用 label 匹配，避免误定位
-        input_elem = None
-        strategies = [
-            # 1. 精确 label 匹配（最可靠）
-            lambda: self.page.get_by_label(selector, exact=False).first,
-            # 2. 清理后的 label 匹配
-            lambda: self.page.get_by_label(clean_selector, exact=False).first,
-            # 3. combobox 角色（autocomplete 通常是 combobox）
-            lambda: self.page.get_by_role("combobox", name=selector).first,
-            lambda: self.page.get_by_role("combobox", name=clean_selector).first,
-            # 4. textbox 角色
-            lambda: self.page.get_by_role("textbox", name=selector).first,
-            lambda: self.page.get_by_role("textbox", name=clean_selector).first,
-            # 5. 通过包含 selector 文本的 label 元素找相邻输入框
-            lambda: (
-                self.page.locator(f"label:has-text('{clean_selector}')")
-                .locator("..")
-                .locator("input, [role='combobox']")
-                .first
-            ),
-            # 6. 直接通过 aria-label
-            lambda: self.page.locator(f"[aria-label*='{clean_selector}' i]").first,
-        ]
-        # 注意：不要用 get_by_placeholder("type") 这种宽泛匹配，容易定位到错误字段
-
-        for strategy in strategies:
-            try:
-                elem = strategy()
-                if elem.is_visible(timeout=300):
-                    input_elem = elem
-                    self._log(f"   📍 定位成功: {selector}")
-                    break
-            except Exception:
-                continue
-
-        if not input_elem:
-            self._log(f"   ⚠️ 无法定位输入框: {selector}", "warn")
-            return False
-
-        try:
-            # 1. 点击激活输入框
-            input_elem.click(timeout=800)
-            self.page.wait_for_timeout(100)
-
-            # 2. 清空现有内容（全选后删除，更可靠）
-            input_elem.press("Control+a")
-            self.page.wait_for_timeout(30)
-            input_elem.press("Backspace")
-            self.page.wait_for_timeout(50)
-
-            # 3. 逐字输入，触发 autocomplete
-            input_elem.type(str(value), delay=40)  # 逐字输入触发下拉
-
-            # 4. 短暂等待让下拉框出现（主循环会截图让 AI 看到变化）
-            self.page.wait_for_timeout(600)
-            return True
-        except Exception as e:
-            self._log(f"   ⚠️ 输入失败: {e}", "warn")
-            return False
+        return exec_smart_type(
+            self.page,
+            selector,
+            value,
+            log_fn=lambda msg, lvl="info": self._log(msg, lvl),
+        )
 
     def _do_select(self, selector: str, value: str) -> bool:
-        """
-        选择下拉框选项（仅处理原生 <select>）。
-        对于非原生下拉框，AI 应该使用 type + click 组合。
-        """
-        if not selector or not value:
-            return False
-
-        # 只尝试原生 select，其他情况让 AI 用 type + click
-        try:
-            select = self.page.get_by_label(selector).first
-            if select.is_visible(timeout=500):
-                select.select_option(label=value, timeout=2000)
-                return True
-        except Exception:
-            pass
-
-        # 尝试直接点击已显示的选项（下拉框可能已经打开）
-        try:
-            option = self.page.get_by_role("option", name=value).first
-            if option.is_visible(timeout=300):
-                option.click(timeout=1500)
-                return True
-        except Exception:
-            pass
-
-        return False
+        return exec_do_select(self.page, selector, value)
 
     def _do_upload(self, action: AgentAction, locator=None) -> bool:
         """
@@ -3555,24 +2863,11 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         """
         尝试定位文件上传 input。
         """
-        try:
-            file_inputs = self.page.locator("input[type='file']")
-            if file_inputs.count() > 0:
-                return file_inputs.first
-        except Exception:
-            pass
-
-        if selector:
-            # 有些页面需要先点“Upload/Attach”按钮再出现 file input
-            self._smart_click(selector, element_type="button")
-            self.page.wait_for_timeout(300)
-            try:
-                file_inputs = self.page.locator("input[type='file']")
-                if file_inputs.count() > 0:
-                    return file_inputs.first
-            except Exception:
-                pass
-        return None
+        return exec_locate_file_input(
+            self.page,
+            selector,
+            click_fn=lambda text, et=None: self._smart_click(text, et or "button"),
+        )
 
     def _verify_upload_success(self, file_path: str) -> bool:
         """
@@ -3580,44 +2875,11 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         - input.files 非空且文件名匹配
         - 或页面文本出现文件名
         """
-        filename = Path(file_path).name
-
-        try:
-            count = self.page.locator("input[type='file']").count()
-        except Exception:
-            count = 0
-
-        for i in range(count):
-            try:
-                locator = self.page.locator("input[type='file']").nth(i)
-                ok = locator.evaluate(
-                    "(el, expected) => (el.files && el.files.length > 0 && el.files[0].name === expected)",
-                    filename,
-                )
-                if ok:
-                    return True
-            except Exception:
-                continue
-
-        try:
-            body_text = self.page.inner_text("body")
-            if filename in body_text:
-                return True
-        except Exception:
-            pass
-
-        return False
+        return exec_verify_upload_success(self.page, file_path)
 
     def _do_scroll(self, direction: str) -> bool:
         """滚动页面"""
-        try:
-            if "down" in direction.lower():
-                self.page.evaluate("window.scrollBy(0, 500)")
-            else:
-                self.page.evaluate("window.scrollBy(0, -500)")
-            return True
-        except Exception:
-            return False
+        return exec_do_scroll(self.page, direction)
 
     def _do_refresh(self, trigger: str = "unknown") -> bool:
         """
@@ -3662,17 +2924,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             return False
 
     def _looks_like_completion_text(self, lower_text: str) -> bool:
-        success_indicators = [
-            "thank you for applying",
-            "thanks for your application",
-            "application submitted",
-            "application received",
-            "successfully submitted",
-            "your application has been submitted",
-            "application complete",
-            "thanks for submitting",
-        ]
-        return any(token in lower_text for token in success_indicators)
+        return oc_looks_like_completion_text(lower_text)
 
     def _verify_completion(self) -> tuple[bool, str]:
         """
@@ -3830,38 +3082,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             return png_bytes
 
     def _safe_parse_json(self, raw: str) -> dict | None:
-        """安全解析 JSON"""
-        # 直接解析
-        try:
-            return json.loads(raw)
-        except Exception:
-            pass
-
-        # 从 markdown 代码块提取
-        if "```" in raw:
-            try:
-                start = raw.find("```json")
-                if start != -1:
-                    start = raw.find("\n", start) + 1
-                else:
-                    start = raw.find("```") + 3
-                    start = raw.find("\n", start) + 1
-                end = raw.find("```", start)
-                if end != -1:
-                    return json.loads(raw[start:end].strip())
-            except Exception:
-                pass
-
-        # 提取 { ... }
-        if "{" in raw and "}" in raw:
-            try:
-                start = raw.index("{")
-                end = raw.rfind("}") + 1
-                return json.loads(raw[start:end])
-            except Exception:
-                pass
-
-        return None
+        return planner_safe_parse_json(raw)
 
     def _log(self, message: str, level: str = "info") -> None:
         """写入日志"""

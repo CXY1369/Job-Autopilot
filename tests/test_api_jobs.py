@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+
 from fastapi.testclient import TestClient
 
+import autojobagent.app as app_module
 from autojobagent.app import app
 from autojobagent.models.job_log import JobLog
 from autojobagent.models.job_post import JobPost, JobStatus
@@ -146,3 +149,54 @@ def test_job_diagnostics_endpoint(isolated_db):
     assert isinstance(data["logs"], list)
     assert "screenshots" in data
     assert "trace_events" in data
+
+
+def test_job_diagnostics_includes_visual_fallback_summary(
+    isolated_db, tmp_path, monkeypatch
+):
+    with isolated_db() as session:
+        job = JobPost(
+            company="Acme",
+            title="ML Engineer",
+            link="https://example.com/job/diag2",
+            status=JobStatus.MANUAL_REQUIRED,
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    traces_root = tmp_path / "storage" / "logs"
+    traces_root.mkdir(parents=True, exist_ok=True)
+    trace_file = traces_root / f"agent_trace_job_{job_id}_20990101_000000.ndjson"
+    trace_lines = [
+        {
+            "event": "visual_fallback_decision",
+            "payload": {"use_vision": True, "budget": 3, "reason": "early_step"},
+        },
+        {
+            "event": "visual_fallback_decision",
+            "payload": {"use_vision": False, "budget": 3, "reason": "semantic_only"},
+        },
+        {
+            "event": "visual_fallback_decision",
+            "payload": {"use_vision": True, "budget": 3, "reason": "failure_recovery"},
+        },
+    ]
+    trace_file.write_text(
+        "\n".join(json.dumps(x, ensure_ascii=False) for x in trace_lines) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "BASE_DIR", tmp_path)
+
+    with TestClient(app) as client:
+        resp = client.get(f"/api/jobs/{job_id}/diagnostics")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    summary = data["visual_fallback"]
+    assert summary["decisions_count"] == 3
+    assert summary["vision_used_count"] == 2
+    assert summary["semantic_only_count"] == 1
+    assert summary["budget"] == 3
+    assert summary["budget_exhausted"] is False
