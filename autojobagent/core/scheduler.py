@@ -101,16 +101,38 @@ class JobScheduler:
                 db_job.status = JobStatus.APPLIED
                 db_job.fail_reason = None
                 db_job.manual_reason = None
+                db_job.failure_class = None
+                db_job.failure_code = None
+                db_job.retry_count = 0
+                db_job.last_error_snippet = None
+                db_job.last_outcome_class = "success_confirmed"
+                db_job.last_outcome_at = result.last_outcome_at or datetime.now(timezone.utc)
                 print(f"[job={job.id}] ✓ 状态更新为: APPLIED")
             elif result.manual_required:
                 db_job.status = JobStatus.MANUAL_REQUIRED
                 db_job.fail_reason = None
                 db_job.manual_reason = result.manual_reason
+                db_job.failure_class = result.failure_class
+                db_job.failure_code = result.failure_code
+                db_job.retry_count = int(result.retry_count or 0)
+                db_job.last_error_snippet = result.last_error_snippet
+                db_job.last_outcome_class = result.last_outcome_class
+                db_job.last_outcome_at = result.last_outcome_at or datetime.now(
+                    timezone.utc
+                )
                 print(f"[job={job.id}] ⚠ 状态更新为: MANUAL_REQUIRED")
             else:
                 db_job.status = JobStatus.FAILED
                 db_job.fail_reason = result.fail_reason
                 db_job.manual_reason = None
+                db_job.failure_class = result.failure_class or "unknown"
+                db_job.failure_code = result.failure_code
+                db_job.retry_count = int(result.retry_count or 0)
+                db_job.last_error_snippet = result.last_error_snippet
+                db_job.last_outcome_class = result.last_outcome_class
+                db_job.last_outcome_at = result.last_outcome_at or datetime.now(
+                    timezone.utc
+                )
                 print(f"[job={job.id}] ❌ 状态更新为: FAILED")
             db_job.apply_time = datetime.now(timezone.utc)
             session.add(db_job)

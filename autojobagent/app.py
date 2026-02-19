@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
 from html import unescape
 from pathlib import Path
+from collections import Counter
+import json
 import time
 import os
 import re
@@ -206,6 +208,40 @@ def _attach_resume_match_info(rows: list[dict], session) -> None:
         row["resume_match_reason"] = reason
 
 
+@app.get("/api/stats/failures")
+def get_failure_stats():
+    """失败分类/原因聚合统计。"""
+    from .db.database import SessionLocal
+    from .models.job_post import JobPost
+
+    with SessionLocal() as session:
+        rows = (
+            session.query(
+                JobPost.failure_class,
+                JobPost.failure_code,
+                JobPost.status,
+            )
+            .filter(
+                JobPost.status.in_([JobStatus.MANUAL_REQUIRED, JobStatus.FAILED]),
+            )
+            .all()
+        )
+    by_class: Counter[str] = Counter()
+    by_code: Counter[str] = Counter()
+    for failure_class, failure_code, _status in rows:
+        cls = (failure_class or "unknown").strip() or "unknown"
+        code = (failure_code or "unknown").strip() or "unknown"
+        by_class[cls] += 1
+        by_code[f"{cls}:{code}"] += 1
+    top_codes = [{"key": k, "count": v} for k, v in by_code.most_common(8)]
+    return {
+        "ok": True,
+        "total_failed_jobs": len(rows),
+        "by_class": dict(by_class),
+        "top_failure_codes": top_codes,
+    }
+
+
 @app.post("/api/jobs")
 def add_job(payload: dict):
     """
@@ -239,6 +275,74 @@ def add_job(payload: dict):
         session.commit()
         session.refresh(job)
         return {"ok": True, "job": job.to_dict()}
+
+
+@app.get("/api/jobs/{job_id}/diagnostics")
+def get_job_diagnostics(job_id: int):
+    """返回 job 的关键诊断信息（最近日志摘要 + 截图路径 + trace 事件摘要）。"""
+    from .db.database import SessionLocal
+    from .models.job_post import JobPost
+
+    with SessionLocal() as session:
+        job = session.get(JobPost, job_id)
+        if not job:
+            return {"ok": False, "error": f"Job {job_id} not found"}
+        logs = (
+            session.query(JobLog)
+            .filter(JobLog.job_id == job_id)
+            .order_by(JobLog.create_time.desc())
+            .limit(40)
+            .all()
+        )
+        log_summary = [log.to_dict() for log in reversed(logs)]
+
+    screenshots_root = BASE_DIR / "storage" / "screenshots"
+    traces_root = BASE_DIR / "storage" / "logs"
+    screenshot_dirs = sorted(
+        screenshots_root.glob(f"job_{job_id}_*"),
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    latest_screenshot_dir = screenshot_dirs[0] if screenshot_dirs else None
+    screenshot_paths = []
+    if latest_screenshot_dir and latest_screenshot_dir.is_dir():
+        for p in sorted(latest_screenshot_dir.glob("*.jpg"))[:40]:
+            screenshot_paths.append(str(p))
+
+    trace_files = sorted(
+        traces_root.glob(f"agent_trace_job_{job_id}_*.ndjson"),
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    trace_events: list[dict] = []
+    if trace_files:
+        try:
+            lines = trace_files[0].read_text(encoding="utf-8").splitlines()
+            for raw in lines[-120:]:
+                try:
+                    evt = json.loads(raw)
+                except Exception:
+                    continue
+                if evt.get("event") in {
+                    "submission_outcome_classified",
+                    "retry_policy_applied",
+                    "semantic_loop_guard",
+                    "answer_binding_attempt",
+                    "progression_block_with_fix_hint",
+                }:
+                    trace_events.append(evt)
+        except Exception:
+            trace_events = []
+
+    return {
+        "ok": True,
+        "job": job.to_dict(),
+        "logs": log_summary,
+        "latest_screenshot_dir": str(latest_screenshot_dir) if latest_screenshot_dir else None,
+        "screenshots": screenshot_paths,
+        "trace_file": str(trace_files[0]) if trace_files else None,
+        "trace_events": trace_events[-40:],
+    }
 
 
 @app.post("/api/control/start")

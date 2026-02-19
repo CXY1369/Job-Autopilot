@@ -412,6 +412,40 @@
         font-size: 11px;
         color: rgba(148, 163, 184, 0.9);
       }
+
+      .failure-board {
+        margin-top: 10px;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .failure-card {
+        border-radius: 12px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: rgba(2, 6, 23, 0.55);
+        padding: 8px 10px;
+      }
+
+      .failure-card .k {
+        font-size: 11px;
+        color: var(--text-muted);
+      }
+
+      .failure-card .v {
+        margin-top: 4px;
+        font-size: 18px;
+        color: #e2e8f0;
+      }
+
+      .topn {
+        margin-top: 6px;
+        font-size: 11px;
+        color: rgba(226, 232, 240, 0.92);
+        line-height: 1.45;
+        max-height: 72px;
+        overflow: auto;
+      }
     </style>
   </head>
   <body>
@@ -450,6 +484,12 @@
             <button class="btn-ghost" id="btn-reload">刷新列表</button>
           </div>
           <div class="toolbar-group">
+            <label for="failure-filter">筛选</label>
+            <select id="failure-filter">
+              <option value="all">全部</option>
+              <option value="external_blocked">仅 external_blocked</option>
+              <option value="max_steps">仅 max_steps</option>
+            </select>
             <label for="model-select">模型</label>
             <select id="model-select"></select>
             <button class="btn-ghost" id="btn-model-test">测试</button>
@@ -460,6 +500,22 @@
             </div>
             <button class="btn-ghost" id="btn-start">开始投递</button>
             <button class="btn-ghost" id="btn-pause">暂停</button>
+          </div>
+        </div>
+
+        <div class="failure-board">
+          <div class="failure-card">
+            <div class="k">external_blocked</div>
+            <div class="v" id="fc-external">0</div>
+          </div>
+          <div class="failure-card">
+            <div class="k">validation_error</div>
+            <div class="v" id="fc-validation">0</div>
+          </div>
+          <div class="failure-card">
+            <div class="k">transient_network</div>
+            <div class="v" id="fc-transient">0</div>
+            <div class="topn" id="fc-topn"></div>
           </div>
         </div>
 
@@ -530,6 +586,7 @@
 
     <script>
       const apiBase = "";
+      let currentFailureFilter = "all";
 
       function log(type, message) {
         const logEl = document.getElementById("log");
@@ -549,6 +606,7 @@
           const res = await fetch(apiBase + "/api/jobs");
           const data = await res.json();
           renderJobs(data);
+          fetchFailureStats();
           log("ok", "刷新岗位列表，共 " + data.length + " 条");
           if (data.length) {
             const last = data[0];
@@ -560,6 +618,25 @@
         } catch (e) {
           console.error(e);
           log("error", "获取岗位列表失败：" + e.message);
+        }
+      }
+
+      async function fetchFailureStats() {
+        try {
+          const res = await fetch(apiBase + "/api/stats/failures");
+          const data = await res.json();
+          if (!data.ok) return;
+          const byClass = data.by_class || {};
+          document.getElementById("fc-external").textContent = byClass.external_blocked || 0;
+          document.getElementById("fc-validation").textContent = byClass.validation_error || 0;
+          document.getElementById("fc-transient").textContent = byClass.transient_network || 0;
+          const topn = (data.top_failure_codes || [])
+            .slice(0, 4)
+            .map((x) => `${x.key} (${x.count})`)
+            .join("<br>");
+          document.getElementById("fc-topn").innerHTML = topn || "暂无失败原因";
+        } catch (_e) {
+          // silent
         }
       }
 
@@ -629,13 +706,22 @@
       }
 
       function renderJobs(jobs) {
+        let rows = jobs || [];
+        if (currentFailureFilter === "external_blocked") {
+          rows = rows.filter((j) => j.failure_class === "external_blocked");
+        } else if (currentFailureFilter === "max_steps") {
+          rows = rows.filter((j) => {
+            const reason = `${j.manual_reason || ""} ${j.fail_reason || ""}`.toLowerCase();
+            return reason.includes("最大步数") || reason.includes("max step");
+          });
+        }
         const byStatus = {
           pending: [],
           applied: [],
           manual_required: [],
           failed: [],
         };
-        for (const job of jobs) {
+        for (const job of rows) {
           if (byStatus[job.status]) {
             byStatus[job.status].push(job);
           }
@@ -689,6 +775,16 @@
             reasonDiv.style.cssText = "margin-top:3px;font-size:11px;color:rgba(248,113,113,0.85);word-break:break-word;";
             reasonDiv.textContent = "原因: " + reason;
             div.appendChild(reasonDiv);
+          }
+          if (job.failure_class || job.retry_count || job.last_error_snippet) {
+            const diagDiv = document.createElement("div");
+            diagDiv.style.cssText = "margin-top:3px;font-size:11px;color:rgba(250,204,21,0.95);word-break:break-word;";
+            const parts = [];
+            if (job.failure_class) parts.push(`class=${job.failure_class}`);
+            if (typeof job.retry_count === "number") parts.push(`retry=${job.retry_count}`);
+            if (job.last_error_snippet) parts.push(job.last_error_snippet.slice(0, 120));
+            diagDiv.textContent = parts.join(" | ");
+            div.appendChild(diagDiv);
           }
 
           // 仅对已成功投递岗位显示匹配信息（简历 + 分数 + hover 原因）
@@ -891,6 +987,10 @@
       document.getElementById("btn-start").addEventListener("click", startApplying);
       document.getElementById("btn-pause").addEventListener("click", pauseApplying);
       document.getElementById("model-select").addEventListener("change", setModel);
+      document.getElementById("failure-filter").addEventListener("change", (e) => {
+        currentFailureFilter = e.target.value;
+        fetchJobs();
+      });
       document.getElementById("btn-model-test").addEventListener("click", testModel);
 
       fetchJobs();
@@ -898,5 +998,3 @@
     </script>
   </body>
 </html>
-
-

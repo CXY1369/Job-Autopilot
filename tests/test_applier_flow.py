@@ -171,6 +171,11 @@ def test_apply_for_job_preserves_structured_manual_reason(monkeypatch):
             "同一语义动作重复失败达到上限；动作=click:Yes；最近门控: "
             "检测到表单错误提示（错误容器/红色文本）"
         )
+        job.failure_class_hint = "validation_error"
+        job.failure_code_hint = "missing_required_field"
+        job.retry_count_hint = 2
+        job.last_error_snippet_hint = "Missing country required field"
+        job.last_outcome_class_hint = "validation_error"
         return False
 
     monkeypatch.setattr(applier, "run_browser_agent", _fake_run_browser_agent)
@@ -181,3 +186,8 @@ def test_apply_for_job_preserves_structured_manual_reason(monkeypatch):
     assert result.manual_required is True
     assert result.manual_reason is not None
     assert "同一语义动作重复失败达到上限" in result.manual_reason
+    assert result.failure_class == "validation_error"
+    assert result.failure_code == "missing_required_field"
+    assert result.retry_count == 2
+    assert result.last_error_snippet == "Missing country required field"
+    assert result.last_outcome_class == "validation_error"

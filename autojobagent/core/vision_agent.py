@@ -17,11 +17,13 @@ import hashlib
 import io
 import json
 import os
+import random
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Literal
+from urllib.parse import urlsplit
 
 from openai import OpenAI
 from playwright.sync_api import Page
@@ -95,6 +97,19 @@ class AgentState:
     action_plan: Optional[list[str]] = None
     risk_or_blocker: Optional[str] = None
     page_fingerprint: Optional[str] = None
+
+
+@dataclass
+class SubmissionOutcome:
+    classification: Literal[
+        "success_confirmed",
+        "validation_error",
+        "external_blocked",
+        "transient_network",
+        "unknown_blocked",
+    ]
+    reason_code: str
+    evidence_snippet: str
 
 
 def evaluate_progression_block_reason(
@@ -289,6 +304,17 @@ class BrowserAgent:
         self._semantic_fail_counts: dict[str, int] = {}
         self._last_progression_block_reason: str | None = None
         self._last_progression_block_snippets: list[str] = []
+        self._last_validation_signature: str = ""
+        self._validation_repeat_count: int = 0
+        self._submission_retry_limit = 3
+        self._submission_retry_counts: dict[str, int] = {}
+        self._last_submission_outcome: SubmissionOutcome | None = None
+        self.failure_class_hint: str | None = None
+        self.failure_code_hint: str | None = None
+        self.retry_count_hint: int = 0
+        self.last_error_snippet_hint: str | None = None
+        self.last_outcome_class_hint: str | None = None
+        self.last_outcome_at_hint: datetime | None = None
 
     # region agent log
     def _ndjson_log(self, hypothesis_id: str, location: str, message: str, data: dict):
@@ -398,6 +424,14 @@ class BrowserAgent:
                         self.consecutive_failures += 1
                         continue
                 if semantic_guard == "stop":
+                    if not self._last_submission_outcome:
+                        self._sync_failure_hints(
+                            SubmissionOutcome(
+                                classification="unknown_blocked",
+                                reason_code="semantic_loop_stop",
+                                evidence_snippet=self._last_progression_block_reason or "",
+                            )
+                        )
                     hint = self._build_semantic_loop_manual_reason(action)
                     self._set_manual_reason_hint(hint)
                     self._log(
@@ -453,6 +487,22 @@ class BrowserAgent:
                     self._log(f"   原因: {action.reason}")
 
                 success = self._execute_action(action)
+                should_stop = False
+                source_item = self._last_snapshot_map.get(action.ref or "")
+                if self._is_progression_action(action, item=source_item):
+                    success, should_stop = self._handle_submission_outcome(
+                        action, success
+                    )
+                    if should_stop:
+                        self._record_action_result(fp, action, False)
+                        self._set_manual_reason_hint(
+                            self._build_submission_manual_reason(action)
+                        )
+                        self._log(
+                            "⚠ 提交阻断达到重试上限，停止执行并转人工处理", "warn"
+                        )
+                        self._log("========== AI Agent 运行结束（提交阻断）==========")
+                        return False
                 self._record_action_result(fp, action, success)
 
                 # 记录到历史（让 AI 能看到操作结果，从而调整策略）
@@ -980,7 +1030,8 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
 3. 已上传的文件不重复上传
 4. 只有在页面存在上传信号时才允许使用 upload 动作
 5. refresh 最多使用 2 次；若两次后仍无进展，返回 stuck
-6. 若提交被阻止，先修复报错字段，不要连续重复点击 Submit
+6. 同名 Yes/No 出现多个时，必须先绑定 target_question 后再点击
+7. 若提交被阻止，先修复报错字段，不得立即重复提交
 
 ## 什么时候返回 stuck？（重要！不要轻易放弃！）
 
@@ -2311,6 +2362,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             "progression_block_with_fix_hint",
             {
                 "step": self.step_count,
+                "classification": "validation_error",
+                "reason_code": "progression_blocked",
+                "evidence_snippet": " | ".join(snippet_list)[:220],
                 "reason": blocked_reason,
                 "hint": hint,
                 "error_snippets": snippet_list,
@@ -2535,6 +2589,9 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             "answer_binding_attempt",
             {
                 "step": self.step_count,
+                "classification": "validation_error",
+                "reason_code": "answer_binding",
+                "evidence_snippet": str(payload.get("reason", ""))[:220],
                 "question": question,
                 "answer": answer,
                 "ok": bool(payload.get("ok", False)),
@@ -2693,6 +2750,203 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             return False
         return bool(result.get("matched")) and bool(result.get("ok"))
 
+    def _classify_submission_outcome(
+        self, action: AgentAction, action_success: bool
+    ) -> SubmissionOutcome:
+        evidence = self._extract_outcome_text_evidence()
+        lower = evidence.lower()
+        if self._looks_like_completion_text(lower):
+            return SubmissionOutcome(
+                classification="success_confirmed",
+                reason_code="completion_detected",
+                evidence_snippet=evidence[:220],
+            )
+        if any(
+            k in lower
+            for k in [
+                "flagged as possible spam",
+                "suspicious activity",
+                "anti-spam",
+                "risk",
+                "rate limit",
+                "too many requests",
+                "try again later",
+            ]
+        ):
+            return SubmissionOutcome(
+                classification="external_blocked",
+                reason_code="anti_spam_or_risk_blocked",
+                evidence_snippet=evidence[:220],
+            )
+        if any(
+            k in lower
+            for k in [
+                "network error",
+                "temporarily unavailable",
+                "timeout",
+                "timed out",
+                "connection error",
+                "server error",
+                "5xx",
+            ]
+        ):
+            return SubmissionOutcome(
+                classification="transient_network",
+                reason_code="network_or_server_transient",
+                evidence_snippet=evidence[:220],
+            )
+        block_reason = self._get_progression_block_reason()
+        if block_reason:
+            snippets = " | ".join(self._last_progression_block_snippets[:2])
+            snippet = snippets or block_reason
+            return SubmissionOutcome(
+                classification="validation_error",
+                reason_code="missing_required_field",
+                evidence_snippet=snippet[:220],
+            )
+        if action_success:
+            return SubmissionOutcome(
+                classification="unknown_blocked",
+                reason_code="submit_clicked_without_confirmed_transition",
+                evidence_snippet=evidence[:220],
+            )
+        return SubmissionOutcome(
+            classification="unknown_blocked",
+            reason_code="submit_action_failed",
+            evidence_snippet=evidence[:220],
+        )
+
+    def _handle_submission_outcome(
+        self, action: AgentAction, action_success: bool
+    ) -> tuple[bool, bool]:
+        outcome = self._classify_submission_outcome(action, action_success)
+        self._last_submission_outcome = outcome
+        self._step_log(
+            "submission_outcome_classified",
+            {
+                "step": self.step_count,
+                "classification": outcome.classification,
+                "reason_code": outcome.reason_code,
+                "evidence_snippet": outcome.evidence_snippet,
+                "action": action.action,
+                "selector": action.selector,
+                "ref": action.ref,
+            },
+        )
+        self._sync_failure_hints(outcome)
+        if outcome.classification == "success_confirmed":
+            return True, False
+        if outcome.classification == "validation_error":
+            signature = (
+                f"{outcome.reason_code}|{(outcome.evidence_snippet or '').strip().lower()}"
+            )
+            if signature and signature == self._last_validation_signature:
+                self._validation_repeat_count += 1
+            else:
+                self._validation_repeat_count = 1
+                self._last_validation_signature = signature
+            if self._validation_repeat_count >= 2:
+                self._step_log(
+                    "progression_block_with_fix_hint",
+                    {
+                        "step": self.step_count,
+                        "classification": "validation_error",
+                        "reason_code": "repeat_same_validation_error",
+                        "evidence_snippet": outcome.evidence_snippet[:220],
+                        "reason": "repeat_same_validation_error",
+                        "hint": "同一错误重复出现，下一步必须改为定位并修复具体字段，禁止继续提交",
+                        "error_snippets": [outcome.evidence_snippet],
+                    },
+                )
+            self.history.append(
+                f"步骤{self.step_count}: 提交后检测到表单校验错误，必须先修复字段；{outcome.evidence_snippet}"
+            )
+            return False, False
+        if outcome.classification in ("external_blocked", "transient_network"):
+            key = self._semantic_action_key("", action) or "progression::submit_apply"
+            retry_count = self._submission_retry_counts.get(key, 0) + 1
+            self._submission_retry_counts[key] = retry_count
+            self.retry_count_hint = retry_count
+            self._step_log(
+                "retry_policy_applied",
+                {
+                    "step": self.step_count,
+                    "classification": outcome.classification,
+                    "reason_code": outcome.reason_code,
+                    "retry_count": retry_count,
+                    "retry_limit": self._submission_retry_limit,
+                    "semantic_key": key,
+                    "evidence_snippet": outcome.evidence_snippet,
+                },
+            )
+            if retry_count >= self._submission_retry_limit:
+                return False, True
+            self._apply_humanized_retry_pacing()
+            self.history.append(
+                f"步骤{self.step_count}: 提交受阻（{outcome.classification}），已执行合规重试节奏，下一步改策略"
+            )
+            return False, False
+        return False, False
+
+    def _apply_humanized_retry_pacing(self) -> None:
+        wait_ms = random.randint(900, 1800)
+        try:
+            self.page.wait_for_timeout(wait_ms)
+        except Exception:
+            pass
+        try:
+            self.page.evaluate("window.scrollBy(0, 120)")
+            self.page.wait_for_timeout(200)
+            self.page.evaluate("window.scrollBy(0, -80)")
+        except Exception:
+            pass
+        try:
+            self.page.keyboard.press("Tab")
+            self.page.wait_for_timeout(120)
+            self.page.keyboard.press("Shift+Tab")
+        except Exception:
+            pass
+
+    def _extract_outcome_text_evidence(self) -> str:
+        try:
+            text = self.page.inner_text("body")
+        except Exception:
+            text = ""
+        snippets = self._last_progression_block_snippets[:2]
+        if snippets:
+            text = f"{text}\n" + "\n".join(snippets)
+        return (text or "")[:3000]
+
+    def _sync_failure_hints(self, outcome: SubmissionOutcome) -> None:
+        class_map = {
+            "validation_error": "validation_error",
+            "external_blocked": "external_blocked",
+            "transient_network": "transient_network",
+            "unknown_blocked": "unknown",
+        }
+        self.last_outcome_class_hint = outcome.classification
+        self.last_outcome_at_hint = datetime.now()
+        self.last_error_snippet_hint = outcome.evidence_snippet[:300]
+        self.failure_code_hint = outcome.reason_code
+        self.failure_class_hint = class_map.get(outcome.classification)
+        if outcome.classification == "success_confirmed":
+            self.failure_class_hint = None
+            self.failure_code_hint = None
+            self.retry_count_hint = 0
+            self.last_error_snippet_hint = None
+
+    def _build_submission_manual_reason(self, action: AgentAction) -> str:
+        outcome = self._last_submission_outcome
+        if not outcome:
+            return "提交连续失败达到重试上限，需要人工处理"
+        return (
+            "提交连续受阻达到重试上限；"
+            f"classification={outcome.classification}; "
+            f"code={outcome.reason_code}; "
+            f"action={action.action}:{action.selector or action.ref or 'unknown'}; "
+            f"evidence={outcome.evidence_snippet[:160]}"
+        )
+
     def _build_page_fingerprint(
         self, current_url: str, snapshot_map: dict[str, SnapshotItem]
     ) -> str:
@@ -2843,11 +3097,23 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
             return "progression::submit_apply"
         return None
 
+    def _stable_page_scope(self) -> str:
+        try:
+            current = self.page.url or ""
+        except Exception:
+            current = ""
+        parsed = urlsplit(current)
+        domain = (parsed.netloc or "unknown").lower()
+        path = (parsed.path or "/").lower()
+        stable_parts = [p for p in path.split("/") if p and p not in {"jobs", "job"}]
+        normalized_path = "/" + "/".join(stable_parts[:3]) if stable_parts else "/"
+        return f"{domain}{normalized_path}"
+
     def _semantic_action_key(self, page_fingerprint: str, action: AgentAction) -> str:
         intent = self._normalized_action_intent(action)
         if not intent:
             return ""
-        return f"{page_fingerprint or ''}|{intent}"
+        return f"{self._stable_page_scope()}|{intent}"
 
     def _semantic_loop_guard_decision(
         self, page_fingerprint: str, action: AgentAction
@@ -2868,8 +3134,12 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 "semantic_loop_guard",
                 {
                     "step": self.step_count,
+                    "classification": "unknown_blocked",
+                    "reason_code": "semantic_repeat",
+                    "evidence_snippet": str(action.selector or action.ref or "")[:220],
                     "decision": decision,
                     "semantic_key": key,
+                    "stable_scope": self._stable_page_scope(),
                     "fail_count": fail_count,
                     "action": action.action,
                     "selector": action.selector,
@@ -2885,6 +3155,11 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         suffix = f"；最近门控: {blocker}"
         if snippets:
             suffix += f"；错误片段: {snippets}"
+        if self._last_submission_outcome:
+            suffix += (
+                f"；最近分类: {self._last_submission_outcome.classification}"
+                f"/{self._last_submission_outcome.reason_code}"
+            )
         return (
             "同一语义动作重复失败达到上限（已触发重规划与替代动作）"
             f"；动作={action.action}:{action.selector or action.ref or 'unknown'}{suffix}"
@@ -3387,6 +3662,19 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
                 self.refresh_exhausted = True
             return False
 
+    def _looks_like_completion_text(self, lower_text: str) -> bool:
+        success_indicators = [
+            "thank you for applying",
+            "thanks for your application",
+            "application submitted",
+            "application received",
+            "successfully submitted",
+            "your application has been submitted",
+            "application complete",
+            "thanks for submitting",
+        ]
+        return any(token in lower_text for token in success_indicators)
+
     def _verify_completion(self) -> tuple[bool, str]:
         """
         二次验证：检查页面是否真的完成了申请。
@@ -3605,6 +3893,12 @@ def run_browser_agent(
     success = agent.run()
     try:
         setattr(job, "manual_reason_hint", agent.manual_reason_hint)
+        setattr(job, "failure_class_hint", agent.failure_class_hint)
+        setattr(job, "failure_code_hint", agent.failure_code_hint)
+        setattr(job, "retry_count_hint", agent.retry_count_hint)
+        setattr(job, "last_error_snippet_hint", agent.last_error_snippet_hint)
+        setattr(job, "last_outcome_class_hint", agent.last_outcome_class_hint)
+        setattr(job, "last_outcome_at_hint", agent.last_outcome_at_hint)
     except Exception:
         pass
     return success

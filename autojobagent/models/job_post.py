@@ -36,6 +36,12 @@ class JobPost(Base):
     resume_used: Mapped[str | None] = mapped_column(String(255), nullable=True)
     fail_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     manual_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_outcome_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_outcome_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     create_time: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
@@ -53,6 +59,14 @@ class JobPost(Base):
             "resume_used": self.resume_used,
             "fail_reason": self.fail_reason,
             "manual_reason": self.manual_reason,
+            "failure_class": self.failure_class,
+            "failure_code": self.failure_code,
+            "retry_count": self.retry_count,
+            "last_error_snippet": self.last_error_snippet,
+            "last_outcome_class": self.last_outcome_class,
+            "last_outcome_at": self.last_outcome_at.isoformat()
+            if self.last_outcome_at
+            else None,
             "create_time": self.create_time.isoformat() if self.create_time else None,
             "apply_time": self.apply_time.isoformat() if self.apply_time else None,
         }

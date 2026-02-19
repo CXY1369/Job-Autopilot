@@ -12,9 +12,9 @@
 
 - 当前状态：`Active / Usable`
 - CI 状态：`Green`（`Lint + Core Tests + Full Tests`）
-- 自动化测试：`40 passed`
+- 自动化测试：`46 passed`
 - 架构定位：`AI 决策 + 规则护栏`
-- 关键新增能力：`refresh 动作与卡页重试、简历匹配 Stage A、上传白名单、前进门控、问题定向点击与语义循环熔断`
+- 关键新增能力：`提交结果分类、有限重试状态机、稳定语义熔断键、失败治理字段/API/看板`
 
 ## Scope and Goals
 
@@ -126,6 +126,12 @@
 - `resume_used`
 - `fail_reason`
 - `manual_reason`
+- `failure_class`
+- `failure_code`
+- `retry_count`
+- `last_error_snippet`
+- `last_outcome_class`
+- `last_outcome_at`
 - `apply_time`
 
 ## Decision Logic Profile (for maintainers)
@@ -185,6 +191,15 @@
 - 新增 `refresh` 动作
 - 连续失败自动刷新重试（最多 2 次）
 - 刷新耗尽写入明确 `manual_reason`
+
+### Milestone F - Generalized Failure Governance
+
+- 新增提交结果分类：`success_confirmed/validation_error/external_blocked/transient_network/unknown_blocked`
+- `external_blocked/transient_network` 引入最多 3 次重试节奏，超限转人工
+- 语义熔断键改为稳定域（`domain + normalized_path + intent + question_signature`）
+- DB 增加失败治理字段并在启动时幂等补列（无 Alembic）
+- API 新增：`/api/stats/failures`、`/api/jobs/{id}/diagnostics`
+- 前端新增失败分类卡片、TopN 原因、失败筛选
 
 ## Suggested Next Steps
 

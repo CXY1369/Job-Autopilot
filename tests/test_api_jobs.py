@@ -37,6 +37,12 @@ def test_list_jobs_contains_resume_match_fields(isolated_db):
     assert rows[0]["resume_used"] == "/tmp/alex_backend_resume.pdf"
     assert rows[0]["resume_match_score"] == 88
     assert rows[0]["resume_match_reason"] == "python backend fit"
+    assert "failure_class" in rows[0]
+    assert "failure_code" in rows[0]
+    assert "retry_count" in rows[0]
+    assert "last_error_snippet" in rows[0]
+    assert "last_outcome_class" in rows[0]
+    assert "last_outcome_at" in rows[0]
 
 
 def test_clear_manual_and_failed_via_two_calls(isolated_db):
@@ -78,3 +84,65 @@ def test_clear_manual_and_failed_via_two_calls(isolated_db):
     remaining = r3.json()
     assert len(remaining) == 1
     assert remaining[0]["status"] == "pending"
+
+
+def test_failure_stats_endpoint(isolated_db):
+    with isolated_db() as session:
+        session.add_all(
+            [
+                JobPost(
+                    company="A",
+                    title="x",
+                    link="https://example.com/1",
+                    status=JobStatus.MANUAL_REQUIRED,
+                    failure_class="external_blocked",
+                    failure_code="anti_spam_flagged",
+                ),
+                JobPost(
+                    company="B",
+                    title="y",
+                    link="https://example.com/2",
+                    status=JobStatus.FAILED,
+                    failure_class="validation_error",
+                    failure_code="missing_required_field",
+                ),
+            ]
+        )
+        session.commit()
+    with TestClient(app) as client:
+        resp = client.get("/api/stats/failures")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["by_class"]["external_blocked"] == 1
+    assert data["by_class"]["validation_error"] == 1
+    keys = [x["key"] for x in data["top_failure_codes"]]
+    assert "external_blocked:anti_spam_flagged" in keys
+
+
+def test_job_diagnostics_endpoint(isolated_db):
+    with isolated_db() as session:
+        job = JobPost(
+            company="Acme",
+            title="ML Engineer",
+            link="https://example.com/job/diag",
+            status=JobStatus.MANUAL_REQUIRED,
+            failure_class="unknown",
+            failure_code="semantic_loop_stop",
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        session.add(JobLog(job_id=job.id, level="warn", message="need manual"))
+        session.commit()
+        job_id = job.id
+
+    with TestClient(app) as client:
+        resp = client.get(f"/api/jobs/{job_id}/diagnostics")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["job"]["id"] == job_id
+    assert isinstance(data["logs"], list)
+    assert "screenshots" in data
+    assert "trace_events" in data

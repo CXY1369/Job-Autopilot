@@ -2,6 +2,7 @@ from autojobagent.core.browser_manager import BrowserManager
 from autojobagent.core.vision_agent import (
     BrowserAgent,
     AgentAction,
+    SubmissionOutcome,
     evaluate_progression_block_reason,
 )
 from autojobagent.core.ui_snapshot import SnapshotItem
@@ -10,6 +11,27 @@ from autojobagent.core.ui_snapshot import SnapshotItem
 class _DummyJob:
     id = 999
     resume_used = None
+
+
+class _DummyKeyboard:
+    def press(self, _key: str) -> None:
+        return None
+
+
+class _OutcomePage:
+    def __init__(self, text: str, url: str = "https://jobs.ashbyhq.com/company/role/application"):
+        self._text = text
+        self.url = url
+        self.keyboard = _DummyKeyboard()
+
+    def inner_text(self, _selector: str) -> str:
+        return self._text
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+    def evaluate(self, _script: str):
+        return None
 
 
 def test_progression_gate_does_not_block_job_description_keywords_only():
@@ -367,3 +389,79 @@ def test_fingerprint_stable_for_same_state(monkeypatch):
     fp1 = agent._build_page_fingerprint("https://example.com", items)
     fp2 = agent._build_page_fingerprint("https://example.com", items)
     assert fp1 == fp2, "Same state must produce same fingerprint"
+
+
+def test_submission_outcome_classifier_external_blocked(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _OutcomePage(
+        "We couldn't submit your application. Your application submission was flagged as possible spam."
+    )
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    outcome = agent._classify_submission_outcome(
+        AgentAction(action="click", selector="Submit"), action_success=False
+    )
+    assert outcome.classification == "external_blocked"
+
+
+def test_submission_outcome_classifier_validation_error(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _OutcomePage("Please complete required fields")
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    monkeypatch.setattr(
+        agent,
+        "_get_progression_block_reason",
+        lambda: "检测到 1 个必填字段为空",
+    )
+    agent._last_progression_block_snippets = ["Missing country required field"]
+    outcome = agent._classify_submission_outcome(
+        AgentAction(action="click", selector="Submit"), action_success=False
+    )
+    assert outcome.classification == "validation_error"
+
+
+def test_submission_retry_policy_stops_at_third_attempt(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _OutcomePage("flagged as possible spam")
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    action = AgentAction(action="click", selector="Submit Application")
+    monkeypatch.setattr(
+        agent,
+        "_classify_submission_outcome",
+        lambda _action, _ok: SubmissionOutcome(
+            classification="external_blocked",
+            reason_code="anti_spam_flagged",
+            evidence_snippet="flagged as possible spam",
+        ),
+    )
+    r1 = agent._handle_submission_outcome(action, False)
+    r2 = agent._handle_submission_outcome(action, False)
+    r3 = agent._handle_submission_outcome(action, False)
+    assert r1 == (False, False)
+    assert r2 == (False, False)
+    assert r3 == (False, True)
+
+
+def test_semantic_key_not_reset_by_page_fingerprint(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _OutcomePage("body text", url="https://jobs.ashbyhq.com/suno/jobs/123/application")
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    action = AgentAction(action="click", selector="Submit Application")
+    k1 = agent._semantic_action_key("fp-one", action)
+    k2 = agent._semantic_action_key("fp-two", action)
+    assert k1 == k2

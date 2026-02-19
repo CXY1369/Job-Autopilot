@@ -39,6 +39,12 @@ class ApplyResult:
     fail_reason: Optional[str] = None
     manual_reason: Optional[str] = None
     resume_used: Optional[str] = None
+    failure_class: Optional[str] = None
+    failure_code: Optional[str] = None
+    retry_count: int = 0
+    last_error_snippet: Optional[str] = None
+    last_outcome_class: Optional[str] = None
+    last_outcome_at: Optional[datetime] = None
 
 
 def apply_for_job(job: JobPost) -> ApplyResult:
@@ -257,11 +263,23 @@ def apply_for_job(job: JobPost) -> ApplyResult:
             manual_reason = (
                 getattr(job, "manual_reason_hint", None) or "AI Agent 未能完成全部操作"
             )
+            failure_class = getattr(job, "failure_class_hint", None)
+            failure_code = getattr(job, "failure_code_hint", None)
+            retry_count = int(getattr(job, "retry_count_hint", 0) or 0)
+            last_error_snippet = getattr(job, "last_error_snippet_hint", None)
+            last_outcome_class = getattr(job, "last_outcome_class_hint", None)
+            last_outcome_at = getattr(job, "last_outcome_at_hint", None)
             return ApplyResult(
                 success=False,
                 manual_required=True,
                 manual_reason=manual_reason,
                 resume_used=job.resume_used,
+                failure_class=failure_class,
+                failure_code=failure_code,
+                retry_count=retry_count,
+                last_error_snippet=last_error_snippet,
+                last_outcome_class=last_outcome_class,
+                last_outcome_at=last_outcome_at,
             )
 
     except Exception as e:
@@ -275,6 +293,11 @@ def apply_for_job(job: JobPost) -> ApplyResult:
             success=False,
             fail_reason=str(e),
             resume_used=job.resume_used,
+            failure_class="unknown",
+            failure_code="runtime_exception",
+            last_error_snippet=str(e)[:300],
+            last_outcome_class="unknown_blocked",
+            last_outcome_at=datetime.now(),
         )
 
 
