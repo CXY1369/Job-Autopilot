@@ -106,9 +106,11 @@ class BrowserManager:
         try:
             page.on(
                 "console",
-                lambda msg: self._log(f"[console:{msg.type}] {msg.text}", "warn")
-                if msg.type in ("error", "warning")
-                else None,
+                lambda msg: (
+                    self._log(f"[console:{msg.type}] {msg.text}", "warn")
+                    if msg.type in ("error", "warning")
+                    else None
+                ),
             )
             page.on(
                 "pageerror",

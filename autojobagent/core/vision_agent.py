@@ -429,7 +429,8 @@ class BrowserAgent:
                             SubmissionOutcome(
                                 classification="unknown_blocked",
                                 reason_code="semantic_loop_stop",
-                                evidence_snippet=self._last_progression_block_reason or "",
+                                evidence_snippet=self._last_progression_block_reason
+                                or "",
                             )
                         )
                     hint = self._build_semantic_loop_manual_reason(action)
@@ -2837,9 +2838,7 @@ type(Location, Dallas) → 下拉框出现 → click(Dallas, Texas, United State
         if outcome.classification == "success_confirmed":
             return True, False
         if outcome.classification == "validation_error":
-            signature = (
-                f"{outcome.reason_code}|{(outcome.evidence_snippet or '').strip().lower()}"
-            )
+            signature = f"{outcome.reason_code}|{(outcome.evidence_snippet or '').strip().lower()}"
             if signature and signature == self._last_validation_signature:
                 self._validation_repeat_count += 1
             else:

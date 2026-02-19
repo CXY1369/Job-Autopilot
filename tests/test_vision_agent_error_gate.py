@@ -19,7 +19,9 @@ class _DummyKeyboard:
 
 
 class _OutcomePage:
-    def __init__(self, text: str, url: str = "https://jobs.ashbyhq.com/company/role/application"):
+    def __init__(
+        self, text: str, url: str = "https://jobs.ashbyhq.com/company/role/application"
+    ):
         self._text = text
         self.url = url
         self.keyboard = _DummyKeyboard()
@@ -459,7 +461,9 @@ def test_semantic_key_not_reset_by_page_fingerprint(monkeypatch):
         "_load_settings",
         lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
     )
-    page = _OutcomePage("body text", url="https://jobs.ashbyhq.com/suno/jobs/123/application")
+    page = _OutcomePage(
+        "body text", url="https://jobs.ashbyhq.com/suno/jobs/123/application"
+    )
     agent = BrowserAgent(page=page, job=_DummyJob())
     action = AgentAction(action="click", selector="Submit Application")
     k1 = agent._semantic_action_key("fp-one", action)

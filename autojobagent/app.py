@@ -338,7 +338,9 @@ def get_job_diagnostics(job_id: int):
         "ok": True,
         "job": job.to_dict(),
         "logs": log_summary,
-        "latest_screenshot_dir": str(latest_screenshot_dir) if latest_screenshot_dir else None,
+        "latest_screenshot_dir": str(latest_screenshot_dir)
+        if latest_screenshot_dir
+        else None,
         "screenshots": screenshot_paths,
         "trace_file": str(trace_files[0]) if trace_files else None,
         "trace_events": trace_events[-40:],

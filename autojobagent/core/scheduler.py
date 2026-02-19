@@ -106,7 +106,9 @@ class JobScheduler:
                 db_job.retry_count = 0
                 db_job.last_error_snippet = None
                 db_job.last_outcome_class = "success_confirmed"
-                db_job.last_outcome_at = result.last_outcome_at or datetime.now(timezone.utc)
+                db_job.last_outcome_at = result.last_outcome_at or datetime.now(
+                    timezone.utc
+                )
                 print(f"[job={job.id}] ✓ 状态更新为: APPLIED")
             elif result.manual_required:
                 db_job.status = JobStatus.MANUAL_REQUIRED
