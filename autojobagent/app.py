@@ -328,10 +328,16 @@ def get_job_diagnostics(job_id: int):
                     visual_events.append(evt)
                 if evt.get("event") in {
                     "submission_outcome_classified",
+                    "submission_classified",
                     "retry_policy_applied",
                     "semantic_loop_guard",
                     "answer_binding_attempt",
                     "progression_block_with_fix_hint",
+                    "workflow_phase",
+                    "plan_created",
+                    "task_selected",
+                    "terminal_completion_assessed",
+                    "finalized",
                     "action_executed",
                     "action_verified",
                 }:

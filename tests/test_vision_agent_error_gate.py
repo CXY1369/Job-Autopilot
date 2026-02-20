@@ -2,10 +2,12 @@ from autojobagent.core.browser_manager import BrowserManager
 from autojobagent.core.vision_agent import (
     BrowserAgent,
     AgentAction,
+    AgentState,
     SubmissionOutcome,
     evaluate_progression_block_reason,
 )
 from autojobagent.core.ui_snapshot import SnapshotItem
+from autojobagent.core.llm_runtime import LLMCallResult
 
 
 class _DummyJob:
@@ -22,6 +24,22 @@ class _OutcomePage:
     def __init__(
         self, text: str, url: str = "https://jobs.ashbyhq.com/company/role/application"
     ):
+        self._text = text
+        self.url = url
+        self.keyboard = _DummyKeyboard()
+
+    def inner_text(self, _selector: str) -> str:
+        return self._text
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+    def evaluate(self, _script: str):
+        return None
+
+
+class _ObservePage:
+    def __init__(self, text: str, url: str):
         self._text = text
         self.url = url
         self.keyboard = _DummyKeyboard()
@@ -201,7 +219,10 @@ def test_intent_model_follows_fallback_order(monkeypatch):
         "_load_settings",
         lambda _self: {"llm": {"fallback_models": ["gpt-4o", "gpt-4o-mini"]}},
     )
-    agent = BrowserAgent(page=object(), job=_DummyJob())
+    agent = BrowserAgent(
+        page=_ObservePage("application page", "https://jobs.ashbyhq.com/suno/role/application"),
+        job=_DummyJob(),
+    )
     assert agent.intent_model == "gpt-4o"
 
 
@@ -216,7 +237,12 @@ def test_intent_model_respects_explicit_override(monkeypatch):
             }
         },
     )
-    agent = BrowserAgent(page=object(), job=_DummyJob())
+    agent = BrowserAgent(
+        page=_ObservePage(
+            "application page", "https://jobs.ashbyhq.com/suno/role/application"
+        ),
+        job=_DummyJob(),
+    )
     assert agent.intent_model == "gpt-4o-mini"
 
 
@@ -670,3 +696,155 @@ def test_replay_suno_yes_no_oscillation_escalates_to_stop(monkeypatch):
     assert agent._semantic_loop_guard_decision("ignored-fp", action) == "alternate"
     agent._promote_semantic_guard("ignored-fp", action, stage="alternate")
     assert agent._semantic_loop_guard_decision("ignored-fp", action) == "stop"
+
+
+def test_observe_and_think_non_json_completion_fallback_returns_done(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _ObservePage(
+        "Your application has been submitted successfully.",
+        "https://jobs.ashbyhq.com/acme/role/application",
+    )
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    agent.step_count = 9
+    agent.client = object()
+    agent.visual_fallback_budget = 0
+
+    snapshot_map = {
+        "e1": SnapshotItem(ref="e1", role="button", name="Submit Application", nth=0)
+    }
+    monkeypatch.setattr(
+        "autojobagent.core.vision_agent.build_ui_snapshot",
+        lambda _page: ("e1 | role=button | name=Submit Application", snapshot_map),
+    )
+    monkeypatch.setattr(
+        "autojobagent.core.vision_agent.build_question_blocks",
+        lambda _page, _snapshot_map: [],
+    )
+    monkeypatch.setattr(
+        agent,
+        "_collect_manual_required_evidence",
+        lambda *_args, **_kwargs: {
+            "password_input_count": 0,
+            "captcha_element_count": 0,
+            "has_captcha_challenge_text": False,
+            "has_login_button": False,
+            "has_apply_cta": False,
+        },
+    )
+    monkeypatch.setattr(
+        agent,
+        "_classify_page_state",
+        lambda *_args, **_kwargs: "application_or_form_page",
+    )
+    monkeypatch.setattr(
+        "autojobagent.core.vision_agent.run_chat_with_fallback",
+        lambda **_kwargs: LLMCallResult(
+            ok=True,
+            raw="Your application was successfully submitted. The process is complete.",
+            model="gpt-4o",
+            model_index=0,
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_verify_completion",
+        lambda: (True, "页面显示申请成功信息，无错误提示"),
+    )
+    state = agent._observe_and_think()
+    assert state.status == "done"
+
+
+def test_run_reports_macro_action_result_after_execution(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(
+        page=_ObservePage(
+            "application page", "https://jobs.ashbyhq.com/suno/role/application"
+        ),
+        job=_DummyJob(),
+    )
+    agent.client = object()
+    monkeypatch.setattr(agent, "_log", lambda *_args, **_kwargs: None)
+    action = AgentAction(
+        action="click",
+        selector="Yes",
+        target_question="Are you legally authorized to work in the United States?",
+        reason="[macro:t2] execute planned question option selection",
+    )
+    states = iter(
+        [
+            AgentState(
+                status="continue",
+                summary="macro step",
+                next_action=action,
+                page_fingerprint="fp-1",
+            ),
+            AgentState(status="stuck", summary="stop"),
+        ]
+    )
+    monkeypatch.setattr(agent, "_observe_and_think", lambda: next(states))
+    monkeypatch.setattr(agent, "_semantic_loop_guard_decision", lambda *_args: "none")
+    monkeypatch.setattr(agent, "_should_skip_repeated_action", lambda *_args: False)
+    monkeypatch.setattr(agent, "_execute_action", lambda _action: False)
+    monkeypatch.setattr(agent, "_record_action_result", lambda *_args: None)
+    calls: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        agent,
+        "_on_macro_action_result",
+        lambda used_action, ok: calls.append((used_action.reason or "", bool(ok))),
+    )
+    result = agent.run()
+    assert result is False
+    assert calls == [("[macro:t2] execute planned question option selection", False)]
+
+
+def test_run_reports_macro_result_when_submission_branch_stops(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    agent.client = object()
+    monkeypatch.setattr(agent, "_log", lambda *_args, **_kwargs: None)
+    action = AgentAction(
+        action="click",
+        selector="Submit Application",
+        reason="[macro:t9] progression submit",
+    )
+    monkeypatch.setattr(
+        agent,
+        "_observe_and_think",
+        lambda: AgentState(
+            status="continue",
+            summary="submit",
+            next_action=action,
+            page_fingerprint="fp-submit",
+        ),
+    )
+    monkeypatch.setattr(agent, "_semantic_loop_guard_decision", lambda *_args: "none")
+    monkeypatch.setattr(agent, "_should_skip_repeated_action", lambda *_args: False)
+    monkeypatch.setattr(agent, "_execute_action", lambda _action: False)
+    monkeypatch.setattr(agent, "_is_progression_action", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        agent,
+        "_handle_submission_outcome",
+        lambda _action, _success: (False, True),
+    )
+    monkeypatch.setattr(agent, "_record_action_result", lambda *_args: None)
+    calls: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        agent,
+        "_on_macro_action_result",
+        lambda used_action, ok: calls.append((used_action.reason or "", bool(ok))),
+    )
+    result = agent.run()
+    assert result is False
+    assert calls == [("[macro:t9] progression submit", False)]

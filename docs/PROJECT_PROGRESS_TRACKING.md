@@ -317,6 +317,84 @@
   - `tests/test_manual_gate.py`
 - 全量回归验证通过（`70 passed`）
 
+### Milestone R - V2.5 Phase A (Terminal Guard + Semantic Question Blocks)
+
+- 新增 `autojobagent/core/semantic_tree.py`：
+  - `QuestionBlock/OptionNode` 结构
+  - 从 DOM 抽取问题块（question + options + selected/error）
+  - 生成问题块摘要文本，供 LLM 规划时绑定问题语义
+- 新增 `autojobagent/core/terminal_guard.py`：
+  - `raw_response_implies_completion`（非 JSON 回复的终态兜底）
+- `vision_agent.py` 关键改造：
+  - `_observe_and_think` 增加 LLM 前“终态硬判定”（命中成功证据直接 `done`）
+  - LLM parse fail 时，若原始文本表达“提交成功”且页面验证通过，直接收敛到 `done`
+  - 增加 `question_blocks_detected` 与 `terminal_success_detected` 事件
+  - `build_user_prompt` 注入语义问题块摘要
+  - 修复非 dict JSON 解析结果导致的运行时异常风险（如 `'list' object has no attribute 'get'`）
+- 新增测试：
+  - `tests/test_semantic_tree.py`
+  - `tests/test_terminal_guard.py`
+  - `tests/test_vision_agent_error_gate.py` 新增 parse-fallback 成功收敛用例
+- 全量回归验证通过（`75 passed`）
+
+### Milestone S - V2.5 Phase B (Macro-Plan Execution Wiring)
+
+- `vision_agent.py` 主循环完成 Phase B 接线：
+  - 宏任务动作执行后，统一回写 `_on_macro_action_result(action, success)`
+  - 提交阻断提前终止分支同样回写失败结果，避免宏任务状态“悬空”
+- 保障“初始全局计划 + 每步状态检测 + 局部调整”执行语义一致，不再出现宏任务选中后无结果回写的问题
+- 新增回归测试（`tests/test_vision_agent_error_gate.py`）：
+  - `test_run_reports_macro_action_result_after_execution`
+  - `test_run_reports_macro_result_when_submission_branch_stops`
+- 全量回归验证通过（`77 passed`）
+
+### Milestone T - V2.5 General Option Mapper (Semantic Tree + Profile Rules)
+
+- `autojobagent/core/macro_tasks.py` 升级为通用选项映射器：
+  - 内置规则覆盖常见申请题：work authorization / visa sponsorship / relocate / over-18 / driver's license / background check / drug test / relative / previous employment / remote preference / demographics / referral source
+  - 布尔题不再依赖固定 `Yes/No` 文案，支持 `I do not require sponsorship` 等变体
+  - 保留并强化 office 多选映射（preferred_locations 与页面选项做模糊交集）
+  - 支持 profile 自定义 `option_rules`（可处理 A/B/C 等站点自定义标签）
+- `MacroTask` 新增 `mapping_reason`，并在 `macro_task_selected` 日志事件中输出，提升可诊断性。
+- `autojobagent/config/user_profile.yaml.example` 增加 `option_rules` 示例配置。
+- 新增测试：`tests/test_macro_tasks.py`
+  - 非 Yes/No 布尔文案映射
+  - 远程办公偏好枚举映射
+  - 办公地点多选映射
+  - A/B/C 自定义规则映射
+  - 无可靠匹配时跳过（避免误选）
+- 全量回归验证通过（`82 passed`）
+
+### Milestone U - V2.6 Engine Hardening Bundle (State Machine + FormGraph + Completion Scoring)
+
+- 执行状态机升级（`autojobagent/core/fsm_orchestrator.py`）：
+  - 新增 `derive_execution_phase`（`observe/plan/execute_chain/verify_action/repair/submit/finalize/manual_stop`）
+  - 新增 `decide_local_adjustment_path`（动作失败后本地调整路径）
+  - `vision_agent.py` 每步输出 `workflow_phase`，支持稳定复盘
+- 语义树升级为可导航表单图（`autojobagent/core/semantic_tree.py`）：
+  - 新增 `FieldNode/FormGraph`
+  - 新增 `build_form_graph/format_form_graph`
+  - `_observe_and_think` 注入 `form_graph_text` 到 prompt，并记录 `form_graph_generated`
+- 终态判定升级（`autojobagent/core/outcome_classifier.py` + `vision_agent.py`）：
+  - 新增 `CompletionAssessment` 与 `assess_completion_confidence`
+  - `_verify_completion` 改为多信号评分（成功文案、Submit可见性、错误信号、URL成功线索、外部阻断线索）
+  - 新增 `terminal_completion_assessed` 事件，降低“已提交仍继续操作”概率
+- 宏任务链稳定性增强（`vision_agent.py`）：
+  - 宏任务动作默认走“局部调整”，不触发全局语义 guard 重规划
+  - 增加 precondition 等待与 `macro_task_waiting_precondition`
+  - 全阻断时返回 `stuck`（`macro_plan_blocked`），避免空转
+- 提交阻断恢复策略增强：
+  - `external_blocked/transient_network` 第2次失败增加一次“刷新恢复”尝试（有 `reload` 能力时）
+  - 保留最多3次上限后转人工
+- 可观测性标准化：
+  - 新增/统一事件：`plan_created`、`task_selected`、`submission_classified`、`finalized`
+  - `GET /api/jobs/{id}/diagnostics` 事件摘要加入上述关键事件
+- 新增测试：
+  - `tests/test_outcome_classifier.py`
+  - `tests/test_semantic_tree.py` 扩展 FormGraph 覆盖
+  - `tests/test_fsm_orchestrator.py` 扩展执行阶段与本地调整路径覆盖
+- 全量回归验证通过（`88 passed`）
+
 ## Suggested Next Steps
 
 - 增加 `press/check/uncheck/hover` 等动作以提升复杂页面泛化

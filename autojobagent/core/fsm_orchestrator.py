@@ -24,6 +24,23 @@ FailureRecoveryPath = Literal[
     "stop_refresh_exhausted",
     "stop_max_failures",
 ]
+ExecutionPhase = Literal[
+    "observe",
+    "plan",
+    "execute_chain",
+    "verify_action",
+    "repair",
+    "submit",
+    "finalize",
+    "manual_stop",
+]
+LocalAdjustmentPath = Literal[
+    "advance",
+    "retry_same_task",
+    "alternate_task",
+    "repair_then_continue",
+    "stop_manual",
+]
 
 
 def decide_semantic_guard_path(
@@ -76,3 +93,52 @@ def decide_failure_recovery_path(
     if consecutive_failures >= max_consecutive_failures:
         return "stop_max_failures"
     return "none"
+
+
+def derive_execution_phase(
+    *,
+    state_status: str,
+    has_next_action: bool,
+    action_is_progression: bool,
+    progression_blocked: bool,
+    manual_required: bool,
+    has_pending_macro_tasks: bool,
+    consecutive_failures: int,
+) -> ExecutionPhase:
+    if state_status == "done":
+        return "finalize"
+    if state_status == "stuck" or manual_required:
+        return "manual_stop"
+    if state_status == "error":
+        return "observe"
+    if progression_blocked:
+        return "repair"
+    if has_next_action and action_is_progression:
+        return "submit"
+    if has_next_action and (has_pending_macro_tasks or consecutive_failures > 0):
+        return "execute_chain"
+    if has_next_action:
+        return "verify_action"
+    return "plan"
+
+
+def decide_local_adjustment_path(
+    *,
+    action_success: bool,
+    is_macro_action: bool,
+    has_alternate_action: bool,
+    repeated_same_error: bool,
+    retry_count: int,
+    retry_limit: int,
+) -> LocalAdjustmentPath:
+    if action_success:
+        return "advance"
+    if retry_count >= retry_limit:
+        return "stop_manual"
+    if repeated_same_error:
+        return "repair_then_continue"
+    if is_macro_action:
+        return "retry_same_task"
+    if has_alternate_action:
+        return "alternate_task"
+    return "repair_then_continue"

@@ -129,6 +129,22 @@ common_answers:
   willing_drug_test: true
 
 # -----------------------------------------------------------------------------
+# Optional Generic Option Rules (for site-specific A/B/C or custom labels)
+# -----------------------------------------------------------------------------
+# Use this only when built-in rules cannot infer the right option.
+# The mapper will match by `question_keywords` and then choose `answer(s)` from
+# current page options via fuzzy text matching.
+option_rules:
+  - question_keywords:
+      - "security clearance"
+      - "clearance level"
+    answer: "B"
+  - question_keywords:
+      - "preferred interview language"
+    answers:
+      - "English"
+
+# -----------------------------------------------------------------------------
 # File Uploads Configuration
 # -----------------------------------------------------------------------------
 files:

@@ -188,6 +188,8 @@ def build_user_prompt(
     history_text: str,
     visible_text: str,
     snapshot_text: str,
+    question_blocks_text: str,
+    form_graph_text: str,
     upload_signal_text: str,
     simplify_state: str,
     simplify_message: str,
@@ -207,6 +209,12 @@ def build_user_prompt(
 
 ## 可交互元素快照（ref → 元素）
 {snapshot_text}
+
+## 语义问题块（question → options，优先用于回答题绑定）
+{question_blocks_text}
+
+## 表单语义图（fields/questions/submit/errors）
+{form_graph_text}
 
 ## 上传信号检测
 {upload_signal_text}
@@ -234,6 +242,7 @@ def build_user_prompt(
 - checkbox 多选：取"用户偏好 ∩ 页面选项"的交集（模糊匹配）
 - 开放式问题（无选项）：默认填 3 个相关值
 - 示例：" 空缺 3 项：1. Location → Dallas；2. Which office → 交集4个(Boston/NYC/LA/SF)；3. Skills → Python, ML, DL"
+- 生成一次全局任务链后，不要每步重做全局规划；失败时只调整当前任务
 
 **规则：规划的选项必须全部执行！**
 - checkbox 规划了 4 个 → 选完 4 个再继续

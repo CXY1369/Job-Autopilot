@@ -32,6 +32,7 @@ from ..db.database import SessionLocal
 from ..models.job_log import JobLog
 from ..config import (
     get_user_info_for_prompt,
+    load_user_profile,
     load_agent_guidelines,
     list_upload_candidates,
     is_upload_path_allowed,
@@ -47,6 +48,7 @@ from .semantic_perception import (
     extract_semantic_error_snippets,
 )
 from .outcome_classifier import (
+    assess_completion_confidence as oc_assess_completion_confidence,
     SubmissionOutcome,
     build_submission_manual_reason as oc_build_submission_manual_reason,
     classify_submission_outcome as oc_classify_submission_outcome,
@@ -88,9 +90,11 @@ from .manual_gate import (
     select_apply_entry_candidate as mg_select_apply_entry_candidate,
 )
 from .fsm_orchestrator import (
+    decide_local_adjustment_path as fsm_decide_local_adjustment_path,
     decide_failure_recovery_path as fsm_decide_failure_recovery_path,
     decide_repeated_skip_path as fsm_decide_repeated_skip_path,
     decide_semantic_guard_path as fsm_decide_semantic_guard_path,
+    derive_execution_phase as fsm_derive_execution_phase,
 )
 from .llm_runtime import run_chat_with_fallback
 from .prompt_builder import (
@@ -98,6 +102,16 @@ from .prompt_builder import (
     build_user_prompt,
 )
 from .state_parser import parse_agent_response_payload
+from .terminal_guard import raw_response_implies_completion
+from .semantic_tree import (
+    FormGraph,
+    QuestionBlock,
+    build_form_graph,
+    build_question_blocks,
+    format_form_graph,
+    format_question_blocks,
+)
+from .macro_tasks import MacroTask, build_macro_tasks, summarize_macro_tasks
 from .verifier import (
     get_input_value as verifier_get_input_value,
     is_dropdown_open as verifier_is_dropdown_open,
@@ -352,6 +366,14 @@ class BrowserAgent:
         )
         self._intent_cache: dict[str, dict[str, list[str]]] = {}
         self._last_snapshot_intents: dict[str, set[str]] = {}
+        self._last_question_blocks: list[QuestionBlock] = []
+        self._last_form_graph: FormGraph | None = None
+        self._last_form_graph_text: str = ""
+        self._user_profile: dict = load_user_profile()
+        self._macro_tasks: list[MacroTask] = []
+        self._macro_scope: str = ""
+        self._active_macro_task_id: str | None = None
+        self._macro_retry_limit = 3
         self._error_gate_cache: dict[str, bool] = {}
         self._last_observed_fingerprint: str = ""
         self._state_cache_by_fingerprint: dict[str, AgentState] = {}
@@ -365,6 +387,7 @@ class BrowserAgent:
         self._validation_repeat_count: int = 0
         self._submission_retry_limit = 3
         self._submission_retry_counts: dict[str, int] = {}
+        self._submission_refresh_attempts: dict[str, int] = {}
         self._last_submission_outcome: SubmissionOutcome | None = None
         self.failure_class_hint: str | None = None
         self.failure_code_hint: str | None = None
@@ -372,6 +395,7 @@ class BrowserAgent:
         self.last_error_snippet_hint: str | None = None
         self.last_outcome_class_hint: str | None = None
         self.last_outcome_at_hint: datetime | None = None
+        self._execution_phase: str = "observe"
         try:
             self.visual_fallback_budget = max(
                 0, int(os.getenv("VISION_FALLBACK_BUDGET", "8"))
@@ -413,6 +437,7 @@ class BrowserAgent:
 
         if not self.client and not self.pre_nav_only:
             self._log("❌ OPENAI_API_KEY 未设置，无法运行 Agent", "error")
+            self._log_finalized("failed", "missing_openai_api_key")
             return False
 
         while self.step_count < self.max_steps:
@@ -437,11 +462,44 @@ class BrowserAgent:
             if state.risk_or_blocker:
                 self._log(f"⚠ 风险/阻塞: {state.risk_or_blocker}")
 
+            next_item = None
+            if state.next_action is not None:
+                next_item = self._last_snapshot_map.get((state.next_action.ref or ""))
+            next_is_progression = bool(
+                state.next_action
+                and self._is_progression_action(state.next_action, item=next_item)
+            )
+            pending_macro_tasks = any(
+                task.status not in ("done", "blocked") for task in self._macro_tasks
+            )
+            self._execution_phase = fsm_derive_execution_phase(
+                state_status=state.status,
+                has_next_action=state.next_action is not None,
+                action_is_progression=next_is_progression,
+                progression_blocked=bool(self._last_progression_block_reason),
+                manual_required=state.status == "stuck",
+                has_pending_macro_tasks=pending_macro_tasks,
+                consecutive_failures=self.consecutive_failures,
+            )
+            self._step_log(
+                "workflow_phase",
+                {
+                    "step": self.step_count,
+                    "phase": self._execution_phase,
+                    "state_status": state.status,
+                    "has_next_action": state.next_action is not None,
+                    "next_is_progression": next_is_progression,
+                    "pending_macro_tasks": pending_macro_tasks,
+                    "consecutive_failures": self.consecutive_failures,
+                },
+            )
+
             # 3. 检查是否完成（带二次验证）
             if state.status == "done":
                 if self.pre_nav_only:
                     self._log("✓ 预导航完成：已进入申请页")
                     self._log("========== AI Agent 运行结束 ==========")
+                    self._log_finalized("done", "pre_nav_completed")
                     return True
                 self._log("🔍 Agent 判断任务完成，进行二次验证...")
 
@@ -451,6 +509,7 @@ class BrowserAgent:
                 if is_really_done:
                     self._log(f"✓ 二次验证通过: {verification_msg}")
                     self._log("========== AI Agent 运行结束 ==========")
+                    self._log_finalized("done", verification_msg)
                     return True
                 else:
                     self._log(f"⚠ 二次验证失败: {verification_msg}", "warn")
@@ -462,14 +521,28 @@ class BrowserAgent:
                 self._set_manual_reason_hint(state.summary or "需要人工介入")
                 self._log("⚠ Agent 判断无法继续，需要人工介入", "warn")
                 self._log("========== AI Agent 运行结束 ==========")
+                self._log_finalized("manual_required", state.summary or "stuck")
                 return False
 
             # 4. 执行下一步操作
             if state.next_action:
                 action = state.next_action
                 fp = state.page_fingerprint or self._last_observed_fingerprint
+                is_macro_action = self._is_macro_action(action)
                 semantic_guard = self._semantic_loop_guard_decision(fp, action)
                 precomputed_alternate = None
+                if is_macro_action and semantic_guard != "none":
+                    self._step_log(
+                        "macro_local_adjustment",
+                        {
+                            "step": self.step_count,
+                            "reason_code": "ignore_global_semantic_guard_for_macro",
+                            "original_guard": semantic_guard,
+                            "action": action.action,
+                            "selector": action.selector,
+                        },
+                    )
+                    semantic_guard = "none"
                 if semantic_guard == "alternate":
                     precomputed_alternate = self._build_alternate_action(action)
                 guard_path = fsm_decide_semantic_guard_path(
@@ -513,8 +586,9 @@ class BrowserAgent:
                         "⚠ 语义动作重复失败超过阈值，停止执行并转人工处理", "warn"
                     )
                     self._log("========== AI Agent 运行结束（语义循环熔断）==========")
+                    self._log_finalized("manual_required", "semantic_loop_guard_stop")
                     return False
-                if self._should_skip_repeated_action(fp, action):
+                if (not is_macro_action) and self._should_skip_repeated_action(fp, action):
                     skip_key = self._action_fail_key(fp, action)
                     skip_count = self._repeated_skip_counts.get(skip_key, 0) + 1
                     self._repeated_skip_counts[skip_key] = skip_count
@@ -550,6 +624,9 @@ class BrowserAgent:
                         self._log(
                             "========== AI Agent 运行结束（重复失败无替代）=========="
                         )
+                        self._log_finalized(
+                            "manual_required", "repeated_failure_without_alternate"
+                        )
                         return False
                     self.history.append(
                         f"步骤{self.step_count}: 跳过重复失败动作 {action.action}({action.ref or action.selector or ''})，要求改用其他策略"
@@ -573,6 +650,7 @@ class BrowserAgent:
                         action, success
                     )
                     if should_stop:
+                        self._on_macro_action_result(action, False)
                         self._record_action_result(fp, action, False)
                         self._set_manual_reason_hint(
                             self._build_submission_manual_reason(action)
@@ -581,7 +659,11 @@ class BrowserAgent:
                             "⚠ 提交阻断达到重试上限，停止执行并转人工处理", "warn"
                         )
                         self._log("========== AI Agent 运行结束（提交阻断）==========")
+                        self._log_finalized(
+                            "manual_required", "submission_blocked_retry_exhausted"
+                        )
                         return False
+                self._on_macro_action_result(action, success)
                 self._record_action_result(fp, action, success)
 
                 # 记录到历史（让 AI 能看到操作结果，从而调整策略）
@@ -607,6 +689,26 @@ class BrowserAgent:
                 if success:
                     self._log("   ✓ 执行成功")
                 else:
+                    if is_macro_action:
+                        adjustment = fsm_decide_local_adjustment_path(
+                            action_success=False,
+                            is_macro_action=True,
+                            has_alternate_action=self._build_alternate_action(action)
+                            is not None,
+                            repeated_same_error=self._validation_repeat_count >= 2,
+                            retry_count=self._macro_task_retry_count(action),
+                            retry_limit=self._macro_retry_limit,
+                        )
+                        self._step_log(
+                            "macro_local_adjustment",
+                            {
+                                "step": self.step_count,
+                                "task_id": self._macro_task_id_from_action(action),
+                                "adjustment": adjustment,
+                                "retry_count": self._macro_task_retry_count(action),
+                                "retry_limit": self._macro_retry_limit,
+                            },
+                        )
                     self._log(
                         f"   ❌ 执行失败 (连续失败: {self.consecutive_failures}/{self.max_consecutive_failures})",
                         "warn",
@@ -651,6 +753,7 @@ class BrowserAgent:
                         self._log(
                             "========== AI Agent 运行结束（刷新重试耗尽）=========="
                         )
+                        self._log_finalized("manual_required", "refresh_retries_exhausted")
                         return False
                     elif failure_path == "stop_max_failures":
                         self._set_manual_reason_hint(
@@ -661,6 +764,9 @@ class BrowserAgent:
                             "warn",
                         )
                         self._log("========== AI Agent 运行结束（智能终止）==========")
+                        self._log_finalized(
+                            "manual_required", "consecutive_action_failures_exhausted"
+                        )
                         return False
 
                 # 等待页面响应后立即截图（让 AI 看到实时变化）
@@ -672,6 +778,7 @@ class BrowserAgent:
         self._log(f"⚠ 已达到最大步数 {self.max_steps}，停止执行", "warn")
         self._set_manual_reason_hint("已达到最大步数仍未完成，需要人工处理")
         self._log("========== AI Agent 运行结束 ==========")
+        self._log_finalized("manual_required", "max_steps_exhausted")
         return False
 
     def _observe_and_think(self) -> AgentState:
@@ -706,6 +813,18 @@ class BrowserAgent:
             snapshot_map,
             visible_text,
         )
+        question_blocks = build_question_blocks(self.page, snapshot_map)
+        self._last_question_blocks = question_blocks
+        question_blocks_text = format_question_blocks(question_blocks)
+        form_graph = build_form_graph(
+            current_url=current_url_for_fp,
+            snapshot_map=snapshot_map,
+            question_blocks=question_blocks,
+            error_snippets=semantic_snapshot.errors,
+        )
+        self._last_form_graph = form_graph
+        form_graph_text = format_form_graph(form_graph)
+        self._last_form_graph_text = form_graph_text
         self._step_log(
             event="snapshot_generated",
             payload={
@@ -718,6 +837,35 @@ class BrowserAgent:
                 "required_unfilled_count": len(semantic_snapshot.required_unfilled),
                 "submit_candidate_count": len(semantic_snapshot.submit_candidates),
                 "error_preview": semantic_snapshot.errors[:3],
+            },
+        )
+        self._step_log(
+            event="question_blocks_detected",
+            payload={
+                "step": self.step_count,
+                "count": len(question_blocks),
+                "sample": [
+                    {
+                        "question_id": qb.question_id,
+                        "question_text": qb.question_text[:140],
+                        "control_type": qb.control_type,
+                        "required": qb.required,
+                        "has_error": qb.has_error,
+                        "option_count": len(qb.options),
+                    }
+                    for qb in question_blocks[:6]
+                ],
+            },
+        )
+        self._step_log(
+            event="form_graph_generated",
+            payload={
+                "step": self.step_count,
+                "scope": form_graph.page_scope,
+                "field_count": len(form_graph.fields),
+                "question_count": len(form_graph.questions),
+                "required_unfilled_count": len(form_graph.required_unfilled),
+                "submit_candidate_count": len(form_graph.submit_refs),
             },
         )
         # region agent log
@@ -842,6 +990,23 @@ class BrowserAgent:
                     page_fingerprint=page_fingerprint,
                 )
 
+        # 2.7 终态硬判定（独立于 LLM JSON）：命中成功证据即直接收敛
+        done_now, done_reason = self._verify_completion()
+        if done_now:
+            self._step_log(
+                event="terminal_success_detected",
+                payload={
+                    "step": self.step_count,
+                    "source": "observe_pre_llm",
+                    "reason": done_reason,
+                },
+            )
+            return AgentState(
+                status="done",
+                summary=f"检测到提交成功终态：{done_reason}",
+                page_fingerprint=page_fingerprint,
+            )
+
         # 3. 获取页面 URL 并检测页面变化
         try:
             current_url = self.page.url
@@ -868,6 +1033,43 @@ class BrowserAgent:
                 "snapshot_preview": snapshot_text[:2000],
             },
         )
+
+        macro_action = self._maybe_get_macro_action(
+            snapshot_map=snapshot_map,
+            page_fingerprint=page_fingerprint,
+        )
+        if macro_action is not None:
+            remaining = [
+                line
+                for line in summarize_macro_tasks(self._macro_tasks)
+                if ":done:" not in line
+            ]
+            return AgentState(
+                status="continue",
+                summary="执行全局宏任务链中的当前步骤（语义树计划）",
+                next_action=macro_action,
+                action_plan=remaining[:5] if remaining else None,
+                page_fingerprint=page_fingerprint,
+            )
+        if self._macro_tasks:
+            pending = [t for t in self._macro_tasks if t.status != "done"]
+            if pending and all(t.status == "blocked" for t in pending):
+                blocked_summary = "; ".join(
+                    f"{t.task_id}:{t.mapping_reason or t.title}" for t in pending[:4]
+                )
+                self._step_log(
+                    "macro_plan_blocked",
+                    {
+                        "step": self.step_count,
+                        "blocked_tasks": [t.task_id for t in pending[:10]],
+                        "summary": blocked_summary,
+                    },
+                )
+                return AgentState(
+                    status="stuck",
+                    summary=f"宏任务链全部阻断，需人工处理：{blocked_summary}",
+                    page_fingerprint=page_fingerprint,
+                )
 
         cached_state = self._state_cache_by_fingerprint.get(page_fingerprint)
         if (
@@ -963,6 +1165,8 @@ class BrowserAgent:
             history_text=history_text,
             visible_text=visible_text,
             snapshot_text=snapshot_text,
+            question_blocks_text=question_blocks_text,
+            form_graph_text=form_graph_text,
             upload_signal_text=upload_signal_text,
             simplify_state=self.simplify_state,
             simplify_message=self.simplify_message,
@@ -1074,7 +1278,25 @@ class BrowserAgent:
 
         # 6. 解析返回
         data = self._safe_parse_json(raw)
-        if not data:
+        if not isinstance(data, dict):
+            if raw_response_implies_completion(raw):
+                done_from_raw, done_reason = self._verify_completion()
+                if done_from_raw:
+                    self._step_log(
+                        event="terminal_success_detected",
+                        payload={
+                            "step": self.step_count,
+                            "source": "raw_parse_fallback",
+                            "reason": done_reason,
+                            "raw_prefix": raw[:200],
+                        },
+                    )
+                    return AgentState(
+                        status="done",
+                        summary=f"检测到提交成功终态：{done_reason}",
+                        raw_response=raw,
+                        page_fingerprint=page_fingerprint,
+                    )
             self._log(f"❌ LLM 返回格式错误: {raw[:300]}", "error")
             # region agent log
             self._ndjson_log(
@@ -1141,6 +1363,7 @@ class BrowserAgent:
             if action.ref:
                 return self._execute_ref_action(action)
             self._log_action_executed(action, source="selector")
+            before_url, before_excerpt, before_fp = self._capture_page_change_markers()
             success = False
 
             if action.action == "click":
@@ -1162,21 +1385,49 @@ class BrowserAgent:
                         self._log_action_verified(action, ok=success)
                         return success
                 success = self._smart_click(action.selector, action.element_type)
+                if success:
+                    success = self._verify_non_ref_action_effect(
+                        action,
+                        before_url=before_url,
+                        before_excerpt=before_excerpt,
+                        before_fp=before_fp,
+                    )
                 self._log_action_verified(action, ok=success)
                 return success
 
             elif action.action == "fill":
                 success = self._smart_fill(action.selector, action.value)
+                if success:
+                    success = self._verify_non_ref_action_effect(
+                        action,
+                        before_url=before_url,
+                        before_excerpt=before_excerpt,
+                        before_fp=before_fp,
+                    )
                 self._log_action_verified(action, ok=success)
                 return success
 
             elif action.action == "type":
                 success = self._smart_type(action.selector, action.value)
+                if success:
+                    success = self._verify_non_ref_action_effect(
+                        action,
+                        before_url=before_url,
+                        before_excerpt=before_excerpt,
+                        before_fp=before_fp,
+                    )
                 self._log_action_verified(action, ok=success)
                 return success
 
             elif action.action == "select":
                 success = self._do_select(action.selector, action.value)
+                if success:
+                    success = self._verify_non_ref_action_effect(
+                        action,
+                        before_url=before_url,
+                        before_excerpt=before_excerpt,
+                        before_fp=before_fp,
+                    )
                 self._log_action_verified(action, ok=success)
                 return success
 
@@ -1244,6 +1495,69 @@ class BrowserAgent:
         # backward compatibility with existing log consumers
         self._step_log("action_verify", payload)
         self._step_log("action_verified", payload)
+
+    def _capture_page_change_markers(self) -> tuple[str, str, str]:
+        """抓取轻量页面标记用于非-ref 动作后验。"""
+        try:
+            before_url = self.page.url or ""
+        except Exception:
+            before_url = ""
+        try:
+            before_excerpt = (self.page.inner_text("body") or "")[:1200]
+        except Exception:
+            before_excerpt = ""
+        before_fp = ""
+        try:
+            _text, snap = build_ui_snapshot(self.page)
+            before_fp = self._build_page_fingerprint(before_url, snap)
+        except Exception:
+            before_fp = ""
+        return before_url, before_excerpt, before_fp
+
+    def _verify_non_ref_action_effect(
+        self,
+        action: AgentAction,
+        *,
+        before_url: str,
+        before_excerpt: str,
+        before_fp: str,
+    ) -> bool:
+        """非 ref 路径后验：URL / 语义快照 / 文本至少有一项变化。"""
+        if action.action not in ("click", "fill", "type", "select"):
+            return True
+        source_item = self._last_snapshot_map.get(action.ref or "")
+        if self._is_progression_action(action, item=source_item):
+            return True
+        if self._is_answer_click_action(action) and action.target_question:
+            expected = self._normalize_answer_label(action.selector)
+            if expected in ("yes", "no"):
+                return self._verify_question_answer_state(
+                    action.target_question, expected
+                )
+        try:
+            after_url = self.page.url or ""
+        except Exception:
+            after_url = ""
+        try:
+            after_excerpt = (self.page.inner_text("body") or "")[:1200]
+        except Exception:
+            after_excerpt = ""
+        after_fp = ""
+        try:
+            _text, snap = build_ui_snapshot(self.page)
+            after_fp = self._build_page_fingerprint(after_url, snap)
+        except Exception:
+            after_fp = ""
+        if before_url and after_url and before_url != after_url:
+            return True
+        if before_fp and after_fp and before_fp != after_fp:
+            return True
+        if before_excerpt and after_excerpt and before_excerpt != after_excerpt:
+            return True
+        if action.action in ("fill", "type", "select"):
+            # 输入类操作在某些站点不会立刻刷新文本，避免误判。
+            return True
+        return False
 
     def _execute_ref_action(self, action: AgentAction) -> bool:
         """基于快照 ref 执行动作（确定性定位）。"""
@@ -2268,6 +2582,14 @@ class BrowserAgent:
                 "ref": action.ref,
             },
         )
+        self._step_log(
+            "submission_classified",
+            {
+                "step": self.step_count,
+                "classification": outcome.classification,
+                "reason_code": outcome.reason_code,
+            },
+        )
         self._sync_failure_hints(outcome)
         if outcome.classification == "success_confirmed":
             return True, False
@@ -2314,6 +2636,21 @@ class BrowserAgent:
             )
             if retry_count >= self._submission_retry_limit:
                 return False, True
+            refresh_attempts = self._submission_refresh_attempts.get(key, 0)
+            if retry_count >= 2 and refresh_attempts < 1 and hasattr(self.page, "reload"):
+                refreshed = self._do_refresh(trigger="submission_blocked_recovery")
+                self._submission_refresh_attempts[key] = refresh_attempts + 1
+                self._step_log(
+                    "retry_policy_applied",
+                    {
+                        "step": self.step_count,
+                        "classification": outcome.classification,
+                        "reason_code": "refresh_recovery_attempt",
+                        "retry_count": retry_count,
+                        "semantic_key": key,
+                        "refreshed": bool(refreshed),
+                    },
+                )
             self._apply_humanized_retry_pacing()
             self.history.append(
                 f"步骤{self.step_count}: 提交受阻（{outcome.classification}），已执行合规重试节奏，下一步改策略"
@@ -2766,6 +3103,266 @@ class BrowserAgent:
             )
         return None
 
+    def _is_macro_action(self, action: AgentAction) -> bool:
+        return bool((action.reason or "").startswith("[macro:"))
+
+    def _macro_task_id_from_action(self, action: AgentAction) -> str:
+        reason = action.reason or ""
+        if not reason.startswith("[macro:"):
+            return ""
+        return reason.split("]", 1)[0].replace("[macro:", "").strip()
+
+    def _macro_task_retry_count(self, action: AgentAction) -> int:
+        task_id = self._macro_task_id_from_action(action)
+        if not task_id:
+            return 0
+        for task in self._macro_tasks:
+            if task.task_id == task_id:
+                return task.retry_count
+        return 0
+
+    def _find_question_block(self, task: MacroTask) -> QuestionBlock | None:
+        if not task.question_text:
+            return None
+        wanted = " ".join(task.question_text.lower().split())
+        for block in self._last_question_blocks:
+            current = " ".join((block.question_text or "").lower().split())
+            if current == wanted:
+                return block
+            if wanted and wanted in current:
+                return block
+            if current and current in wanted:
+                return block
+        return None
+
+    def _macro_task_completed(
+        self, task: MacroTask, snapshot_map: dict[str, SnapshotItem]
+    ) -> bool:
+        if task.status in ("done", "blocked"):
+            return task.status == "done"
+        if task.task_type == "combobox_select":
+            options_open = any(item.role == "option" for item in snapshot_map.values())
+            if options_open:
+                return False
+            # combobox 任务一旦进入执行态且下拉已关闭，视为本轮完成
+            return task.status == "in_progress"
+        block = self._find_question_block(task)
+        if not block:
+            return False
+        selected = {" ".join(x.lower().split()) for x in block.selected_options}
+        expected = {" ".join(x.lower().split()) for x in task.expected_options}
+        return bool(expected) and expected.issubset(selected)
+
+    def _macro_task_precondition_met(
+        self, task: MacroTask, snapshot_map: dict[str, SnapshotItem]
+    ) -> bool:
+        if task.task_type == "combobox_select":
+            if task.field_ref and task.field_ref in snapshot_map:
+                return True
+            return any(item.role == "combobox" for item in snapshot_map.values())
+        block = self._find_question_block(task)
+        return block is not None and bool(task.expected_options)
+
+    def _build_macro_action_for_task(
+        self, task: MacroTask, snapshot_map: dict[str, SnapshotItem]
+    ) -> AgentAction | None:
+        reason_prefix = f"[macro:{task.task_id}] "
+        if task.task_type == "combobox_select":
+            options = [it for it in snapshot_map.values() if it.role == "option"]
+            target = (task.target_value or "").strip()
+            if options:
+                target_norm = target.lower()
+                chosen = None
+                for opt in options:
+                    name = (opt.name or "").lower()
+                    if target_norm and (
+                        target_norm in name
+                        or name in target_norm
+                        or target_norm.split(",")[0].strip() in name
+                    ):
+                        chosen = opt
+                        break
+                if chosen is None:
+                    chosen = options[0]
+                return AgentAction(
+                    action="click",
+                    ref=chosen.ref,
+                    selector=chosen.name,
+                    element_type=chosen.role,
+                    reason=reason_prefix
+                    + "combobox options visible, select best matching option",
+                )
+            selector = task.field_selector or "Location"
+            return AgentAction(
+                action="type",
+                ref=task.field_ref,
+                selector=selector,
+                value=target,
+                element_type="combobox",
+                reason=reason_prefix + "type target value into combobox",
+            )
+
+        block = self._find_question_block(task)
+        if not block or not task.expected_options:
+            return None
+        selected = {" ".join(x.lower().split()) for x in block.selected_options}
+        for expected in task.expected_options:
+            expected_norm = " ".join(expected.lower().split())
+            if expected_norm in selected:
+                continue
+            target_opt = None
+            for opt in block.options:
+                if " ".join(opt.text.lower().split()) == expected_norm:
+                    target_opt = opt
+                    break
+            if target_opt is None:
+                continue
+            return AgentAction(
+                action="click",
+                ref=target_opt.ref_id,
+                selector=target_opt.text,
+                target_question=block.question_text,
+                element_type=target_opt.role,
+                reason=reason_prefix + "execute planned question option selection",
+            )
+        return None
+
+    def _maybe_get_macro_action(
+        self,
+        *,
+        snapshot_map: dict[str, SnapshotItem],
+        page_fingerprint: str,
+    ) -> AgentAction | None:
+        scope = self._stable_page_scope()
+        if scope != self._macro_scope:
+            self._macro_scope = scope
+            self._macro_tasks = []
+            self._active_macro_task_id = None
+
+        if not self._macro_tasks:
+            self._macro_tasks = build_macro_tasks(
+                profile=self._user_profile,
+                snapshot_map=snapshot_map,
+                question_blocks=self._last_question_blocks,
+            )
+            if self._macro_tasks:
+                self._step_log(
+                    "macro_plan_built",
+                    {
+                        "step": self.step_count,
+                        "scope": scope,
+                        "page_fingerprint": page_fingerprint[:32],
+                        "tasks": summarize_macro_tasks(self._macro_tasks),
+                    },
+                )
+                self._step_log(
+                    "plan_created",
+                    {
+                        "step": self.step_count,
+                        "scope": scope,
+                        "plan_type": "macro_task_chain",
+                        "task_count": len(self._macro_tasks),
+                    },
+                )
+
+        for task in self._macro_tasks:
+            if self._macro_task_completed(task, snapshot_map):
+                task.status = "done"
+                continue
+            if task.status == "blocked":
+                continue
+            if not self._macro_task_precondition_met(task, snapshot_map):
+                self._step_log(
+                    "macro_task_waiting_precondition",
+                    {
+                        "step": self.step_count,
+                        "task_id": task.task_id,
+                        "task_type": task.task_type,
+                        "precondition": task.precondition,
+                    },
+                )
+                continue
+            action = self._build_macro_action_for_task(task, snapshot_map)
+            if action is None:
+                task.status = "blocked"
+                continue
+            task.status = "in_progress"
+            self._active_macro_task_id = task.task_id
+            self._step_log(
+                "macro_task_selected",
+                {
+                    "step": self.step_count,
+                    "task_id": task.task_id,
+                    "task_type": task.task_type,
+                    "title": task.title,
+                    "mapping_reason": task.mapping_reason,
+                    "precondition": task.precondition,
+                    "postcondition": task.postcondition,
+                    "question_text": task.question_text,
+                    "expected_options": task.expected_options[:4],
+                    "target_value": task.target_value,
+                    "retry_count": task.retry_count,
+                },
+            )
+            self._step_log(
+                "task_selected",
+                {
+                    "step": self.step_count,
+                    "task_id": task.task_id,
+                    "task_type": task.task_type,
+                    "mapping_reason": task.mapping_reason,
+                },
+            )
+            return action
+        return None
+
+    def _on_macro_action_result(self, action: AgentAction, success: bool) -> None:
+        reason = action.reason or ""
+        if not reason.startswith("[macro:"):
+            return
+        task_id = reason.split("]", 1)[0].replace("[macro:", "").strip()
+        if not task_id:
+            return
+        for task in self._macro_tasks:
+            if task.task_id != task_id:
+                continue
+            if success:
+                # combobox type 后通常还需点 option，保留 in_progress；
+                # combobox click/问题点击成功后交由下一轮状态检测判定是否 done。
+                if task.task_type == "combobox_select" and action.action == "click":
+                    task.status = "in_progress"
+                else:
+                    task.status = "in_progress"
+                task.retry_count = 0
+            else:
+                task.retry_count += 1
+                if task.retry_count >= self._macro_retry_limit:
+                    task.status = "blocked"
+                    self._step_log(
+                        "macro_task_blocked",
+                        {
+                            "step": self.step_count,
+                            "task_id": task.task_id,
+                            "task_type": task.task_type,
+                            "reason": "retry_limit_exceeded",
+                            "retry_count": task.retry_count,
+                        },
+                    )
+            break
+
+    def _log_finalized(self, status: str, reason: str) -> None:
+        self._step_log(
+            "finalized",
+            {
+                "step": self.step_count,
+                "status": status,
+                "reason": (reason or "")[:280],
+                "failure_class_hint": self.failure_class_hint,
+                "failure_code_hint": self.failure_code_hint,
+                "retry_count_hint": self.retry_count_hint,
+            },
+        )
+
     def _step_log(self, event: str, payload: dict) -> None:
         """写入每步证据链日志。"""
         data = {
@@ -2933,55 +3530,10 @@ class BrowserAgent:
         return oc_looks_like_completion_text(lower_text)
 
     def _verify_completion(self) -> tuple[bool, str]:
-        """
-        二次验证：检查页面是否真的完成了申请。
-
-        关键逻辑：
-        1. 如果 Submit 按钮仍可见且没有成功消息 → 表单未提交
-        2. 排除浏览器扩展消息（如 "Autofill complete!"）的干扰
-        3. 必须有明确的成功消息才算完成
-
-        返回:
-            tuple[bool, str]: (是否真的完成, 验证信息)
-        """
+        """二次验证：多信号终态评分，避免“已提交仍继续操作”。"""
         try:
-            # 获取页面文本
-            body_text = self.page.inner_text("body").lower()
-
-            # 1. 检查是否有真正的成功标志（必须是网站返回的，不是扩展）
-            success_indicators = [
-                "thank you for applying",
-                "thanks for your application",
-                "application submitted",
-                "application received",
-                "successfully submitted",
-                "we have received your application",
-                "your application has been submitted",
-                "application complete",
-                "thanks for submitting",
-                "we'll be in touch",
-                "we will review your application",
-            ]
-
-            has_success = any(
-                indicator in body_text for indicator in success_indicators
-            )
-
-            # 2. 排除浏览器扩展的误报消息
-            extension_false_positives = [
-                "autofill complete",
-                "simplify",
-                "extension",
-                "chrome extension",
-            ]
-
-            # 如果页面只有扩展相关的"成功"消息，不算真正成功
-            if not has_success:
-                for fp in extension_false_positives:
-                    if fp in body_text and "complete" in body_text:
-                        self._log(f"   ⚠ 检测到扩展消息 '{fp}'，不是真正的申请成功")
-
-            # 3. 检查是否有错误标志
+            body_text = self.page.inner_text("body")
+            lower_text = body_text.lower()
             error_indicators = [
                 "this field is required",
                 "please fill",
@@ -2990,65 +3542,57 @@ class BrowserAgent:
                 "please complete",
                 "invalid",
             ]
-
-            has_error = False
-            for indicator in error_indicators:
-                if indicator in body_text:
-                    has_error = True
-                    break
-
-            # 4. 检查是否还有 Submit 按钮可见（关键检查！）
+            has_error = any(indicator in lower_text for indicator in error_indicators)
             has_submit_button = False
-            submit_button_checks = [
-                ("button", "Submit"),
-                ("button", "Submit Application"),
-                ("button", "Apply"),
-                ("button", "Submit your application"),
-            ]
-
-            for role, name in submit_button_checks:
-                try:
-                    submit_btn = self.page.get_by_role(role, name=name).first
-                    if submit_btn.is_visible(timeout=300):
-                        has_submit_button = True
-                        self._log(f"   🔍 检测到 Submit 按钮仍可见: '{name}'")
-                        break
-                except Exception:
-                    continue
-
-            # 也检查文本匹配
+            try:
+                _snapshot_text, _snapshot_map = build_ui_snapshot(self.page)
+                has_submit_button = any(
+                    item.role in ("button", "link")
+                    and any(
+                        kw in (item.name or "").lower()
+                        for kw in ("submit", "apply", "continue")
+                    )
+                    for item in _snapshot_map.values()
+                )
+            except Exception:
+                has_submit_button = False
             if not has_submit_button:
                 try:
-                    submit_text = self.page.get_by_text(
-                        "Submit Application", exact=False
-                    ).first
-                    if submit_text.is_visible(timeout=300):
+                    submit_btn = self.page.get_by_role("button", name="Submit").first
+                    if submit_btn.is_visible(timeout=300):
                         has_submit_button = True
-                        self._log("   🔍 检测到 Submit Application 文本仍可见")
                 except Exception:
                     pass
-
-            # 5. 综合判断
-            # 关键规则：如果 Submit 按钮仍可见且没有成功消息，表单肯定未提交
-            if has_submit_button and not has_success:
-                return False, "Submit 按钮仍可见，表单尚未提交"
-
+            try:
+                current_url = self.page.url
+            except Exception:
+                current_url = ""
+            assessment = oc_assess_completion_confidence(
+                body_text=body_text,
+                current_url=current_url,
+                has_submit_button=has_submit_button,
+                has_error=has_error,
+            )
+            self._step_log(
+                "terminal_completion_assessed",
+                {
+                    "step": self.step_count,
+                    "confirmed": assessment.confirmed,
+                    "score": assessment.score,
+                    "signals": assessment.signals,
+                },
+            )
+            if assessment.confirmed:
+                return True, f"终态评分通过(score={assessment.score:.2f})"
+            if bool(assessment.signals.get("external_blocked")):
+                return False, "检测到外部阻断信号，未完成提交"
             if has_error:
                 return False, "页面仍有错误提示，表单未完成"
-
-            if has_success and not has_error:
-                return True, "页面显示申请成功信息，无错误提示"
-
-            # 如果没有成功标志也没有 Submit 按钮，可能是跳转到了其他页面
-            if not has_success and not has_submit_button:
-                # 保守判断，可能需要继续观察
-                return False, "未检测到明确的成功信息，可能需要继续"
-
-            return False, "状态不确定，继续执行"
-
+            if has_submit_button and not bool(assessment.signals.get("success_text")):
+                return False, "Submit 按钮仍可见，表单尚未提交"
+            return False, f"终态评分不足(score={assessment.score:.2f})"
         except Exception as e:
             self._log(f"⚠ 二次验证出错: {e}", "warn")
-            # 验证出错时，保守返回 False
             return False, f"验证过程出错: {e}"
 
     def _compress_screenshot(self, png_bytes: bytes) -> bytes:
