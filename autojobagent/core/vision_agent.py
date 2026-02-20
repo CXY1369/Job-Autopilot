@@ -588,7 +588,9 @@ class BrowserAgent:
                     self._log("========== AI Agent 运行结束（语义循环熔断）==========")
                     self._log_finalized("manual_required", "semantic_loop_guard_stop")
                     return False
-                if (not is_macro_action) and self._should_skip_repeated_action(fp, action):
+                if (not is_macro_action) and self._should_skip_repeated_action(
+                    fp, action
+                ):
                     skip_key = self._action_fail_key(fp, action)
                     skip_count = self._repeated_skip_counts.get(skip_key, 0) + 1
                     self._repeated_skip_counts[skip_key] = skip_count
@@ -753,7 +755,9 @@ class BrowserAgent:
                         self._log(
                             "========== AI Agent 运行结束（刷新重试耗尽）=========="
                         )
-                        self._log_finalized("manual_required", "refresh_retries_exhausted")
+                        self._log_finalized(
+                            "manual_required", "refresh_retries_exhausted"
+                        )
                         return False
                     elif failure_path == "stop_max_failures":
                         self._set_manual_reason_hint(
@@ -2637,7 +2641,11 @@ class BrowserAgent:
             if retry_count >= self._submission_retry_limit:
                 return False, True
             refresh_attempts = self._submission_refresh_attempts.get(key, 0)
-            if retry_count >= 2 and refresh_attempts < 1 and hasattr(self.page, "reload"):
+            if (
+                retry_count >= 2
+                and refresh_attempts < 1
+                and hasattr(self.page, "reload")
+            ):
                 refreshed = self._do_refresh(trigger="submission_blocked_recovery")
                 self._submission_refresh_attempts[key] = refresh_attempts + 1
                 self._step_log(

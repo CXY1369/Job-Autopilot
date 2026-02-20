@@ -220,7 +220,9 @@ def test_intent_model_follows_fallback_order(monkeypatch):
         lambda _self: {"llm": {"fallback_models": ["gpt-4o", "gpt-4o-mini"]}},
     )
     agent = BrowserAgent(
-        page=_ObservePage("application page", "https://jobs.ashbyhq.com/suno/role/application"),
+        page=_ObservePage(
+            "application page", "https://jobs.ashbyhq.com/suno/role/application"
+        ),
         job=_DummyJob(),
     )
     assert agent.intent_model == "gpt-4o"

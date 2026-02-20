@@ -91,9 +91,7 @@ def test_build_form_graph_extracts_required_and_submit():
             required=True,
             value_hint="Xingyu",
         ),
-        "e3": SnapshotItem(
-            ref="e3", role="button", name="Submit Application", nth=0
-        ),
+        "e3": SnapshotItem(ref="e3", role="button", name="Submit Application", nth=0),
     }
     blocks = build_question_blocks(_TreePage(), snapshot_map)
     graph = build_form_graph(

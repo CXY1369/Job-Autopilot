@@ -10,7 +10,7 @@ def _qb(question: str, options: list[str], role: str = "button") -> QuestionBloc
         required=True,
         has_error=False,
         options=[
-            OptionNode(text=opt, role=role, selected=False, ref_id=f"e{i+1}")
+            OptionNode(text=opt, role=role, selected=False, ref_id=f"e{i + 1}")
             for i, opt in enumerate(options)
         ],
         selected_options=[],

@@ -404,7 +404,9 @@ def _resolve_question_mapping(
     )
 
     # Priority 1: office-like multi-selection questions
-    if _contains_any(lower_q, ["which office", "willing to work out of", "work out of"]):
+    if _contains_any(
+        lower_q, ["which office", "willing to work out of", "work out of"]
+    ):
         expected = _match_preferred_locations(
             question_options=options,
             preferred_locations=preferred_locations,
@@ -443,10 +445,9 @@ def build_macro_tasks(
     task_idx = 1
 
     location_cfg = profile.get("location", {}) if isinstance(profile, dict) else {}
-    target_location = (
-        (location_cfg.get("full_location") or "").strip()
-        or (location_cfg.get("current_city") or "").strip()
-    )
+    target_location = (location_cfg.get("full_location") or "").strip() or (
+        location_cfg.get("current_city") or ""
+    ).strip()
 
     # 1) Combobox location task
     if target_location:

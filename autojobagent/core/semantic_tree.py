@@ -58,7 +58,9 @@ def _normalize_text(value: str | None) -> str:
     return " ".join((value or "").split()).strip()
 
 
-def _snapshot_ref_lookup(snapshot_map: dict[str, SnapshotItem]) -> dict[tuple[str, str], list[str]]:
+def _snapshot_ref_lookup(
+    snapshot_map: dict[str, SnapshotItem],
+) -> dict[tuple[str, str], list[str]]:
     out: dict[tuple[str, str], list[str]] = {}
     for ref, item in snapshot_map.items():
         key = (item.role.strip().lower(), _normalize_text(item.name).lower())
@@ -79,7 +81,9 @@ def _try_consume_ref(
     return refs.pop(0)
 
 
-def build_question_blocks(page, snapshot_map: dict[str, SnapshotItem]) -> list[QuestionBlock]:
+def build_question_blocks(
+    page, snapshot_map: dict[str, SnapshotItem]
+) -> list[QuestionBlock]:
     """
     从页面中提取问题块（单选/多选/按钮组选项）。
     失败时返回空列表，保证不影响主流程。
@@ -244,7 +248,9 @@ def build_question_blocks(page, snapshot_map: dict[str, SnapshotItem]) -> list[Q
         block = QuestionBlock(
             question_id=f"q{idx}",
             question_text=question_text,
-            control_type=_normalize_text(str(raw.get("control_type") or "choice_group")),
+            control_type=_normalize_text(
+                str(raw.get("control_type") or "choice_group")
+            ),
             required=bool(raw.get("required", False)),
             has_error=bool(raw.get("has_error", False)),
             options=options,
@@ -261,7 +267,9 @@ def format_question_blocks(question_blocks: list[QuestionBlock]) -> str:
     for block in question_blocks[:8]:
         required = "required" if block.required else "optional"
         err = "error" if block.has_error else "ok"
-        selected = ", ".join(block.selected_options[:3]) if block.selected_options else "none"
+        selected = (
+            ", ".join(block.selected_options[:3]) if block.selected_options else "none"
+        )
         lines.append(
             f"- [{block.question_id}] {block.question_text} ({block.control_type}, {required}, {err}, selected={selected})"
         )
