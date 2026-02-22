@@ -3,7 +3,7 @@
 ## Metadata
 
 - `project_name`: `Job Autopilot - Auto Application Agent`
-- `last_updated_utc`: `2026-02-19`
+- `last_updated_utc`: `2026-02-21`
 - `primary_language`: `Python`
 - `runtime_stack`: `FastAPI + Playwright + OpenAI + SQLite`
 - `document_purpose`: `维护进度、实现细节与后续规划（AI/人类共读）`
@@ -12,9 +12,9 @@
 
 - 当前状态：`Active / Usable`
 - CI 状态：`Green`（`Lint + Core Tests + Full Tests`）
-- 自动化测试：`60 passed`
+- 自动化测试：`119 passed`
 - 架构定位：`AI 决策 + 规则护栏`
-- 关键新增能力：`提交结果分类、有限重试状态机、稳定语义熔断键、失败治理字段/API/看板`
+- 关键新增能力：`提交结果分类、有限重试状态机、稳定语义熔断键、失败治理字段/API/看板、Failure Memory（案例记忆）`
 - V2.1 蓝图：`docs/V2_ARCHITECTURE_BLUEPRINT.md`（语义优先、视觉兜底、Assist 可选）
 
 ## Scope and Goals
@@ -218,6 +218,19 @@
 - 快照层增加 Assist 面板降权隔离（避免 Simplify 侧栏污染主页面决策）
 - 回归测试新增覆盖并通过（总计 `54 passed`）
 
+### Milestone M - Cross-Site Form Stabilization (Root Cause Fix)
+
+- `question_multi` 改为“增量选择”执行：每步仅点击未完成选项，已选项 no-op，避免 toggle 回退
+- 问题选项后验升级为“节点级校验”：`checked/aria-checked/aria-pressed/data-state/class` 综合判定
+- 点击后增加短等待与重采样，降低“点击成功但后验竞态失败”
+- 视觉补齐只做缺漏补全，新增语义去重：避免重复追加 `inference_required`
+- 宏任务在“无动作但已满足后验”场景下不再误判 `blocked`
+- 新增测试覆盖：
+  - 多选任务跳过已选项
+  - 选项节点级后验
+  - 视觉补齐去重
+- 全量回归：`PYTHONPATH=. pytest -q` -> `108 passed`
+
 ### Milestone I - Diagnostics and Replay Hardening
 
 - `GET /api/jobs/{id}/diagnostics` 新增 `visual_fallback` 统计摘要（used/budget/exhausted/recent decisions）
@@ -401,3 +414,91 @@
 - 扩充“成功/错误文案词库”的可配置化
 - 增加针对 `manual_reason` 的统计和聚类分析，持续降人工率
 - 建立更细粒度的 e2e 回归场景库
+
+### Milestone V - V2.6 Root-Cause Fix Pack (Upload Timing + Visual Cross-Audit + Inference Required)
+
+- 修复“宏任务提前 return 导致上传信号未更新”的时序根因：
+  - 在宏任务决策前统一刷新运行时信号（`runtime_signals_refreshed`）
+  - `upload` 执行增加 DOM override：即使文本信号为空，只要可定位 `file input` 仍可继续上传
+- 新/刷新页面初始规划增加“一次强制截图交叉审计”：
+  - 引入 `VisualAuditResult`，将截图识别出的必填字段/必答问题/必传附件与语义快照合并
+  - 新增事件：`plan_visual_audit_started`、`plan_visual_audit_merged`、`execution_queue_augmented_by_visual_audit`
+- 宏任务新增 `inference_required`：
+  - 对“未映射但必答问题”不再静默跳过
+  - 先规则推断，再 LLM 结构化推断选项；失败走受控升级
+- 简历上传值优先级已固定：
+  - 宏任务 `upload Resume` 优先使用 `job.resume_used`，与 JD 匹配结果强绑定
+- 终端可观测性增强：
+  - 初始规划前新增两条输出并保持在状态/计划之前：
+    - `检测页面必填项DOM元素: ...`
+    - `根据AI视觉理解简单描述页面截图内容: ...`
+
+### Milestone W - V2.6 Scope-Hardening Fix Pack (Question Scope + Upload Lock)
+
+- 问题作用域后验收紧：
+  - `question` 选项状态检测改为“最小问题容器优先”，避免回退整页宽容器导致跨题污染
+  - `question_single` 完成判定升级为目标选项节点级硬校验，不再仅凭模糊 `selected_options` 命中
+  - 新增 `scope_kind/scope_control_count` 到 `answer_binding_attempt` 证据，便于追踪作用域质量
+- 上传任务去重强化：
+  - `file_upload` 成功后写入任务锁（当前 scope），直接判定任务完成，避免前端状态延迟触发重复上传
+  - 页面刷新时清理上传锁，确保重开流程可重新上传
+- 可观测性与一致性：
+  - `ref` 路径 `upload/scroll/refresh/wait` 统一补发 `action_verified`
+  - 新增 `macro_task_completion_decision` 与 `upload_task_locked` 事件
+- 测试补充：
+  - `question_single` 不因跨题 `Yes/No` 污染误判完成
+  - 上传成功后任务锁定完成
+  - `ref upload` 产出 `action_verified`
+- 当前回归结果：`PYTHONPATH=. pytest -q` 全绿（`108 passed`）
+
+### Milestone X - V2.7 Completeness Gate + Deadlock Breaker (Unmapped Questions)
+
+- 计划完备性门控（`vision_agent.py`）：
+  - 新增 `plan_completeness_checked` 事件，在宏任务建链与刷新增量后都执行覆盖审计。
+  - 自动补齐“语义块中可交互但未覆盖”的问题任务，避免检测到了却未入队的静默漏题。
+- 视觉补齐去幻影任务（`vision_agent.py`）：
+  - `execution_queue_augmented_by_visual_audit` 仅在能匹配到语义问题块时才追加任务。
+  - 无法匹配到语义块的视觉问题仅记录缺口，不再盲目创建 `inference_required` 卡死队列。
+- 宏任务前置条件熔断（`vision_agent.py`）：
+  - 新增 `wait_count` 与 precondition 超时阻断（默认 3 次），事件 `macro_task_blocked(reason=precondition_timeout)`。
+  - 避免 `question_block_present` 长期不满足导致 50 步空转。
+- 通用问题映射增强（`macro_tasks.py`）：
+  - 未命中规则的问题（即使 `required=false`）不再直接跳过，生成 `inference_required`，提高新页面泛化覆盖。
+  - 有 `combobox` 位置任务时，过滤 `Location` 类伪问题，避免把下拉候选误当独立题目。
+  - 增加“经验描述”类开放题默认映射（`common_answers.experience_summary` 或生成兜底文案）。
+- 计划键稳定性增强（`vision_agent.py`）：
+  - question 任务 identity key 改为语义归一，减少同义问题文本差异导致的重复入队。
+- 测试补充：
+  - `tests/test_macro_tasks.py`
+    - 未映射可选题不再静默跳过
+    - 经验描述类字段自动填充映射
+  - `tests/test_vision_agent_error_gate.py`
+    - visual 补齐跳过无语义块匹配问题
+    - precondition 超时会阻断 inference 任务
+- 回归结果：
+  - `PYTHONPATH=. pytest -q`：`115 passed`
+  - `ruff check`：`All checks passed`
+
+### Milestone Y - V2.8 Failure Memory System (Case-Based Learning + Replay Foundation)
+
+- 新增失败记忆模块：`autojobagent/core/failure_memory.py`
+  - 结构化存储：`autojobagent/storage/memory/failure_memory.ndjson`
+  - 关键字段：`signature/page_scope/classification/reason_code/symptom/root_cause/successful_strategy/guardrails/hit_count`
+  - 动态路径归一：将路径中的 UUID/长数字掩码，提升跨岗位复用能力
+- 记忆写入接线（`vision_agent.py`）：
+  - `submission_outcome_classified` 后自动 upsert（非 success）
+  - `macro_task_blocked`（`precondition_timeout` / `retry_limit_exceeded`）自动 upsert
+  - `finalized(status=manual_required)` 自动 upsert
+- 记忆读取接线（`vision_agent.py` + `prompt_builder.py`）：
+  - 每步 `_observe_and_think` 在 LLM 调用前检索相似失败案例并生成提示
+  - 新增事件：`failure_memory_hints_loaded`
+  - 终端新增：`🧠 Failure Memory 提示: ...`
+  - Prompt 新增 `Failure Memory` 段，指导模型优先复用已验证策略并保持后验校验
+- 隐私与仓库控制：
+  - `autojobagent/storage/memory/` 已加入 `.gitignore`（运行期记忆不入库）
+- 测试新增：
+  - `tests/test_failure_memory.py`（upsert/query/signature 归一）
+  - `tests/test_vision_agent_error_gate.py` 补充记忆写入/读取接线测试
+- 回归结果：
+  - `PYTHONPATH=. pytest -q`：`119 passed`
+  - `ruff check`：`All checks passed`

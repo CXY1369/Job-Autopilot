@@ -197,6 +197,7 @@ def build_user_prompt(
     assist_required_after: int,
     assist_prefill_delta: int,
     assist_prefill_verified: bool,
+    failure_memory_text: str,
     upload_candidates_text: str,
     is_new_page: bool,
 ) -> str:
@@ -229,6 +230,11 @@ def build_user_prompt(
   - delta: {assist_prefill_delta}
   - verified: {assist_prefill_verified}
   - 规则：只有 verified=true 或 delta>0 时，才能声称“已自动填好”
+
+## Failure Memory（历史失败案例与已验证策略）
+{failure_memory_text}
+- 规则：优先复用已验证策略；若当前证据与案例冲突，以当前页面证据为准。
+- 规则：禁止机械套用案例，必须通过本页后验验证。
 
 ## 白名单可上传候选文件（仅可从以下文件中选择）
 {upload_candidates_text}

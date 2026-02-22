@@ -4,7 +4,7 @@
 
 - `project`: `Job Autopilot - Auto Application Agent`
 - `version`: `v2.1-blueprint`
-- `date_utc`: `2026-02-19`
+- `date_utc`: `2026-02-21`
 - `status`: `Approved for implementation`
 - `owner`: `Agent + Human co-design`
 
@@ -152,6 +152,21 @@ V2.1 的目标不是修单站点，而是建立可迁移的通用执行范式：
 - `assist_invoked`
 - `assist_effect_evaluated`
 
+### 3.9 Failure Memory Layer
+
+目标：把“历史失败 -> 可复用策略”固化为运行期记忆，避免同类问题反复试错。
+
+- 存储：`autojobagent/storage/memory/failure_memory.ndjson`（运行期文件，默认不入库）
+- 主键签名：`page_scope + classification + reason_code + question_text + action`
+- 归一策略：路径中的 UUID/长数字掩码，提升跨岗位复用
+- 写入时机：
+  - `submission_outcome_classified` 且结果非 `success_confirmed`
+  - `macro_task_blocked`（如 `precondition_timeout/retry_limit_exceeded`）
+  - `finalized(status=manual_required)`
+- 读取时机：
+  - 每步 LLM 调用前按当前 `page_scope + question_blocks + outcome` 检索相似案例
+  - 注入 Prompt 的 `Failure Memory` 段，作为“优先复用、但必须后验验证”的软约束
+
 ## 4) Interface Contracts (Python)
 
 ```python
@@ -215,12 +230,16 @@ class SubmissionOutcome:
 1. `set_radio/set_checkbox`
 - 验证：同组目标项 `checked=true`，且冲突项取消。
 - 若绑定问题存在，校验对应问题块错误提示下降。
+- 多选执行采用增量集合策略：`remaining = expected - selected`，已选项直接 no-op，禁止重复 toggle。
+- 节点级后验优先：目标选项节点必须命中 `checked/aria-checked/aria-pressed/data-state/class(selected)` 之一。
+- 作用域约束：成功判定仅允许在“最小问题容器”内进行，整页容器仅可用于候选发现，不可用于后验通过。
 
 2. `type_ref`
 - 验证：value 非空且与目标值匹配（允许归一化）。
 
 3. `upload_file`
 - 验证：文件名展示或 input files count > 0。
+- 上传锁存：上传动作成功后将该上传任务在当前 scope 标记为 completed，避免 UI 延迟导致重复上传。
 
 4. `submit`
 - 验证：进入 `VERIFY_OUTCOME`，必须产出 `SubmissionOutcome`。
@@ -342,3 +361,52 @@ class SubmissionOutcome:
 
 5. `Plugin isolation`
 - Simplify 面板区域在快照中降权或隔离，避免污染主页面交互决策。
+
+## 14) Implementation Sync (2026-02-21)
+
+本节用于对齐蓝图与当前代码实现，避免“方案已写但主流程未接线”。
+
+1. 上传时序根因修复（已实现）
+- 宏任务路径前置刷新运行时上传信号，避免读取旧状态。
+- 上传执行增加 DOM 兜底：信号为空但可定位 `file input` 时继续执行上传。
+
+2. 新/刷新页面初始规划交叉校验（已实现）
+- 每个页面 scope 初次建宏任务链时，强制执行一次截图交叉审计（与语义快照合并）。
+- 刷新后下一次建链强制重新审计，不复用旧审计缓存。
+
+3. 未映射必答问题治理（已实现）
+- 新增宏任务类型 `inference_required`。
+- 对 required 且未命中规则的问题，进入推断任务，不再静默跳过。
+
+4. 终端叙事链路增强（已实现）
+- 在每步状态/计划之前固定输出：
+  - `检测页面必填项DOM元素: ...`
+  - `根据AI视觉理解简单描述页面截图内容: ...`
+- 保持后续 `状态/计划序列/风险` 输出顺序。
+
+5. 与蓝图一致性说明
+- 主路径保持“语义优先”；截图用于关键节点交叉审计与冲突兜底。
+- 未引入站点专用硬编码主路径，继续沿用规则 + 推断 + 状态机升级策略。
+
+## 15) Implementation Sync (2026-02-21, Iteration B)
+
+1. 计划完备性门控（已接线）
+- 宏任务建链后增加 `plan_completeness_checked`，覆盖审计“可交互问题是否均有可执行任务”。
+- 对语义树中未覆盖的问题自动补齐任务，避免“检测到问题但未入队”。
+
+2. 视觉补齐防幻影任务（已接线）
+- visual-required question 仅在能匹配到语义问题块时才追加任务。
+- 无语义块匹配时不再盲目创建 `inference_required`，避免 precondition 永久不满足。
+
+3. 前置条件死锁熔断（已接线）
+- `MacroTask` 增加 `wait_count`；`question_block_present` 等前置条件连续等待超阈值后自动 `blocked`。
+- 统一写入 `macro_task_blocked(reason=precondition_timeout)`，用于诊断与回放。
+
+4. 问题映射泛化增强（已接线）
+- 未映射 choice question（含 `required=false`）不再默认跳过，统一进入 `inference_required`。
+- 对 `Location` + combobox 场景做通用去伪问题过滤，防止下拉候选污染任务链。
+- 新增经验描述类开放题映射：`common_answers.experience_summary` + 生成式兜底。
+
+5. 去重稳定性（已接线）
+- question/inference identity key 改为语义归一文本，降低同义文本导致重复入队概率。
+- visual augmentation 去重从“精确文本”升级到“语义相似度”。

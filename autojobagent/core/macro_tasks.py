@@ -23,6 +23,78 @@ def _contains_any(text: str, keywords: list[str]) -> bool:
     return any(k in text for k in keywords)
 
 
+def _looks_required_label(label: str) -> bool:
+    return bool(_norm(label).endswith("*"))
+
+
+def _is_resume_upload_label(label: str) -> bool:
+    lower = _norm(label)
+    if not lower:
+        return False
+    return "resume" in lower or lower == "cv" or "curriculum vitae" in lower
+
+
+def _is_cover_letter_label(label: str) -> bool:
+    return "cover letter" in _norm(label)
+
+
+def _is_upload_label(label: str) -> bool:
+    lower = _norm(label)
+    if not lower:
+        return False
+    return _contains_any(
+        lower,
+        ["upload", "attach", "drop file", "drag and drop", "choose file", "replace"],
+    )
+
+
+def _is_optional_prompt_label(label: str) -> bool:
+    lower = _norm(label)
+    return _contains_any(
+        lower,
+        [
+            "why",
+            "interested",
+            "motivation",
+            "cover letter",
+            "skills",
+            "experience",
+            "about you",
+        ],
+    )
+
+
+def _is_location_question_label(label: str) -> bool:
+    lower = _norm(label)
+    if not lower:
+        return False
+    return lower in ("location", "start typing...") or _contains_any(
+        lower,
+        [
+            "where are you located",
+            "your location",
+            "current location",
+            "location preference",
+        ],
+    )
+
+
+def _preferred_resume_value(
+    profile: dict,
+    preferred_resume_path: str | None = None,
+) -> str | None:
+    preferred = str(preferred_resume_path or "").strip()
+    if preferred:
+        return preferred
+    if not isinstance(profile, dict):
+        return None
+    files = profile.get("files", {})
+    if not isinstance(files, dict):
+        return None
+    value = str(files.get("default_resume") or "").strip()
+    return value or None
+
+
 def _city_seed(text: str | None) -> str:
     value = _norm(text)
     if not value:
@@ -181,7 +253,7 @@ def _pick_by_candidates(options: list[str], candidates: list[str]) -> str | None
 @dataclass
 class MacroTask:
     task_id: str
-    task_type: str  # combobox_select | question_single | question_multi
+    task_type: str  # combobox_select | field_fill | field_fill_optional | question_single | question_multi | inference_required | file_upload | manual_required
     title: str
     question_text: str | None = None
     field_ref: str | None = None
@@ -193,6 +265,10 @@ class MacroTask:
     postcondition: str | None = None
     status: str = "pending"  # pending | in_progress | done | blocked
     retry_count: int = 0
+    wait_count: int = 0
+    completed_options: list[str] = field(default_factory=list)
+    last_attempt_option: str | None = None
+    required: bool = False
 
 
 @dataclass(frozen=True)
@@ -206,20 +282,20 @@ class MappingRule:
 
 _MAPPING_RULES: tuple[MappingRule, ...] = (
     MappingRule(
-        rule_id="authorized_to_work",
-        keywords=(
-            "authorized to work",
-            "legally authorized",
-            "work in the united states",
-        ),
-        value_type="bool",
-        profile_path=("work_authorization", "authorized_to_work_in_us"),
-    ),
-    MappingRule(
         rule_id="visa_sponsorship",
         keywords=("visa sponsorship", "require sponsorship", "need sponsorship"),
         value_type="bool",
         profile_path=("work_authorization", "require_visa_sponsorship"),
+    ),
+    MappingRule(
+        rule_id="authorized_to_work",
+        keywords=(
+            "authorized to work",
+            "legally authorized",
+            "employment authorized",
+        ),
+        value_type="bool",
+        profile_path=("work_authorization", "authorized_to_work_in_us"),
     ),
     MappingRule(
         rule_id="willing_relocate",
@@ -306,6 +382,147 @@ _MAPPING_RULES: tuple[MappingRule, ...] = (
         profile_path=("common_answers", "referral_source"),
     ),
 )
+
+
+def _build_generic_motivation(profile: dict) -> str:
+    skills = profile.get("skills", {}) if isinstance(profile, dict) else {}
+    domains = skills.get("domains", []) if isinstance(skills, dict) else []
+    domain_text = ""
+    if isinstance(domains, list):
+        picked = [str(x).strip() for x in domains if str(x).strip()][:2]
+        if picked:
+            domain_text = " and ".join(picked)
+    experience = profile.get("experience", {}) if isinstance(profile, dict) else {}
+    current_title = ""
+    if isinstance(experience, dict):
+        current_title = str(experience.get("current_title") or "").strip()
+    if domain_text:
+        return (
+            f"I am excited about this opportunity and can contribute with strong "
+            f"experience in {domain_text}."
+        )
+    if current_title:
+        return (
+            f"I am excited about this opportunity and believe my background as "
+            f"{current_title} aligns well with this role."
+        )
+    return "I am excited about this opportunity and believe I can add meaningful value to the team."
+
+
+def _build_generic_experience_summary(profile: dict) -> str:
+    experience = profile.get("experience", {}) if isinstance(profile, dict) else {}
+    current_title = ""
+    years = ""
+    if isinstance(experience, dict):
+        current_title = str(experience.get("current_title") or "").strip()
+        years = str(experience.get("years_total") or "").strip()
+    skills = profile.get("skills", {}) if isinstance(profile, dict) else {}
+    domains = skills.get("domains", []) if isinstance(skills, dict) else []
+    domain_text = ""
+    if isinstance(domains, list):
+        picked = [str(x).strip() for x in domains if str(x).strip()][:2]
+        if picked:
+            domain_text = " and ".join(picked)
+
+    sentence = "I have hands-on experience delivering end-to-end initiatives"
+    if years:
+        sentence = f"I have {years} years of hands-on experience delivering end-to-end initiatives"
+    if current_title:
+        sentence += f" as a {current_title}"
+    if domain_text:
+        sentence += f", especially in {domain_text}"
+    return sentence + "."
+
+
+def _resolve_text_field_mapping(
+    *,
+    profile: dict,
+    field_label: str,
+    input_type: str | None,
+) -> tuple[str | None, str | None]:
+    common = profile.get("common_answers", {}) if isinstance(profile, dict) else {}
+    lower = _norm(field_label)
+    in_type = _norm(input_type)
+
+    def _pick(path: tuple[str, ...]) -> str:
+        value = _get_path(profile, path, "")
+        return str(value or "").strip()
+
+    if in_type == "email" or "email" in lower:
+        value = _pick(("personal", "email"))
+        if value:
+            return value, "personal.email"
+    if "first name" in lower:
+        value = _pick(("personal", "first_name"))
+        if value:
+            return value, "personal.first_name"
+    if "last name" in lower:
+        value = _pick(("personal", "last_name"))
+        if value:
+            return value, "personal.last_name"
+    if "name" in lower:
+        value = _pick(("personal", "full_name"))
+        if value:
+            return value, "personal.full_name"
+    if any(k in lower for k in ("phone", "mobile", "telephone")):
+        value = _pick(("personal", "phone"))
+        if value:
+            return value, "personal.phone"
+    if any(k in lower for k in ("linkedin", "linked in")):
+        value = _pick(("personal", "linkedin"))
+        if value:
+            return value, "personal.linkedin"
+    if any(k in lower for k in ("website", "portfolio", "github")):
+        value = _pick(("personal", "website"))
+        if value:
+            return value, "personal.website"
+    if "location" in lower:
+        value = _pick(("location", "full_location")) or _pick(("location", "current_city"))
+        if value:
+            return value, "location.full_location"
+    if any(k in lower for k in ("why", "interested", "motivation", "cover letter")):
+        value = ""
+        if isinstance(common, dict):
+            value = str(
+                common.get("why_this_company")
+                or common.get("why_interested")
+                or common.get("motivation")
+                or ""
+            ).strip()
+        if not value:
+            value = _build_generic_motivation(profile)
+        if value:
+            return value, "common_answers.why_or_motivation"
+    if _contains_any(
+        lower,
+        [
+            "describe your work experience",
+            "tell us about your experience",
+            "relevant experience",
+            "in a couple sentences",
+            "in 4 sentences or fewer",
+            "4 sentences or fewer",
+            "briefly describe",
+        ],
+    ):
+        value = ""
+        if isinstance(common, dict):
+            value = str(
+                common.get("experience_summary_short")
+                or common.get("experience_summary")
+                or common.get("relevant_experience")
+                or ""
+            ).strip()
+        if not value:
+            value = _build_generic_experience_summary(profile)
+        if value:
+            return value, "common_answers.experience_summary"
+    # 有些站点把 LinkedIn 放在普通文本字段名里，做最后一次兜底
+    if "profile" in lower and ("link" in lower or "url" in lower):
+        value = _pick(("personal", "linkedin")) or _pick(("personal", "website"))
+        if value:
+            return value, "personal.profile_link"
+    return None, None
 
 
 def _resolve_rule_mapping(
@@ -440,6 +657,7 @@ def build_macro_tasks(
     profile: dict,
     snapshot_map: dict[str, SnapshotItem],
     question_blocks: list[QuestionBlock],
+    preferred_resume_path: str | None = None,
 ) -> list[MacroTask]:
     tasks: list[MacroTask] = []
     task_idx = 1
@@ -469,10 +687,191 @@ def build_macro_tasks(
             )
             task_idx += 1
 
-    # 2) Question tasks from semantic blocks (generalized option mapper)
+    # 2) Required/optional text field fill tasks (deterministic, profile-driven)
+    for item in sorted(snapshot_map.values(), key=lambda x: x.ref):
+        if item.role != "textbox":
+            continue
+        if _norm(item.value_hint):
+            continue
+        label = (item.name or "").strip()
+        input_type = (item.input_type or "").strip().lower()
+        if input_type == "file":
+            continue
+        if _contains_any(_norm(label), ["resume", "cv", "upload"]):
+            continue
+        is_required = bool(item.required) or _looks_required_label(label)
+        value, reason = _resolve_text_field_mapping(
+            profile=profile,
+            field_label=label,
+            input_type=input_type,
+        )
+        if not value:
+            continue
+        if not is_required and not _is_optional_prompt_label(label):
+            continue
+        task_type = "field_fill" if is_required else "field_fill_optional"
+        title = (
+            "Fill required field from profile"
+            if is_required
+            else "Fill optional prompt field from profile"
+        )
+        precondition = (
+            "required_text_field_empty" if is_required else "optional_text_field_empty"
+        )
+        tasks.append(
+            MacroTask(
+                task_id=f"t{task_idx}",
+                task_type=task_type,
+                title=title,
+                field_ref=item.ref,
+                field_selector=label,
+                target_value=value,
+                mapping_reason=reason,
+                precondition=precondition,
+                postcondition="field_value_filled",
+            )
+        )
+        task_idx += 1
+
+    # 3) Upload handling policy:
+    # - Resume/CV upload is always treated as mandatory.
+    # - Required non-resume file upload => manual_required.
+    # - Cover letter file upload: required => manual_required, optional => skip.
+    has_replace_btn = any(
+        item.role == "button" and "replace" in _norm(item.name)
+        for item in snapshot_map.values()
+    )
+    preferred_resume = _preferred_resume_value(profile, preferred_resume_path)
+    resume_task_added = False
+    for item in sorted(snapshot_map.values(), key=lambda x: x.ref):
+        role = (item.role or "").strip().lower()
+        input_type = (item.input_type or "").strip().lower()
+        is_file_like = role == "file_input" or input_type == "file"
+        if not is_file_like:
+            continue
+        label = (item.name or "").strip()
+        if not label:
+            continue
+        is_required = bool(item.required) or _looks_required_label(label)
+        if _is_cover_letter_label(label):
+            if is_required:
+                tasks.append(
+                    MacroTask(
+                        task_id=f"t{task_idx}",
+                        task_type="manual_required",
+                        title="Required cover letter upload requires manual handling",
+                        field_ref=item.ref,
+                        field_selector=label,
+                        mapping_reason="required_cover_letter_upload",
+                        precondition="required_file_upload_present",
+                        postcondition="manual_required",
+                    )
+                )
+                task_idx += 1
+            continue
+        if _is_resume_upload_label(label):
+            if has_replace_btn:
+                continue
+            if not resume_task_added:
+                tasks.append(
+                    MacroTask(
+                        task_id=f"t{task_idx}",
+                        task_type="file_upload",
+                        title="Upload required resume",
+                        field_ref=item.ref,
+                        field_selector=label,
+                        target_value=preferred_resume,
+                        mapping_reason="required_resume_upload",
+                        precondition="resume_upload_needed",
+                        postcondition="file_uploaded",
+                    )
+                )
+                task_idx += 1
+                resume_task_added = True
+            continue
+        if is_required:
+            tasks.append(
+                MacroTask(
+                    task_id=f"t{task_idx}",
+                    task_type="manual_required",
+                    title="Unsupported required file upload",
+                    field_ref=item.ref,
+                    field_selector=label,
+                    mapping_reason="required_non_resume_upload",
+                    precondition="required_file_upload_present",
+                    postcondition="manual_required",
+                )
+            )
+            task_idx += 1
+
+    if not resume_task_added and not has_replace_btn:
+        resume_buttons = [
+            item
+            for item in snapshot_map.values()
+            if item.role == "button"
+            and _is_upload_label(item.name)
+            and (
+                "resume" in _norm(item.name)
+                or "upload file" in _norm(item.name)
+                or "upload cv" in _norm(item.name)
+            )
+        ]
+        if resume_buttons:
+            target = sorted(resume_buttons, key=lambda x: x.ref)[0]
+            tasks.append(
+                MacroTask(
+                    task_id=f"t{task_idx}",
+                    task_type="file_upload",
+                    title="Upload required resume",
+                    field_ref=target.ref,
+                    field_selector=target.name,
+                    target_value=preferred_resume,
+                    mapping_reason="required_resume_upload_button_fallback",
+                    precondition="resume_upload_needed",
+                    postcondition="file_uploaded",
+                )
+            )
+            task_idx += 1
+
+    # 4) Question tasks from semantic blocks (generalized option mapper)
+    has_location_task = any(t.task_type == "combobox_select" for t in tasks)
+    seen_question_signatures: set[str] = set()
     for qb in question_blocks:
+        signature = _norm(qb.question_text)
+        if not signature or signature in seen_question_signatures:
+            continue
+        seen_question_signatures.add(signature)
+        if has_location_task and _is_location_question_label(qb.question_text):
+            # Location 已由 combobox 任务覆盖，避免把下拉候选误当成独立问题。
+            continue
         expected, reason = _resolve_question_mapping(qb=qb, profile=profile)
         if not expected:
+            inferred_options = [opt.text for opt in qb.options if opt.text][:8]
+            if len(inferred_options) < 2:
+                continue
+            mapping_reason = (
+                "inference_required_unmapped"
+                if qb.required
+                else "inference_unmapped_question"
+            )
+            tasks.append(
+                MacroTask(
+                    task_id=f"t{task_idx}",
+                    task_type="inference_required",
+                    title="Infer answer for unmapped question",
+                    question_text=qb.question_text,
+                    expected_options=inferred_options,
+                    mapping_reason=mapping_reason,
+                    precondition="question_block_present",
+                    postcondition=(
+                        "required_question_answered"
+                        if qb.required
+                        else "question_answered"
+                    ),
+                    required=bool(qb.required),
+                )
+            )
+            task_idx += 1
             continue
         option_roles = {(_norm(opt.role) or "button") for opt in qb.options}
         is_multi = len(expected) > 1 or "checkbox" in option_roles
@@ -487,6 +886,7 @@ def build_macro_tasks(
                 mapping_reason=reason,
                 precondition="question_block_present",
                 postcondition="expected_option_selected",
+                required=bool(qb.required),
             )
         )
         task_idx += 1
@@ -502,9 +902,27 @@ def summarize_macro_tasks(tasks: list[MacroTask]) -> list[str]:
             out.append(
                 f"{task.task_id}:{status}: combobox -> {task.target_value or ''}"
             )
+        elif task.task_type in ("field_fill", "field_fill_optional"):
+            out.append(
+                f"{task.task_id}:{status}: fill {task.field_selector or ''} -> {task.target_value or ''}"
+            )
+        elif task.task_type == "file_upload":
+            out.append(
+                f"{task.task_id}:{status}: upload {task.field_selector or 'resume'} -> {task.target_value or 'auto'}"
+            )
+        elif task.task_type == "manual_required":
+            out.append(
+                f"{task.task_id}:{status}: manual_required {task.field_selector or task.title}"
+            )
+        elif task.task_type == "inference_required":
+            reason = f" [{task.mapping_reason}]" if task.mapping_reason else ""
+            options = ", ".join(task.expected_options[:4]) if task.expected_options else "auto-infer"
+            out.append(
+                f"{task.task_id}:{status}: infer {task.question_text or task.title} -> {options}{reason}"
+            )
         else:
             reason = f" [{task.mapping_reason}]" if task.mapping_reason else ""
             out.append(
                 f"{task.task_id}:{status}: {task.question_text or task.title} -> {', '.join(task.expected_options[:4])}{reason}"
             )
-    return out[:10]
+    return out

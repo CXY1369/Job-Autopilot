@@ -49,18 +49,25 @@ def verify_ref_action_effect(
     *,
     is_answer_click_action: Callable[[Any, SnapshotItem | None], bool],
     verify_question_answer_state: Callable[[str, str], bool],
+    verify_question_option_state: Callable[[str, str], bool] | None = None,
 ) -> bool:
     """对 ref 动作进行基础后验校验。"""
     try:
         if action.action == "click":
             if item.role in ("checkbox", "radio"):
                 return locator.is_checked()
-            if is_answer_click_action(action, item):
-                if action.target_question:
+            if getattr(action, "target_question", None):
+                option_text = str(getattr(action, "selector", "") or item.name or "").strip()
+                if verify_question_option_state and option_text:
+                    if verify_question_option_state(action.target_question, option_text):
+                        return True
+                if is_answer_click_action(action, item):
                     expected = normalize_answer_label(action.selector or item.name)
                     return verify_question_answer_state(
                         action.target_question, expected
                     )
+                return False
+            if is_answer_click_action(action, item):
                 # 对未绑定问题文本的回答型按钮，至少确认该按钮出现可见选中态
                 try:
                     if item.role in ("checkbox", "radio"):

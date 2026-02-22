@@ -4,10 +4,14 @@ from autojobagent.core.vision_agent import (
     AgentAction,
     AgentState,
     SubmissionOutcome,
+    VisualAuditResult,
     evaluate_progression_block_reason,
 )
+from autojobagent.core.macro_tasks import MacroTask
+from autojobagent.core.semantic_tree import OptionNode, QuestionBlock
 from autojobagent.core.ui_snapshot import SnapshotItem
 from autojobagent.core.llm_runtime import LLMCallResult
+from autojobagent.core.failure_memory import FailureMemoryStore
 
 
 class _DummyJob:
@@ -52,6 +56,36 @@ class _ObservePage:
 
     def evaluate(self, _script: str):
         return None
+
+
+class _QuestionStatePage:
+    def __init__(self, selected_by_question: dict[str, list[str]]):
+        self._selected_by_question = selected_by_question
+        self.url = "https://jobs.ashbyhq.com/suno/role/application"
+        self.keyboard = _DummyKeyboard()
+
+    def inner_text(self, _selector: str) -> str:
+        return "application page"
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+    def evaluate(self, _script: str, payload: dict | None = None):
+        if not isinstance(payload, dict):
+            return None
+        question = str(payload.get("question") or "")
+        expected = str(payload.get("expected") or "")
+        selected = list(self._selected_by_question.get(question, []))
+        expected_lower = expected.lower().strip()
+        option_found = True if not expected_lower else any(
+            expected_lower in s.lower() or s.lower() in expected_lower for s in selected
+        )
+        return {
+            "matched": bool(question),
+            "option_found": option_found,
+            "option_selected": option_found,
+            "selected": selected,
+        }
 
 
 def test_progression_gate_does_not_block_job_description_keywords_only():
@@ -483,6 +517,355 @@ def test_submission_retry_policy_stops_at_third_attempt(monkeypatch):
     assert r3 == (False, True)
 
 
+def test_submission_external_blocked_immediately_refreshes(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _OutcomePage("flagged as possible spam")
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    action = AgentAction(action="click", selector="Submit Application")
+    monkeypatch.setattr(
+        agent,
+        "_classify_submission_outcome",
+        lambda _action, _ok: SubmissionOutcome(
+            classification="external_blocked",
+            reason_code="anti_spam_or_risk_blocked",
+            evidence_snippet="flagged as possible spam",
+        ),
+    )
+    refresh_triggers: list[str] = []
+    monkeypatch.setattr(
+        agent,
+        "_do_refresh",
+        lambda trigger="unknown": refresh_triggers.append(trigger) or True,
+    )
+    paced: list[str] = []
+    monkeypatch.setattr(agent, "_apply_humanized_retry_pacing", lambda: paced.append("p"))
+    result = agent._handle_submission_outcome(action, False)
+    assert result == (False, False)
+    assert refresh_triggers == ["external_blocked_immediate_restart"]
+    assert paced == []
+
+
+def test_progression_queue_prefers_submit_over_apply(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    monkeypatch.setattr(agent, "_get_progression_block_reason", lambda: None)
+    snapshot_map = {
+        "e1": SnapshotItem(ref="e1", role="button", name="Apply Now", nth=0),
+        "e2": SnapshotItem(ref="e2", role="button", name="Submit Application", nth=0),
+    }
+    action = agent._maybe_get_progression_queue_action(snapshot_map)
+    assert action is not None
+    assert action.ref == "e2"
+
+
+def test_task_execution_key_supports_non_binary_question_option(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _OutcomePage("body text")
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    action = AgentAction(
+        action="click",
+        selector="B",
+        target_question="What is your security clearance level?",
+    )
+    key = agent._task_execution_key("fp-any", action)
+    assert "answer::what is your security clearance level?::b" in key
+
+
+def test_submission_action_skips_semantic_guard(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _OutcomePage("body text")
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    action = AgentAction(action="click", selector="Submit Application")
+    # 即使已有 fail_count，也不应对提交动作触发语义熔断决策
+    key = agent._semantic_action_key("fp-one", action)
+    agent._semantic_fail_counts[key] = 3
+    assert agent._is_submission_click_action(action, item=None) is True
+
+
+def test_macro_task_identity_key_for_question_multi(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    task = MacroTask(
+        task_id="t1",
+        task_type="question_multi",
+        title="Answer required question",
+        question_text="Which office are you willing to work out of?",
+        expected_options=["San Francisco", "New York City (Chelsea)"],
+    )
+    key = agent._macro_task_identity_key(task)
+    assert "which office" in key
+    assert "san francisco" in key
+
+
+def test_question_multi_build_action_skips_already_selected_option(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    question = "Which office are you willing to work out of?"
+    page = _QuestionStatePage({question: ["San Francisco"]})
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    block = QuestionBlock(
+        question_id="q1",
+        question_text=question,
+        control_type="choice_group",
+        required=True,
+        has_error=False,
+        options=[
+            OptionNode(
+                text="San Francisco",
+                role="checkbox",
+                selected=True,
+                ref_id="e1",
+            ),
+            OptionNode(
+                text="New York City (Chelsea)",
+                role="checkbox",
+                selected=False,
+                ref_id="e2",
+            ),
+        ],
+        selected_options=["San Francisco"],
+    )
+    agent._last_question_blocks = [block]
+    task = MacroTask(
+        task_id="t6",
+        task_type="question_multi",
+        title="Answer required question",
+        question_text=question,
+        expected_options=["San Francisco", "New York City (Chelsea)"],
+        status="in_progress",
+    )
+    action = agent._build_macro_action_for_task(task, snapshot_map={})
+    assert action is not None
+    assert action.selector == "New York City (Chelsea)"
+    assert "San Francisco" in task.completed_options
+
+
+def test_macro_task_completed_question_single_requires_target_option_state(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(page=_ObservePage("app", "https://jobs.ashbyhq.com/suno"), job=_DummyJob())
+    task = MacroTask(
+        task_id="t8",
+        task_type="question_single",
+        title="Answer required question",
+        question_text="Do you require visa sponsorship?",
+        expected_options=["Yes"],
+    )
+    monkeypatch.setattr(
+        agent,
+        "_find_question_block",
+        lambda _task: QuestionBlock(
+            question_id="q4",
+            question_text="Do you require visa sponsorship?",
+            control_type="choice_group",
+            required=True,
+            has_error=False,
+            options=[],
+            selected_options=["Yes"],
+        ),
+    )
+    # 即使 selected_options 内有 "Yes"，只要目标选项节点状态未命中，也不得判定完成
+    monkeypatch.setattr(agent, "_verify_question_option_state", lambda _q, _o: False)
+    assert agent._macro_task_completed(task, snapshot_map={}) is False
+
+
+def test_verify_question_option_state_uses_option_level_signal(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    question = "Do you require visa sponsorship?"
+    page = _QuestionStatePage({question: ["No"]})
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    assert agent._verify_question_option_state(question, "No") is True
+    assert agent._verify_question_option_state(question, "Yes") is False
+
+
+def test_file_upload_task_is_locked_done_after_success(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(
+        page=_ObservePage("application page", "https://jobs.ashbyhq.com/suno/role/application"),
+        job=_DummyJob(),
+    )
+    task = MacroTask(
+        task_id="t5",
+        task_type="file_upload",
+        title="Upload required resume",
+        field_selector="Resume",
+        status="in_progress",
+    )
+    agent._macro_tasks = [task]
+    action = AgentAction(
+        action="upload",
+        selector="Resume",
+        reason="[macro:t5] upload required file",
+    )
+    agent._on_macro_action_result(action, True)
+    assert task.status == "done"
+    assert agent._macro_upload_completed(task) is True
+
+
+def test_execute_ref_upload_logs_action_verified(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(
+        page=_ObservePage("application page", "https://jobs.ashbyhq.com/suno/role/application"),
+        job=_DummyJob(),
+    )
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(agent, "_step_log", lambda event, payload: events.append((event, payload)))
+    agent._last_snapshot_map = {
+        "e1": SnapshotItem(ref="e1", role="file_input", name="Resume", nth=0, input_type="file")
+    }
+    monkeypatch.setattr(agent, "_locator_from_snapshot_item", lambda _item: object())
+    monkeypatch.setattr(agent, "_do_upload", lambda _action, locator=None: True)
+    ok = agent._execute_ref_action(AgentAction(action="upload", ref="e1", selector="Resume"))
+    assert ok is True
+    assert any(event == "action_verified" and payload.get("action") == "upload" for event, payload in events)
+
+
+def test_visual_augmentation_dedup_drops_duplicate_optional_prompt(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(
+        page=_ObservePage("app", "https://jobs.ashbyhq.com/suno"),
+        job=_DummyJob(),
+    )
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        agent,
+        "_step_log",
+        lambda event, payload: events.append((event, payload)),
+    )
+    tasks = [
+        MacroTask(
+            task_id="t3",
+            task_type="field_fill_optional",
+            title="Fill optional prompt field from profile",
+            field_selector="Why are you interested in working at Suno?",
+            target_value="reason",
+            mapping_reason="common_answers.why_this_company",
+        )
+    ]
+    audit = VisualAuditResult(
+        visual_summary="required question exists",
+        required_fields=[],
+        required_questions=["Why are you interested in working at Suno?"],
+        required_uploads=[],
+        source="vision+heuristic",
+    )
+    merged = agent._augment_macro_tasks_with_visual_audit(
+        tasks=tasks,
+        audit=audit,
+        snapshot_map={},
+        question_blocks=[],
+    )
+    assert len(merged) == 1
+    assert all(task.task_type != "inference_required" for task in merged)
+    assert any(
+        event == "execution_queue_augmented_by_visual_audit"
+        and payload.get("dedup_dropped_count") == 1
+        for event, payload in events
+    )
+
+
+def test_visual_augmentation_skips_unmatched_required_question(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(
+        page=_ObservePage("app", "https://jobs.ashbyhq.com/suno"),
+        job=_DummyJob(),
+    )
+    tasks: list[MacroTask] = []
+    audit = VisualAuditResult(
+        visual_summary="required question exists",
+        required_fields=[],
+        required_questions=["Have you worked on a data engineering initiative 0-1?"],
+        required_uploads=[],
+        source="vision+heuristic",
+    )
+    merged = agent._augment_macro_tasks_with_visual_audit(
+        tasks=tasks,
+        audit=audit,
+        snapshot_map={},
+        question_blocks=[],
+    )
+    assert merged == []
+
+
+def test_macro_task_precondition_timeout_blocks_inference_task(monkeypatch):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(
+        page=_ObservePage("app", "https://jobs.ashbyhq.com/suno/role/application"),
+        job=_DummyJob(),
+    )
+    agent._macro_scope = agent._stable_page_scope()
+    agent._macro_tasks = [
+        MacroTask(
+            task_id="t9",
+            task_type="inference_required",
+            title="Infer answer for unmapped question",
+            question_text="Have you worked on a data engineering initiative 0-1?",
+            expected_options=["Yes", "No"],
+            precondition="question_block_present",
+            postcondition="required_question_answered",
+        )
+    ]
+    agent._last_question_blocks = []
+    for _ in range(agent._macro_precondition_wait_limit):
+        action = agent._maybe_get_macro_action(
+            snapshot_map={},
+            page_fingerprint="fp",
+        )
+        assert action is None
+    assert agent._macro_tasks[0].status == "blocked"
+    assert agent._macro_tasks[0].wait_count == agent._macro_precondition_wait_limit
+
+
 def test_semantic_key_not_reset_by_page_fingerprint(monkeypatch):
     monkeypatch.setattr(
         BrowserManager,
@@ -724,7 +1107,7 @@ def test_observe_and_think_non_json_completion_fallback_returns_done(monkeypatch
     )
     monkeypatch.setattr(
         "autojobagent.core.vision_agent.build_question_blocks",
-        lambda _page, _snapshot_map: [],
+        lambda _page, _snapshot_map, **_kwargs: [],
     )
     monkeypatch.setattr(
         agent,
@@ -758,6 +1141,125 @@ def test_observe_and_think_non_json_completion_fallback_returns_done(monkeypatch
     )
     state = agent._observe_and_think()
     assert state.status == "done"
+
+
+def test_observe_and_think_llm_refusal_on_blocked_page_returns_refresh_action(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _ObservePage(
+        "We couldn't submit your application. Your submission was flagged as possible spam.",
+        "https://jobs.ashbyhq.com/acme/role/application",
+    )
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    agent.step_count = 6
+    agent.client = object()
+    agent.visual_fallback_budget = 0
+    monkeypatch.setattr(agent, "_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "autojobagent.core.vision_agent.build_ui_snapshot",
+        lambda _page: (
+            "e1 | role=link | name=Learn more",
+            {"e1": SnapshotItem(ref="e1", role="link", name="Learn more", nth=0)},
+        ),
+    )
+    monkeypatch.setattr(
+        "autojobagent.core.vision_agent.build_question_blocks",
+        lambda _page, _snapshot_map, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        agent,
+        "_collect_manual_required_evidence",
+        lambda *_args, **_kwargs: {
+            "password_input_count": 0,
+            "captcha_element_count": 0,
+            "has_captcha_challenge_text": False,
+            "has_login_button": False,
+            "has_apply_cta": False,
+        },
+    )
+    monkeypatch.setattr(
+        agent,
+        "_classify_page_state",
+        lambda *_args, **_kwargs: "application_or_form_page",
+    )
+    monkeypatch.setattr(
+        "autojobagent.core.vision_agent.run_chat_with_fallback",
+        lambda **_kwargs: LLMCallResult(
+            ok=True,
+            raw="I'm unable to assist with this request.",
+            model="gpt-4o",
+            model_index=0,
+        ),
+    )
+    monkeypatch.setattr(agent, "_capture_step_screenshot", lambda: None)
+    state = agent._observe_and_think()
+    assert state.status == "continue"
+    assert state.next_action is not None
+    assert state.next_action.action == "refresh"
+
+
+def test_observe_and_think_llm_refusal_blocked_page_refresh_exhausted_goes_stuck(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    page = _ObservePage(
+        "We couldn't submit your application. Your submission was flagged as possible spam.",
+        "https://jobs.ashbyhq.com/acme/role/application",
+    )
+    agent = BrowserAgent(page=page, job=_DummyJob())
+    agent.step_count = 6
+    agent.client = object()
+    agent.visual_fallback_budget = 0
+    agent.refresh_attempts = agent.max_refresh_attempts
+    monkeypatch.setattr(agent, "_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "autojobagent.core.vision_agent.build_ui_snapshot",
+        lambda _page: (
+            "e1 | role=link | name=Learn more",
+            {"e1": SnapshotItem(ref="e1", role="link", name="Learn more", nth=0)},
+        ),
+    )
+    monkeypatch.setattr(
+        "autojobagent.core.vision_agent.build_question_blocks",
+        lambda _page, _snapshot_map, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        agent,
+        "_collect_manual_required_evidence",
+        lambda *_args, **_kwargs: {
+            "password_input_count": 0,
+            "captcha_element_count": 0,
+            "has_captcha_challenge_text": False,
+            "has_login_button": False,
+            "has_apply_cta": False,
+        },
+    )
+    monkeypatch.setattr(
+        agent,
+        "_classify_page_state",
+        lambda *_args, **_kwargs: "application_or_form_page",
+    )
+    monkeypatch.setattr(
+        "autojobagent.core.vision_agent.run_chat_with_fallback",
+        lambda **_kwargs: LLMCallResult(
+            ok=True,
+            raw="I'm unable to assist with this request.",
+            model="gpt-4o",
+            model_index=0,
+        ),
+    )
+    monkeypatch.setattr(agent, "_capture_step_screenshot", lambda: None)
+    state = agent._observe_and_think()
+    assert state.status == "stuck"
 
 
 def test_run_reports_macro_action_result_after_execution(monkeypatch):
@@ -850,3 +1352,109 @@ def test_run_reports_macro_result_when_submission_branch_stops(monkeypatch):
     result = agent.run()
     assert result is False
     assert calls == [("[macro:t9] progression submit", False)]
+
+
+def test_sync_failure_hints_records_failure_memory(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(
+        page=_ObservePage("application", "https://jobs.ashbyhq.com/suno/role/application"),
+        job=_DummyJob(),
+    )
+    agent._failure_memory = FailureMemoryStore(path=tmp_path / "failure_memory.ndjson")
+    outcome = SubmissionOutcome(
+        classification="external_blocked",
+        reason_code="anti_spam_or_risk_blocked",
+        evidence_snippet="Your application submission was flagged as possible spam.",
+    )
+    action = AgentAction(action="click", selector="Submit Application")
+    agent._sync_failure_hints(outcome, action)
+    hits = agent._failure_memory.query_similar(
+        page_scope=agent._stable_page_scope(),
+        classification="external_blocked",
+        reason_code="anti_spam_or_risk_blocked",
+        action="click",
+        limit=2,
+    )
+    assert len(hits) >= 1
+    assert "spam" in (hits[0].evidence_snippet or "").lower()
+
+
+def test_load_failure_memory_hints_returns_promptable_summary(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        BrowserManager,
+        "_load_settings",
+        lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
+    )
+    agent = BrowserAgent(
+        page=_ObservePage("application", "https://jobs.ashbyhq.com/suno/role/application"),
+        job=_DummyJob(),
+    )
+    agent._failure_memory = FailureMemoryStore(path=tmp_path / "failure_memory.ndjson")
+    agent._failure_memory.upsert_case(
+        page_scope=agent._stable_page_scope(),
+        classification="validation_error",
+        reason_code="required_field_missing",
+        symptom="submit blocked by missing required field",
+        root_cause="required question not answered",
+        successful_strategy="repair missing field first then submit",
+        guardrails="do not repeat submit before fixing error",
+        source_event="unit_test",
+    )
+    summary = agent._load_failure_memory_hints(
+        page_scope=agent._stable_page_scope(),
+        question_blocks=[],
+    )
+    assert summary != "无"
+    assert "策略" in summary
+
+
+def test_should_query_failure_memory_skips_stable_fill_path():
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    blocks = [
+        QuestionBlock(
+            question_id="q1",
+            question_text="Are you authorized to work in the United States?",
+            control_type="single_choice",
+            required=True,
+            has_error=False,
+            options=[
+                OptionNode(text="Yes", role="button", selected=False),
+                OptionNode(text="No", role="button", selected=False),
+            ],
+            selected_options=[],
+        )
+    ]
+    enabled, reason = agent._should_query_failure_memory(
+        page_state="application_or_form_page",
+        question_blocks=blocks,
+        has_pending_macro_tasks=True,
+    )
+    assert enabled is False
+    assert reason == "stable_fill_path"
+
+
+def test_should_query_failure_memory_enables_after_failure():
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    agent.consecutive_failures = 1
+    enabled, reason = agent._should_query_failure_memory(
+        page_state="application_or_form_page",
+        question_blocks=[],
+        has_pending_macro_tasks=True,
+    )
+    assert enabled is True
+    assert reason == "failure_recovery"
+
+
+def test_should_query_failure_memory_enables_before_submit_when_queue_done():
+    agent = BrowserAgent(page=object(), job=_DummyJob())
+    enabled, reason = agent._should_query_failure_memory(
+        page_state="application_or_form_page",
+        question_blocks=[],
+        has_pending_macro_tasks=False,
+    )
+    assert enabled is True
+    assert reason == "pre_submit_review"

@@ -104,14 +104,7 @@ class BrowserManager:
     def _attach_basic_listeners(self, page: Page) -> None:
         """采集页面基础错误信息，写入日志便于排查。"""
         try:
-            page.on(
-                "console",
-                lambda msg: (
-                    self._log(f"[console:{msg.type}] {msg.text}", "warn")
-                    if msg.type in ("error", "warning")
-                    else None
-                ),
-            )
+            page.on("console", self._handle_console_message)
             page.on(
                 "pageerror",
                 lambda exc: self._log(f"[pageerror] {exc}", "error"),
@@ -119,16 +112,53 @@ class BrowserManager:
         except Exception:
             pass
 
+    def _handle_console_message(self, msg) -> None:
+        """处理浏览器 console 消息，过滤已知无害噪声。"""
+        try:
+            msg_type = str(getattr(msg, "type", "") or "")
+            text = str(getattr(msg, "text", "") or "")
+        except Exception:
+            return
+        if msg_type not in ("error", "warning"):
+            return
+        if self._should_ignore_console_warning(msg_type, text):
+            return
+        self._log(f"[console:{msg_type}] {text}", "warn")
+
+    def _should_ignore_console_warning(self, msg_type: str, text: str) -> bool:
+        """
+        屏蔽已知无害前端性能告警，避免污染终端输出。
+        """
+        lower = (text or "").lower()
+        if (
+            "chrome-extension://" in lower
+            and "content security policy directive" in lower
+        ):
+            return True
+        if "chrome-extension://" in lower and "refused to load the script" in lower:
+            return True
+        if msg_type != "warning":
+            return False
+        return (
+            "was preloaded using link preload but not used within a few seconds" in lower
+            and "window's load event" in lower
+        )
+
     def _attach_context_listeners(self, context: BrowserContext) -> None:
         try:
-            context.on(
-                "requestfailed",
-                lambda req: self._log(
-                    f"[requestfailed] {req.method} {req.url}", "warn"
-                ),
-            )
+            context.on("requestfailed", self._handle_request_failed)
         except Exception:
             pass
+
+    def _handle_request_failed(self, req) -> None:
+        try:
+            url = str(getattr(req, "url", "") or "")
+            method = str(getattr(req, "method", "") or "")
+        except Exception:
+            return
+        if url.startswith("chrome-extension://"):
+            return
+        self._log(f"[requestfailed] {method} {url}", "warn")
 
     def _load_settings(self) -> dict:
         """读取项目配置文件（autojobagent/config.yaml）。"""

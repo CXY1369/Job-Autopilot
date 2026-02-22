@@ -18,6 +18,7 @@ import io
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -112,6 +113,7 @@ from .semantic_tree import (
     format_question_blocks,
 )
 from .macro_tasks import MacroTask, build_macro_tasks, summarize_macro_tasks
+from .failure_memory import FailureMemoryStore
 from .verifier import (
     get_input_value as verifier_get_input_value,
     is_dropdown_open as verifier_is_dropdown_open,
@@ -175,6 +177,26 @@ class AgentState:
     page_fingerprint: Optional[str] = None
 
 
+@dataclass
+class QueueTaskView:
+    task_id: str
+    task_type: str
+    label: str
+    status: str
+    action: str
+    ref: str | None = None
+    target_question: str | None = None
+
+
+@dataclass
+class VisualAuditResult:
+    visual_summary: str
+    required_fields: list[str]
+    required_questions: list[str]
+    required_uploads: list[str]
+    source: str = "heuristic"
+
+
 def evaluate_progression_block_reason(
     evidence: dict[str, int | list[str] | bool],
     *,
@@ -189,6 +211,7 @@ def evaluate_progression_block_reason(
     global_error_keyword_hits = int(evidence.get("global_error_keyword_hits", 0) or 0)
     submit_candidates = evidence.get("submit_candidates", [])
     has_enabled_submit = False
+    has_submit_candidate = False
     if isinstance(submit_candidates, list):
         for item in submit_candidates:
             if not isinstance(item, dict):
@@ -200,6 +223,7 @@ def evaluate_progression_block_reason(
             )
             if not is_submit_like:
                 continue
+            has_submit_candidate = True
             disabled = bool(item.get("disabled", False))
             aria_disabled = str(item.get("aria_disabled", "")).lower()
             if (not disabled) and aria_disabled not in ("true", "1"):
@@ -236,7 +260,7 @@ def evaluate_progression_block_reason(
         if (
             all_invalid_are_file
             and has_upload_ready_signal
-            and has_enabled_submit
+            and (has_enabled_submit or has_submit_candidate)
             and (required_empty_count <= 0 or all_required_empty_are_file)
             and error_container_hits <= 0
             and red_error_hits <= 0
@@ -374,6 +398,9 @@ class BrowserAgent:
         self._macro_scope: str = ""
         self._active_macro_task_id: str | None = None
         self._macro_retry_limit = 3
+        self._macro_precondition_wait_limit = 3
+        self._macro_disabled_scopes: set[str] = set()
+        self._macro_manual_block_reason: str | None = None
         self._error_gate_cache: dict[str, bool] = {}
         self._last_observed_fingerprint: str = ""
         self._state_cache_by_fingerprint: dict[str, AgentState] = {}
@@ -395,7 +422,22 @@ class BrowserAgent:
         self.last_error_snippet_hint: str | None = None
         self.last_outcome_class_hint: str | None = None
         self.last_outcome_at_hint: datetime | None = None
+        self._llm_parse_fail_streak = 0
+        self._llm_refusal_streak = 0
         self._execution_phase: str = "observe"
+        self._queue_retry_limit = 3
+        self._max_full_restart_attempts = 2
+        self._full_restart_attempts = 0
+        self._last_failed_task_key: str = ""
+        self._same_task_failure_streak = 0
+        self._last_queue_plan: list[QueueTaskView] = []
+        self._scope_visual_audits: dict[str, VisualAuditResult] = {}
+        self._latest_required_dom_summary: str = ""
+        self._latest_visual_summary: str = ""
+        self._latest_failure_memory_summary: str = "无"
+        self._failure_memory = FailureMemoryStore()
+        self._upload_task_locks: set[str] = set()
+        self._force_visual_audit_next_plan: bool = False
         try:
             self.visual_fallback_budget = max(
                 0, int(os.getenv("VISION_FALLBACK_BUDGET", "8"))
@@ -452,13 +494,28 @@ class BrowserAgent:
                 continue
 
             # 2. 记录 LLM 的分析
+            if self._latest_required_dom_summary:
+                self._log(
+                    f"🧩 检测页面必填项DOM元素: {self._latest_required_dom_summary}"
+                )
+            if self._latest_visual_summary:
+                self._log(
+                    f"🖼 根据AI视觉理解简单描述页面截图内容: {self._latest_visual_summary}"
+                )
+            if (
+                self._latest_failure_memory_summary
+                and self._latest_failure_memory_summary != "无"
+            ):
+                self._log(
+                    f"🧠 Failure Memory 提示: {self._latest_failure_memory_summary}"
+                )
             self._log(f"📋 状态: {state.summary}")
             if state.page_overview:
                 self._log(f"🧭 页面概览: {state.page_overview}")
             if state.field_audit:
                 self._log(f"🧾 字段审计: {state.field_audit}")
             if state.action_plan:
-                self._log(f"🗺 计划序列: {' -> '.join(state.action_plan[:5])}")
+                self._log(f"🗺 计划序列: {' -> '.join(state.action_plan)}")
             if state.risk_or_blocker:
                 self._log(f"⚠ 风险/阻塞: {state.risk_or_blocker}")
 
@@ -529,7 +586,14 @@ class BrowserAgent:
                 action = state.next_action
                 fp = state.page_fingerprint or self._last_observed_fingerprint
                 is_macro_action = self._is_macro_action(action)
-                semantic_guard = self._semantic_loop_guard_decision(fp, action)
+                is_submission_action = self._is_submission_click_action(
+                    action, item=self._last_snapshot_map.get(action.ref or "")
+                )
+                semantic_guard = (
+                    "none"
+                    if is_submission_action
+                    else self._semantic_loop_guard_decision(fp, action)
+                )
                 precomputed_alternate = None
                 if is_macro_action and semantic_guard != "none":
                     self._step_log(
@@ -647,7 +711,7 @@ class BrowserAgent:
                 success = self._execute_action(action)
                 should_stop = False
                 source_item = self._last_snapshot_map.get(action.ref or "")
-                if self._is_progression_action(action, item=source_item):
+                if self._is_submission_click_action(action, item=source_item):
                     success, should_stop = self._handle_submission_outcome(
                         action, success
                     )
@@ -667,6 +731,16 @@ class BrowserAgent:
                         return False
                 self._on_macro_action_result(action, success)
                 self._record_action_result(fp, action, success)
+                task_key = self._task_execution_key(fp, action)
+                if success:
+                    self._same_task_failure_streak = 0
+                    self._last_failed_task_key = ""
+                else:
+                    if task_key and task_key == self._last_failed_task_key:
+                        self._same_task_failure_streak += 1
+                    else:
+                        self._last_failed_task_key = task_key
+                        self._same_task_failure_streak = 1
 
                 # 记录到历史（让 AI 能看到操作结果，从而调整策略）
                 target_desc = action.ref or (action.selector or "")
@@ -686,7 +760,7 @@ class BrowserAgent:
                     self.history.append(
                         f"步骤{self.step_count}: {action_desc} ✗失败 [操作未成功，可能需要换方法]"
                     )
-                    self.consecutive_failures += 1  # 增加连续失败计数
+                    self.consecutive_failures = self._same_task_failure_streak
 
                 if success:
                     self._log("   ✓ 执行成功")
@@ -712,7 +786,10 @@ class BrowserAgent:
                             },
                         )
                     self._log(
-                        f"   ❌ 执行失败 (连续失败: {self.consecutive_failures}/{self.max_consecutive_failures})",
+                        (
+                            "   ❌ 执行失败 "
+                            f"(同任务连续失败: {self._same_task_failure_streak}/{self._queue_retry_limit})"
+                        ),
                         "warn",
                     )
                     # 保存失败截图（带 _failed 后缀）
@@ -729,20 +806,26 @@ class BrowserAgent:
                         pass
 
                     failure_path = fsm_decide_failure_recovery_path(
-                        consecutive_failures=self.consecutive_failures,
-                        max_consecutive_failures=self.max_consecutive_failures,
+                        consecutive_failures=self._same_task_failure_streak,
+                        max_consecutive_failures=self._queue_retry_limit,
                         refresh_attempts=self.refresh_attempts,
                         max_refresh_attempts=self.max_refresh_attempts,
                         refresh_exhausted=self.refresh_exhausted,
                     )
                     if failure_path == "refresh":
                         self._log(
-                            f"⚠ 连续失败达到 {self.consecutive_failures} 次，触发页面刷新重试",
+                            (
+                                "⚠ 当前任务连续失败达到 "
+                                f"{self._same_task_failure_streak} 次，触发页面刷新并重建队列"
+                            ),
                             "warn",
                         )
                         refreshed = self._do_refresh(trigger="auto_stuck_recovery")
                         if refreshed:
+                            self._full_restart_attempts = self.refresh_attempts
                             self.consecutive_failures = 0
+                            self._same_task_failure_streak = 0
+                            self._last_failed_task_key = ""
                             continue
                     elif failure_path == "stop_refresh_exhausted":
                         self._set_manual_reason_hint(
@@ -817,7 +900,9 @@ class BrowserAgent:
             snapshot_map,
             visible_text,
         )
-        question_blocks = build_question_blocks(self.page, snapshot_map)
+        question_blocks = build_question_blocks(
+            self.page, snapshot_map, visible_text=visible_text
+        )
         self._last_question_blocks = question_blocks
         question_blocks_text = format_question_blocks(question_blocks)
         form_graph = build_form_graph(
@@ -871,6 +956,18 @@ class BrowserAgent:
                 "required_unfilled_count": len(form_graph.required_unfilled),
                 "submit_candidate_count": len(form_graph.submit_refs),
             },
+        )
+        # 终端展示上下文：每步都刷新 DOM 必填摘要；视觉摘要按 scope 缓存展示
+        self._latest_required_dom_summary = self._build_required_dom_summary(
+            snapshot_map,
+            question_blocks,
+        )
+        scope_now = self._stable_page_scope()
+        cached_audit = self._scope_visual_audits.get(scope_now)
+        self._latest_visual_summary = (
+            cached_audit.visual_summary
+            if cached_audit
+            else "尚未执行页面截图交叉审计"
         )
         # region agent log
         append_debug_log(
@@ -1038,10 +1135,21 @@ class BrowserAgent:
             },
         )
 
+        # 关键修复：在任何宏任务决策前刷新上传等运行时信号
+        self._refresh_runtime_signals(visible_text, snapshot_map)
+
         macro_action = self._maybe_get_macro_action(
             snapshot_map=snapshot_map,
             page_fingerprint=page_fingerprint,
         )
+        if self._macro_manual_block_reason:
+            reason = self._macro_manual_block_reason
+            self._set_manual_reason_hint(reason)
+            return AgentState(
+                status="stuck",
+                summary=f"检测到当前页面存在必须人工处理的附件要求：{reason}",
+                page_fingerprint=page_fingerprint,
+            )
         if macro_action is not None:
             remaining = [
                 line
@@ -1052,7 +1160,7 @@ class BrowserAgent:
                 status="continue",
                 summary="执行全局宏任务链中的当前步骤（语义树计划）",
                 next_action=macro_action,
-                action_plan=remaining[:5] if remaining else None,
+                action_plan=remaining if remaining else None,
                 page_fingerprint=page_fingerprint,
             )
         if self._macro_tasks:
@@ -1069,11 +1177,48 @@ class BrowserAgent:
                         "summary": blocked_summary,
                     },
                 )
+                self.history.append(
+                    "宏任务队列全部阻断，切换到 LLM 修复模式："
+                    f"{blocked_summary}"
+                )
+                self._macro_disabled_scopes.add(self._stable_page_scope())
+                self._macro_tasks = []
+                self._active_macro_task_id = None
+        has_pending_macro = any(
+            task.status not in ("done", "blocked") for task in self._macro_tasks
+        )
+        if not has_pending_macro:
+            progression_action = self._maybe_get_progression_queue_action(snapshot_map)
+            if progression_action is not None:
                 return AgentState(
-                    status="stuck",
-                    summary=f"宏任务链全部阻断，需人工处理：{blocked_summary}",
+                    status="continue",
+                    summary="宏任务队列已完成，执行提交流程步骤",
+                    next_action=progression_action,
+                    action_plan=["提交申请（队列）"],
                     page_fingerprint=page_fingerprint,
                 )
+
+        self._latest_failure_memory_summary = "无"
+        should_load_failure_memory, failure_memory_reason = (
+            self._should_query_failure_memory(
+                page_state=page_state,
+                question_blocks=question_blocks,
+                has_pending_macro_tasks=has_pending_macro,
+            )
+        )
+        self._step_log(
+            "failure_memory_query_decision",
+            {
+                "step": self.step_count,
+                "enabled": bool(should_load_failure_memory),
+                "reason": failure_memory_reason,
+            },
+        )
+        if should_load_failure_memory:
+            self._latest_failure_memory_summary = self._load_failure_memory_hints(
+                page_scope=self._stable_page_scope(),
+                question_blocks=question_blocks,
+            )
 
         cached_state = self._state_cache_by_fingerprint.get(page_fingerprint)
         if (
@@ -1084,12 +1229,18 @@ class BrowserAgent:
             # Guard: never replay click on toggle elements (checkbox/radio/toggle button)
             _ca = cached_state.next_action
             _is_toggle_replay = False
+            _is_risky_replay = bool(_ca.target_question) or _ca.action in (
+                "upload",
+                "refresh",
+            )
             if _ca.action == "click" and _ca.ref:
                 _target = snapshot_map.get(_ca.ref)
                 if _target and _target.role in ("checkbox", "radio", "switch"):
                     _is_toggle_replay = True
                 elif _target and _target.checked is not None:
                     _is_toggle_replay = True
+                if self._is_progression_action(_ca, item=_target):
+                    _is_risky_replay = True
                 # region agent log
                 append_debug_log(
                     location="vision_agent.py:_observe_and_think:cache_toggle_guard",
@@ -1106,6 +1257,7 @@ class BrowserAgent:
                         "target_checked": _target.checked if _target else "N/A",
                         "target_input_type": _target.input_type if _target else None,
                         "_is_toggle_replay": _is_toggle_replay,
+                        "_is_risky_replay": _is_risky_replay,
                         "page_fingerprint": page_fingerprint[:32],
                     },
                     run_id="debug-v2",
@@ -1118,6 +1270,7 @@ class BrowserAgent:
             )
             if (
                 not _is_toggle_replay
+                and not _is_risky_replay
                 and self._action_fail_counts.get(cache_key, 0) == 0
                 and self._action_cache_use_counts.get(cache_key, 0) < 1
             ):
@@ -1149,8 +1302,7 @@ class BrowserAgent:
 
         # 4. 构建 prompt
         history_text = "\n".join(self.history[-5:]) if self.history else "无"
-        upload_signals = self._detect_upload_signals(visible_text)
-        self._last_upload_signals = upload_signals
+        upload_signals = self._last_upload_signals
         upload_signal_text = "；".join(upload_signals[:8]) if upload_signals else "无"
         upload_candidates_text = (
             "\n".join(f"- {Path(p).name} | {p}" for p in self.upload_candidates[:12])
@@ -1178,6 +1330,7 @@ class BrowserAgent:
             assist_required_after=self.assist_required_after,
             assist_prefill_delta=self.assist_prefill_delta,
             assist_prefill_verified=self.assist_prefill_verified,
+            failure_memory_text=self._latest_failure_memory_summary,
             upload_candidates_text=upload_candidates_text,
             is_new_page=is_new_page,
         )
@@ -1301,7 +1454,23 @@ class BrowserAgent:
                         raw_response=raw,
                         page_fingerprint=page_fingerprint,
                     )
+            self._llm_parse_fail_streak += 1
+            is_refusal = self._is_llm_refusal_response(raw)
+            if is_refusal:
+                self._llm_refusal_streak += 1
+            else:
+                self._llm_refusal_streak = 0
             self._log(f"❌ LLM 返回格式错误: {raw[:300]}", "error")
+            self._step_log(
+                "llm_parse_fail",
+                {
+                    "step": self.step_count,
+                    "raw_prefix": raw[:220],
+                    "is_refusal": is_refusal,
+                    "parse_fail_streak": self._llm_parse_fail_streak,
+                    "refusal_streak": self._llm_refusal_streak,
+                },
+            )
             # region agent log
             self._ndjson_log(
                 hypothesis_id="H3",
@@ -1314,10 +1483,93 @@ class BrowserAgent:
                 },
             )
             # endregion
+
+            blocked_like = self._looks_like_external_blocked_text(visible_text) or bool(
+                self._last_submission_outcome
+                and self._last_submission_outcome.classification == "external_blocked"
+            )
+            if is_refusal and blocked_like:
+                if self.refresh_attempts < self.max_refresh_attempts:
+                    self._step_log(
+                        "llm_parse_fail_fallback",
+                        {
+                            "step": self.step_count,
+                            "reason_code": "blocked_page_refusal_refresh",
+                            "action": "refresh",
+                            "refresh_attempts": self.refresh_attempts,
+                            "refresh_limit": self.max_refresh_attempts,
+                        },
+                    )
+                    return AgentState(
+                        status="continue",
+                        summary="LLM 拒答且检测到外部阻断，执行刷新重开",
+                        next_action=AgentAction(
+                            action="refresh",
+                            reason="LLM refusal fallback on externally blocked page",
+                        ),
+                        raw_response=raw,
+                        page_fingerprint=page_fingerprint,
+                    )
+                self._step_log(
+                    "llm_parse_fail_fallback",
+                    {
+                        "step": self.step_count,
+                        "reason_code": "blocked_page_refusal_refresh_exhausted",
+                        "action": "stop_to_manual",
+                        "refresh_attempts": self.refresh_attempts,
+                        "refresh_limit": self.max_refresh_attempts,
+                    },
+                )
+                return AgentState(
+                    status="stuck",
+                    summary="外部阻断且 LLM 连续拒答，刷新次数已耗尽，需要人工处理",
+                    raw_response=raw,
+                    page_fingerprint=page_fingerprint,
+                )
+
+            if self._llm_parse_fail_streak >= 2:
+                deterministic_action = self._maybe_get_progression_queue_action(
+                    snapshot_map
+                )
+                if deterministic_action is not None:
+                    self._step_log(
+                        "llm_parse_fail_fallback",
+                        {
+                            "step": self.step_count,
+                            "reason_code": "deterministic_progression_fallback",
+                            "action": deterministic_action.action,
+                            "ref": deterministic_action.ref,
+                            "selector": deterministic_action.selector,
+                        },
+                    )
+                    return AgentState(
+                        status="continue",
+                        summary="LLM 连续格式错误，回退到确定性流程动作",
+                        next_action=deterministic_action,
+                        raw_response=raw,
+                        page_fingerprint=page_fingerprint,
+                    )
+                self._step_log(
+                    "llm_parse_fail_fallback",
+                    {
+                        "step": self.step_count,
+                        "reason_code": "parse_fail_exhausted",
+                        "action": "stop_to_manual",
+                        "parse_fail_streak": self._llm_parse_fail_streak,
+                    },
+                )
+                return AgentState(
+                    status="stuck",
+                    summary="LLM 连续返回无效格式，停止自动重试并转人工",
+                    raw_response=raw,
+                    page_fingerprint=page_fingerprint,
+                )
             return AgentState(
                 status="error", summary="LLM 返回格式错误", raw_response=raw
             )
 
+        self._llm_parse_fail_streak = 0
+        self._llm_refusal_streak = 0
         parsed = parse_agent_response_payload(
             data,
             simplify_state=self.simplify_state,
@@ -1371,8 +1623,8 @@ class BrowserAgent:
             success = False
 
             if action.action == "click":
-                if self._is_answer_click_action(action):
-                    bound = self._try_answer_binding_click(action)
+                if self._has_question_binding(action):
+                    bound = self._try_question_binding_click(action)
                     if bound is True:
                         success = True
                         self._log_action_verified(action, ok=success)
@@ -1532,12 +1784,9 @@ class BrowserAgent:
         source_item = self._last_snapshot_map.get(action.ref or "")
         if self._is_progression_action(action, item=source_item):
             return True
-        if self._is_answer_click_action(action) and action.target_question:
-            expected = self._normalize_answer_label(action.selector)
-            if expected in ("yes", "no"):
-                return self._verify_question_answer_state(
-                    action.target_question, expected
-                )
+        if self._has_question_binding(action) and action.selector:
+            if self._verify_question_option_state(action.target_question or "", action.selector):
+                return True
         try:
             after_url = self.page.url or ""
         except Exception:
@@ -1577,8 +1826,8 @@ class BrowserAgent:
 
         try:
             if action.action == "click":
-                if self._is_answer_click_action(action, item=item):
-                    bound = self._try_answer_binding_click(action)
+                if self._has_question_binding(action):
+                    bound = self._try_question_binding_click(action)
                     if bound is True:
                         self._log_action_verified(action, ok=True)
                         return True
@@ -1632,19 +1881,27 @@ class BrowserAgent:
                 self._log_action_verified(action, ok=ok)
                 return ok
             if action.action == "upload":
-                return self._do_upload(action, locator=locator)
+                ok = self._do_upload(action, locator=locator)
+                self._log_action_verified(action, ok=ok)
+                return ok
             if action.action == "scroll":
                 direction = action.value or action.selector or "down"
-                return self._do_scroll(direction)
+                ok = self._do_scroll(direction)
+                self._log_action_verified(action, ok=ok)
+                return ok
             if action.action == "refresh":
-                return self._do_refresh(trigger="llm_action")
+                ok = self._do_refresh(trigger="llm_action")
+                self._log_action_verified(action, ok=ok)
+                return ok
             if action.action in ("wait", "done", "stuck"):
                 if action.action == "wait":
                     seconds = int(action.value or 2)
                     self.page.wait_for_timeout(seconds * 1000)
+                self._log_action_verified(action, ok=True)
                 return True
         except Exception as e:
             self._log(f"ref 执行失败: {e}", "warn")
+            self._log_action_verified(action, ok=False)
             return False
 
         return False
@@ -1687,6 +1944,222 @@ class BrowserAgent:
             signals.append("intent:upload_request text")
 
         return signals
+
+    def _refresh_runtime_signals(
+        self, visible_text: str, snapshot_map: dict[str, SnapshotItem]
+    ) -> None:
+        """每步刷新运行时信号，避免宏任务分支读取陈旧状态。"""
+        upload_signals = self._detect_upload_signals(visible_text)
+        dom_upload_count = sum(
+            1
+            for item in snapshot_map.values()
+            if item.role == "file_input" or (item.input_type or "").lower() == "file"
+        )
+        if dom_upload_count > 0:
+            upload_signals.append(f"dom:file_input x{dom_upload_count}")
+        self._last_upload_signals = upload_signals
+        self._step_log(
+            "runtime_signals_refreshed",
+            {
+                "step": self.step_count,
+                "upload_signal_count": len(upload_signals),
+                "upload_signals": upload_signals[:8],
+            },
+        )
+
+    def _build_required_dom_summary(
+        self,
+        snapshot_map: dict[str, SnapshotItem],
+        question_blocks: list[QuestionBlock],
+    ) -> str:
+        required_fields: list[str] = []
+        for item in snapshot_map.values():
+            role = (item.role or "").lower()
+            is_required = bool(item.required)
+            if role in ("textbox", "combobox", "file_input"):
+                if not is_required:
+                    continue
+                value_hint = (item.value_hint or "").strip()
+                if role == "file_input" or not value_hint:
+                    required_fields.append(item.name or item.ref)
+        required_questions = [
+            qb.question_text.strip()
+            for qb in question_blocks
+            if qb.required and (qb.question_text or "").strip()
+        ]
+        if not required_questions:
+            fallback_questions = [
+                qb.question_text.strip()
+                for qb in question_blocks
+                if (qb.question_text or "").strip() and len(qb.options) >= 2
+            ]
+            if fallback_questions:
+                required_questions = fallback_questions[:4]
+        fields_part = ", ".join(required_fields[:6]) if required_fields else "无"
+        questions_part = ", ".join(required_questions[:4]) if required_questions else "无"
+        return f"字段[{fields_part}]；问题[{questions_part}]"
+
+    def _heuristic_visual_audit(
+        self,
+        snapshot_map: dict[str, SnapshotItem],
+        question_blocks: list[QuestionBlock],
+    ) -> VisualAuditResult:
+        required_fields: list[str] = []
+        required_uploads: list[str] = []
+        for item in snapshot_map.values():
+            if not item.required:
+                continue
+            role = (item.role or "").lower()
+            if role in ("textbox", "combobox"):
+                required_fields.append(item.name or item.ref)
+            if role == "file_input" or (item.input_type or "").lower() == "file":
+                required_uploads.append(item.name or "Resume")
+        required_questions = [
+            qb.question_text.strip()
+            for qb in question_blocks
+            if qb.required and (qb.question_text or "").strip()
+        ]
+        if not required_questions:
+            required_questions = [
+                qb.question_text.strip()
+                for qb in question_blocks
+                if (qb.question_text or "").strip() and len(qb.options) >= 2
+            ]
+        summary = (
+            f"检测到必填字段 {len(required_fields)} 项，"
+            f"必答问题 {len(required_questions)} 项，"
+            f"必传附件 {len(required_uploads)} 项。"
+        )
+        return VisualAuditResult(
+            visual_summary=summary,
+            required_fields=required_fields[:12],
+            required_questions=required_questions[:12],
+            required_uploads=required_uploads[:8],
+            source="heuristic",
+        )
+
+    def _run_scope_visual_audit(
+        self,
+        *,
+        scope: str,
+        snapshot_map: dict[str, SnapshotItem],
+        question_blocks: list[QuestionBlock],
+        force: bool = False,
+    ) -> VisualAuditResult:
+        """
+        新 scope 初始规划前做一次截图+语义交叉审计。
+        若模型不可用，则回退到 DOM 启发式审计。
+        """
+        cached = self._scope_visual_audits.get(scope)
+        if cached and not force:
+            return cached
+
+        result = self._heuristic_visual_audit(snapshot_map, question_blocks)
+        self._step_log(
+            "plan_visual_audit_started",
+            {
+                "step": self.step_count,
+                "scope": scope,
+                "question_count": len(question_blocks),
+            },
+        )
+
+        screenshot_b64 = self._capture_step_screenshot()
+        if screenshot_b64 and self.client:
+            prompt = (
+                "You are auditing a job application page screenshot. "
+                "Return strict JSON only: "
+                '{"visual_summary":"...",'
+                '"required_fields":["..."],'
+                '"required_questions":["..."],'
+                '"required_uploads":["..."]}. '
+                "Only include required items that appear mandatory on the page."
+            )
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"},
+                        },
+                    ],
+                }
+            ]
+            llm_result = run_chat_with_fallback(
+                client=self.client,
+                fallback_models=self.fallback_models,
+                start_model_index=self.model_index,
+                messages=messages,
+                temperature=0.1,
+                top_p=0.8,
+                max_tokens=320,
+                on_log=lambda lvl, msg: self._log(msg, lvl),
+            )
+            if llm_result.ok:
+                self.model_index = llm_result.model_index
+                self.model = llm_result.model
+                parsed = planner_safe_parse_json(llm_result.raw)
+                if isinstance(parsed, dict):
+                    visual_summary = str(parsed.get("visual_summary") or "").strip()
+                    required_fields = [
+                        str(x).strip()
+                        for x in (parsed.get("required_fields") or [])
+                        if str(x).strip()
+                    ][:12]
+                    required_questions = [
+                        str(x).strip()
+                        for x in (parsed.get("required_questions") or [])
+                        if str(x).strip()
+                    ][:12]
+                    required_uploads = [
+                        str(x).strip()
+                        for x in (parsed.get("required_uploads") or [])
+                        if str(x).strip()
+                    ][:8]
+                    if visual_summary or required_fields or required_questions or required_uploads:
+                        merged_fields = list(
+                            dict.fromkeys(result.required_fields + required_fields)
+                        )
+                        merged_questions = list(
+                            dict.fromkeys(result.required_questions + required_questions)
+                        )
+                        merged_uploads = list(
+                            dict.fromkeys(result.required_uploads + required_uploads)
+                        )
+                        result = VisualAuditResult(
+                            visual_summary=visual_summary or result.visual_summary,
+                            required_fields=merged_fields[:12],
+                            required_questions=merged_questions[:12],
+                            required_uploads=merged_uploads[:8],
+                            source="vision+heuristic",
+                        )
+            else:
+                self._step_log(
+                    "plan_visual_audit_fallback",
+                    {
+                        "step": self.step_count,
+                        "scope": scope,
+                        "error_code": llm_result.error_code,
+                        "error_summary": llm_result.error_summary,
+                    },
+                )
+
+        self._scope_visual_audits[scope] = result
+        self._latest_visual_summary = result.visual_summary
+        self._step_log(
+            "plan_visual_audit_merged",
+            {
+                "step": self.step_count,
+                "scope": scope,
+                "source": result.source,
+                "required_field_count": len(result.required_fields),
+                "required_question_count": len(result.required_questions),
+                "required_upload_count": len(result.required_uploads),
+            },
+        )
+        return result
 
     def _collect_manual_required_evidence(
         self,
@@ -1870,6 +2343,27 @@ class BrowserAgent:
         label_intents = self._infer_label_intents([name])
         intents = label_intents.get(name, set())
         return "progression_action" in intents or "apply_entry" in intents
+
+    def _is_submission_click_action(
+        self,
+        action: AgentAction,
+        item: SnapshotItem | None = None,
+    ) -> bool:
+        if action.action != "click":
+            return False
+        label = ""
+        if item is not None:
+            label = item.name or ""
+        elif action.selector:
+            label = action.selector
+        lower = (label or "").strip().lower()
+        if not lower:
+            return False
+        if "submit" in lower:
+            return True
+        if "complete application" in lower or "finish application" in lower:
+            return True
+        return False
 
     def _get_progression_block_reason(self) -> str | None:
         """
@@ -2325,6 +2819,7 @@ class BrowserAgent:
             item,
             is_answer_click_action=self._is_answer_click_action,
             verify_question_answer_state=self._verify_question_answer_state,
+            verify_question_option_state=self._verify_question_option_state,
         )
 
     def _retry_ref_action(
@@ -2347,7 +2842,7 @@ class BrowserAgent:
                 try:
                     locator.scroll_into_view_if_needed(timeout=1500)
                     locator.click(timeout=1500)
-                    return True
+                    return self._verify_ref_action_effect(action, locator, item)
                 except Exception:
                     return False
         except Exception:
@@ -2365,6 +2860,26 @@ class BrowserAgent:
     def _normalize_answer_label(self, text: str | None) -> str:
         return verifier_normalize_answer_label(text)
 
+    def _normalize_option_text(self, text: str | None) -> str:
+        value = (text or "").strip().lower()
+        value = re.sub(r"[\s\u00a0]+", " ", value)
+        value = re.sub(r"[^\w\s]", "", value)
+        return value.strip()
+
+    def _option_text_matches(self, left: str | None, right: str | None) -> bool:
+        left_norm = self._normalize_option_text(left)
+        right_norm = self._normalize_option_text(right)
+        if not left_norm or not right_norm:
+            return False
+        if left_norm == right_norm:
+            return True
+        if left_norm in right_norm or right_norm in left_norm:
+            return True
+        return False
+
+    def _has_question_binding(self, action: AgentAction) -> bool:
+        return bool((action.target_question or "").strip())
+
     def _is_answer_click_action(
         self, action: AgentAction, item: SnapshotItem | None = None
     ) -> bool:
@@ -2379,51 +2894,97 @@ class BrowserAgent:
                 label = snapshot_item.name or ""
         return self._normalize_answer_label(label) in ("yes", "no")
 
-    def _try_answer_binding_click(self, action: AgentAction) -> bool | None:
+    def _try_question_binding_click(self, action: AgentAction) -> bool | None:
         """
-        对同名 Yes/No 优先执行“问题绑定点击”。
+        对目标问题优先执行“问题绑定点击”（支持 Yes/No、A/B/C 及通用选项）。
         返回：
         - True：绑定点击成功且后验通过
         - False：绑定点击已执行但后验失败
         - None：不适用或定位失败，回退原有点击路径
         """
-        answer = self._normalize_answer_label(action.selector)
         question = (action.target_question or "").strip()
-        if not answer or not question:
+        option = (action.selector or "").strip()
+        if not option and action.ref:
+            target = self._last_snapshot_map.get(action.ref)
+            if target:
+                option = (target.name or "").strip()
+        if not option or not question:
             return None
-        payload = self._click_answer_with_question_binding(question, answer)
+        payload = self._click_answer_with_question_binding(question, option)
+        if not bool(payload.get("ok", False)):
+            self._step_log(
+                "answer_binding_attempt",
+                {
+                    "step": self.step_count,
+                    "classification": "validation_error",
+                    "reason_code": "answer_binding",
+                    "evidence_snippet": str(payload.get("reason", ""))[:220],
+                    "question": question,
+                    "answer": option,
+                    "ok": False,
+                    "reason": payload.get("reason", ""),
+                },
+            )
+            return False
+        try:
+            self.page.wait_for_timeout(180)
+        except Exception:
+            pass
+        inspected = self._inspect_question_option_state(question, option)
+        verified = bool(
+            inspected.get("matched")
+            and inspected.get("option_found")
+            and inspected.get("option_selected")
+        )
+        verify_reason = "option_selected_verified" if verified else "option_not_selected"
         self._step_log(
             "answer_binding_attempt",
             {
                 "step": self.step_count,
                 "classification": "validation_error",
                 "reason_code": "answer_binding",
-                "evidence_snippet": str(payload.get("reason", ""))[:220],
+                "evidence_snippet": str(
+                    f"{payload.get('reason', '')}|{verify_reason}"
+                )[:220],
                 "question": question,
-                "answer": answer,
-                "ok": bool(payload.get("ok", False)),
-                "reason": payload.get("reason", ""),
+                "answer": option,
+                "ok": bool(verified),
+                "reason": verify_reason,
+                "option_found": bool(inspected.get("option_found")),
+                "scope_kind": str(inspected.get("scope_kind") or ""),
+                "scope_control_count": int(inspected.get("scope_control_count") or 0),
+                "selected_options": [
+                    str(x) for x in (inspected.get("selected_options") or [])[:6]
+                ],
             },
         )
-        if not bool(payload.get("ok", False)):
-            return None
-        verified = self._verify_question_answer_state(question, answer)
+        if not verified and self._is_answer_click_action(action):
+            # Yes/No 场景继续兼容旧后验，以覆盖部分站点的 aria 差异。
+            answer = self._normalize_answer_label(option)
+            if answer in ("yes", "no"):
+                verified = self._verify_question_answer_state(question, answer)
         return bool(verified)
 
-    def _click_answer_with_question_binding(
-        self, question: str, answer: str
+    def _try_answer_binding_click(self, action: AgentAction) -> bool | None:
+        """
+        兼容旧调用：已升级为通用问题绑定点击。
+        """
+        return self._try_question_binding_click(action)
+
+    def _click_option_with_question_binding(
+        self, question: str, option_text: str
     ) -> dict[str, str | bool]:
         """
-        在包含问题文本的容器内点击指定答案（yes/no）。
+        在包含问题文本的容器内点击指定选项（通用）。
         """
         try:
             result = self.page.evaluate(
                 """
-                ({ question, answer }) => {
+                ({ question, optionText }) => {
                   const norm = (v) => String(v || "").toLowerCase().replace(/\\s+/g, " ").trim();
                   const q = norm(question);
-                  const a = norm(answer);
-                  if (!q || !a) return { ok: false, reason: "missing_question_or_answer" };
+                  const optionNorm = norm(optionText);
+                  if (!q || !optionNorm) return { ok: false, reason: "missing_question_or_answer" };
                   const isVisible = (el) => {
                     if (!el) return false;
                     const st = window.getComputedStyle(el);
@@ -2436,42 +2997,60 @@ class BrowserAgent:
                     if (!el) return "";
                     return norm(el.innerText || el.textContent || el.getAttribute("aria-label") || el.value || "");
                   };
-                  const answerNodes = Array.from(
-                    document.querySelectorAll("button, [role='button'], label, input[type='radio'], input[type='checkbox']")
+                  const clickableNodes = Array.from(
+                    document.querySelectorAll(
+                      "button, [role='button'], label, input[type='radio'], input[type='checkbox'], [role='radio'], [role='checkbox']"
+                    )
                   ).filter((el) => isVisible(el));
-                  const answerCandidates = answerNodes.filter((el) => {
+                  const answerCandidates = clickableNodes.filter((el) => {
                     const t = textOf(el);
-                    return t === a || t.startsWith(a + " ");
+                    return (
+                      t === optionNorm ||
+                      t.startsWith(optionNorm + " ") ||
+                      optionNorm.startsWith(t + " ")
+                    );
                   });
                   if (!answerCandidates.length) {
                     return { ok: false, reason: "answer_candidates_not_found" };
                   }
-                  const containerHints = ["fieldset", "[role='group']", "[role='radiogroup']", "form", ".question", ".application-question", "section", "li", "div"];
+                  const controlSelectors = "button, [role='button'], label, input[type='radio'], input[type='checkbox'], [role='radio'], [role='checkbox']";
+                  const controlsInside = (scope) => {
+                    if (!scope) return [];
+                    return Array.from(scope.querySelectorAll(controlSelectors)).filter((el) => isVisible(el));
+                  };
                   let best = null;
-                  let bestScore = -1;
+                  let bestScore = -Infinity;
                   for (const candidate of answerCandidates) {
                     let cur = candidate;
                     let depth = 0;
+                    let candidateScored = false;
                     while (cur && depth < 8) {
+                      const tag = String(cur.tagName || "").toLowerCase();
+                      if (tag === "form" || tag === "body" || tag === "html") {
+                        break;
+                      }
                       const scoreText = textOf(cur);
-                      if (scoreText.includes(q)) {
-                        const score = 100 - depth;
+                      const controls = controlsInside(cur);
+                      if (scoreText.includes(q) && controls.length >= 2) {
+                        let score = 0;
+                        if (tag === "fieldset") score += 90;
+                        const role = String(cur.getAttribute?.("role") || "").toLowerCase();
+                        if (role === "radiogroup" || role === "group") score += 80;
+                        score += Math.max(0, 40 - depth * 5);
+                        score -= controls.length * 10;
+                        score -= Math.min(scoreText.length / 40, 50);
                         if (score > bestScore) {
                           bestScore = score;
                           best = candidate;
                         }
+                        candidateScored = true;
                         break;
                       }
-                      let next = null;
-                      for (const sel of containerHints) {
-                        const found = cur.closest(sel);
-                        if (found && found !== cur) {
-                          next = found.parentElement;
-                          break;
-                        }
-                      }
-                      cur = next || cur.parentElement;
+                      cur = cur.parentElement;
                       depth += 1;
+                    }
+                    if (!candidateScored && depth >= 8) {
+                      // no-op; keep searching other candidates
                     }
                   }
                   if (!best) return { ok: false, reason: "question_container_not_found" };
@@ -2485,7 +3064,7 @@ class BrowserAgent:
                   return { ok: true, reason: "clicked_in_question_container" };
                 }
                 """,
-                {"question": question, "answer": answer},
+                {"question": question, "optionText": option_text},
             )
         except Exception as e:
             return {"ok": False, "reason": f"binding_eval_error:{type(e).__name__}"}
@@ -2496,6 +3075,12 @@ class BrowserAgent:
             }
         return {"ok": False, "reason": "binding_eval_unexpected_payload"}
 
+    def _click_answer_with_question_binding(
+        self, question: str, answer: str
+    ) -> dict[str, str | bool]:
+        """兼容旧调用：answer 语义等同于 option_text。"""
+        return self._click_option_with_question_binding(question, answer)
+
     def _verify_question_answer_state(
         self, question: str, expected_answer: str
     ) -> bool:
@@ -2504,6 +3089,43 @@ class BrowserAgent:
         """
         if not question or expected_answer not in ("yes", "no"):
             return False
+        return self._verify_question_option_state(question, expected_answer)
+
+    def _verify_question_option_state(
+        self, question: str, expected_option: str
+    ) -> bool:
+        """
+        校验目标问题的选项是否已被选中（节点级后验）。
+        """
+        if not question or not expected_option:
+            return False
+        result = self._inspect_question_option_state(question, expected_option)
+        return bool(
+            result.get("matched")
+            and result.get("option_found")
+            and result.get("option_selected")
+        )
+
+    def _collect_selected_options_for_question(self, question: str) -> list[str]:
+        result = self._inspect_question_option_state(question, expected_option="")
+        selected = result.get("selected_options") or []
+        if not isinstance(selected, list):
+            return []
+        return [str(x) for x in selected if str(x).strip()][:12]
+
+    def _inspect_question_option_state(
+        self, question: str, expected_option: str
+    ) -> dict[str, object]:
+        """
+        返回问题级选项状态详情，供 question_single/question_multi 共用。
+        """
+        if not question:
+            return {
+                "matched": False,
+                "option_found": False,
+                "option_selected": False,
+                "selected_options": [],
+            }
         try:
             result = self.page.evaluate(
                 """
@@ -2511,7 +3133,14 @@ class BrowserAgent:
                   const norm = (v) => String(v || "").toLowerCase().replace(/\\s+/g, " ").trim();
                   const q = norm(question);
                   const expectedNorm = norm(expected);
-                  if (!q) return { matched: false, selected: [] };
+                  if (!q) {
+                    return {
+                      matched: false,
+                      option_found: false,
+                      option_selected: false,
+                      selected: [],
+                    };
+                  }
                   const isVisible = (el) => {
                     if (!el) return false;
                     const st = window.getComputedStyle(el);
@@ -2520,46 +3149,222 @@ class BrowserAgent:
                     const r = el.getBoundingClientRect();
                     return r.width > 0 && r.height > 0;
                   };
-                  const textOf = (el) => norm(el?.innerText || el?.textContent || el?.getAttribute("aria-label") || "");
-                  const selected = [];
-                  let matched = false;
-                  const scopes = Array.from(document.querySelectorAll("fieldset,[role='group'],[role='radiogroup'],form,section,li,div"))
-                    .filter((el) => isVisible(el) && textOf(el).includes(q));
-                  for (const scope of scopes.slice(0, 12)) {
-                    matched = true;
-                    const checkedInputs = Array.from(scope.querySelectorAll("input[type='radio']:checked,input[type='checkbox']:checked"));
-                    for (const el of checkedInputs) {
-                      const label = textOf(el.closest("label")) || textOf(el);
-                      if (label) selected.push(label);
+                  const textOf = (el) => {
+                    if (!el) return "";
+                    const text = el.innerText || el.textContent || "";
+                    const aria = el.getAttribute ? (el.getAttribute("aria-label") || "") : "";
+                    const value = el.value || "";
+                    return norm(text || aria || value);
+                  };
+                  const roleOf = (el) => {
+                    const role = String(el?.getAttribute?.("role") || "").toLowerCase();
+                    if (role) return role;
+                    const tag = String(el?.tagName || "").toLowerCase();
+                    const type = String(el?.getAttribute?.("type") || "").toLowerCase();
+                    if (tag === "input" && type === "checkbox") return "checkbox";
+                    if (tag === "input" && type === "radio") return "radio";
+                    return tag || "unknown";
+                  };
+                  const labelOf = (el) => {
+                    if (!el) return "";
+                    const role = roleOf(el);
+                    if (role === "checkbox" || role === "radio") {
+                      const id = el.getAttribute?.("id") || "";
+                      if (id) {
+                        const byFor = document.querySelector(`label[for="${id}"]`);
+                        const txt = textOf(byFor);
+                        if (txt) return txt;
+                      }
+                      const wrap = el.closest?.("label");
+                      const wrapText = textOf(wrap);
+                      if (wrapText) return wrapText;
                     }
-                    const pressed = Array.from(scope.querySelectorAll("button,[role='button']"))
-                      .filter((el) => {
-                        const pressed = String(el.getAttribute("aria-pressed") || "").toLowerCase();
-                        const checked = String(el.getAttribute("aria-checked") || "").toLowerCase();
-                        const cls = String(el.className || "").toLowerCase();
-                        return pressed === "true" || checked === "true" || cls.includes("selected") || cls.includes("active") || cls.includes("checked");
-                      });
-                    for (const el of pressed) {
-                      const t = textOf(el);
-                      if (t) selected.push(t);
+                    const own = textOf(el);
+                    if (own) return own;
+                    const parentLabel = textOf(el.closest?.("label"));
+                    if (parentLabel) return parentLabel;
+                    return "";
+                  };
+                  const selectedOf = (el) => {
+                    if (!el) return false;
+                    const role = roleOf(el);
+                    if (role === "checkbox" || role === "radio") {
+                      const checked = el.checked;
+                      if (typeof checked === "boolean") return checked;
+                    }
+                    const ariaChecked = String(el.getAttribute?.("aria-checked") || "").toLowerCase();
+                    if (ariaChecked === "true") return true;
+                    if (ariaChecked === "false") return false;
+                    const ariaPressed = String(el.getAttribute?.("aria-pressed") || "").toLowerCase();
+                    if (ariaPressed === "true") return true;
+                    if (ariaPressed === "false") return false;
+                    const dataState = String(el.getAttribute?.("data-state") || "").toLowerCase();
+                    if (dataState === "checked" || dataState === "on" || dataState === "selected") return true;
+                    const cls = String(el.className || "").toLowerCase();
+                    if (cls.includes("selected") || cls.includes("active") || cls.includes("checked")) return true;
+                    if (el.matches?.("label")) {
+                      const child = el.querySelector("input[type='checkbox'],input[type='radio']");
+                      if (child && typeof child.checked === "boolean") return child.checked;
+                    }
+                    return false;
+                  };
+                  const controlSelectors = [
+                    "input[type='radio']",
+                    "input[type='checkbox']",
+                    "[role='radio']",
+                    "[role='checkbox']",
+                    "button",
+                    "[role='button']",
+                    "[aria-pressed]",
+                    "[aria-checked]",
+                    "label"
+                  ].join(",");
+                  const controlsInside = (scope) => {
+                    if (!scope) return [];
+                    return Array.from(scope.querySelectorAll(controlSelectors)).filter((el) => isVisible(el));
+                  };
+                  const scoreScope = (scope) => {
+                    const tag = String(scope?.tagName || "").toLowerCase();
+                    const role = String(scope?.getAttribute?.("role") || "").toLowerCase();
+                    const txt = textOf(scope);
+                    const controls = controlsInside(scope);
+                    if (!txt.includes(q) || controls.length < 2) return null;
+                    if (tag === "form" || tag === "body" || tag === "html") return null;
+                    let depth = 0;
+                    let cur = scope;
+                    while (cur && depth < 20) {
+                      depth += 1;
+                      cur = cur.parentElement;
+                    }
+                    let score = 0;
+                    if (tag === "fieldset") score += 90;
+                    if (role === "radiogroup" || role === "group") score += 80;
+                    if (role === "group" && (scope.getAttribute("aria-label") || "").toLowerCase().includes(q)) score += 25;
+                    score += Math.min(depth * 3, 60);
+                    score -= controls.length * 12;
+                    score -= Math.min(txt.length / 30, 80);
+                    return { scope, controls, score, txtLen: txt.length };
+                  };
+                  const primaryCandidates = Array.from(
+                    document.querySelectorAll(
+                      "fieldset,[role='radiogroup'],[role='group'],[data-testid*='question' i],[class*='question' i],section,li,div"
+                    )
+                  )
+                    .filter((el) => isVisible(el))
+                    .map((el) => scoreScope(el))
+                    .filter(Boolean);
+                  const expectedCandidates = expectedNorm
+                    ? Array.from(document.querySelectorAll(controlSelectors)).filter((el) => {
+                        if (!isVisible(el)) return false;
+                        const label = labelOf(el);
+                        if (!label) return false;
+                        return (
+                          label === expectedNorm ||
+                          label.startsWith(expectedNorm + " ") ||
+                          expectedNorm.startsWith(label + " ")
+                        );
+                      })
+                    : [];
+                  const fallbackCandidates = [];
+                  for (const candidate of expectedCandidates.slice(0, 24)) {
+                    let cur = candidate;
+                    let depth = 0;
+                    while (cur && depth < 10) {
+                      cur = cur.parentElement;
+                      depth += 1;
+                      if (!cur) break;
+                      const tag = String(cur.tagName || "").toLowerCase();
+                      if (tag === "form" || tag === "body" || tag === "html") break;
+                      const scored = scoreScope(cur);
+                      if (scored) {
+                        scored.score += 50 - depth * 2;
+                        fallbackCandidates.push(scored);
+                        break;
+                      }
                     }
                   }
-                  const dedup = Array.from(new Set(selected));
-                  const ok = dedup.some((s) => s === expectedNorm || s.startsWith(expectedNorm + " "));
-                  return { matched, selected: dedup, ok };
+                  const merged = [...primaryCandidates, ...fallbackCandidates];
+                  merged.sort((a, b) => {
+                    if (b.score !== a.score) return b.score - a.score;
+                    if (a.controls.length !== b.controls.length) return a.controls.length - b.controls.length;
+                    return a.txtLen - b.txtLen;
+                  });
+                  const chosen = merged[0] || null;
+                  let matched = false;
+                  let optionFound = false;
+                  let optionSelected = false;
+                  const selected = [];
+                  if (chosen) {
+                    matched = true;
+                    for (const el of chosen.controls) {
+                      const label = labelOf(el);
+                      if (!label) continue;
+                      const isSelected = selectedOf(el);
+                      if (isSelected) selected.push(label);
+                      if (!expectedNorm) continue;
+                      if (
+                        label === expectedNorm ||
+                        label.startsWith(expectedNorm + " ") ||
+                        expectedNorm.startsWith(label + " ")
+                      ) {
+                        optionFound = true;
+                        if (isSelected) optionSelected = true;
+                      }
+                    }
+                  }
+                  const dedup = Array.from(new Set(selected.filter(Boolean)));
+                  if (!expectedNorm) optionFound = true;
+                  return {
+                    matched,
+                    option_found: optionFound,
+                    option_selected: optionSelected,
+                    selected: dedup,
+                    scope_kind: chosen
+                      ? `${String(chosen.scope.tagName || "").toLowerCase()}#${String(chosen.scope.getAttribute?.("role") || "").toLowerCase()}`
+                      : "",
+                    scope_control_count: chosen ? chosen.controls.length : 0,
+                  };
                 }
                 """,
-                {"question": question, "expected": expected_answer},
+                {"question": question, "expected": expected_option},
             )
         except Exception:
-            return False
+            return {
+                "matched": False,
+                "option_found": False,
+                "option_selected": False,
+                "selected_options": [],
+            }
         if not isinstance(result, dict):
-            return False
-        return bool(result.get("matched")) and bool(result.get("ok"))
+            return {
+                "matched": False,
+                "option_found": False,
+                "option_selected": False,
+                "selected_options": [],
+            }
+        selected = result.get("selected") or []
+        if not isinstance(selected, list):
+            selected = []
+        return {
+            "matched": bool(result.get("matched")),
+            "option_found": bool(result.get("option_found")),
+            "option_selected": bool(result.get("option_selected")),
+            "selected_options": [str(x) for x in selected if str(x).strip()][:12],
+            "scope_kind": str(result.get("scope_kind") or ""),
+            "scope_control_count": int(result.get("scope_control_count") or 0),
+        }
 
     def _classify_submission_outcome(
         self, action: AgentAction, action_success: bool
     ) -> SubmissionOutcome:
+        if action_success:
+            done, reason = self._verify_completion()
+            if done:
+                return SubmissionOutcome(
+                    classification="success_confirmed",
+                    reason_code="post_submit_terminal_verified",
+                    evidence_snippet=(reason or "")[:220],
+                )
         evidence = self._extract_outcome_text_evidence()
         block_reason = self._get_progression_block_reason()
         return oc_classify_submission_outcome(
@@ -2594,7 +3399,7 @@ class BrowserAgent:
                 "reason_code": outcome.reason_code,
             },
         )
-        self._sync_failure_hints(outcome)
+        self._sync_failure_hints(outcome, action)
         if outcome.classification == "success_confirmed":
             return True, False
         if outcome.classification == "validation_error":
@@ -2638,6 +3443,33 @@ class BrowserAgent:
                     "evidence_snippet": outcome.evidence_snippet,
                 },
             )
+            if (
+                outcome.classification == "external_blocked"
+                and outcome.reason_code == "anti_spam_or_risk_blocked"
+            ):
+                refreshed = self._do_refresh(
+                    trigger="external_blocked_immediate_restart"
+                )
+                self._step_log(
+                    "retry_policy_applied",
+                    {
+                        "step": self.step_count,
+                        "classification": outcome.classification,
+                        "reason_code": "immediate_refresh_restart",
+                        "retry_count": retry_count,
+                        "retry_limit": self._submission_retry_limit,
+                        "semantic_key": key,
+                        "refreshed": bool(refreshed),
+                    },
+                )
+                if retry_count >= self._submission_retry_limit:
+                    return False, True
+                if not refreshed and self.refresh_exhausted:
+                    return False, True
+                self.history.append(
+                    f"步骤{self.step_count}: 检测到 anti-spam/risk 阻断，立即刷新并重开流程（重试 {retry_count}/{self._submission_retry_limit}）"
+                )
+                return False, False
             if retry_count >= self._submission_retry_limit:
                 return False, True
             refresh_attempts = self._submission_refresh_attempts.get(key, 0)
@@ -2695,7 +3527,169 @@ class BrowserAgent:
             text = f"{text}\n" + "\n".join(snippets)
         return (text or "")[:3000]
 
-    def _sync_failure_hints(self, outcome: SubmissionOutcome) -> None:
+    def _recommended_strategy_for_failure(
+        self, classification: str, reason_code: str
+    ) -> tuple[str, str]:
+        cls = (classification or "").strip().lower()
+        code = (reason_code or "").strip().lower()
+        if cls == "external_blocked":
+            if code == "anti_spam_or_risk_blocked":
+                return (
+                    "检测到站点风控阻断时，立即刷新页面并完整重开流程；最多 3 次后转人工。",
+                    "禁止在同一阻断页面连续重复点击 Submit。",
+                )
+            return (
+                "提交受外部阻断时，先做一次刷新恢复，再执行有限重试。",
+                "禁止无证据地无限重试提交动作。",
+            )
+        if cls == "validation_error":
+            return (
+                "先定位并修复具体报错字段，再继续提交流程。",
+                "禁止在必填错误未修复时直接重复提交。",
+            )
+        if cls == "transient_network":
+            return (
+                "等待短暂网络恢复后重试合法入口，失败则切换恢复路径。",
+                "禁止连续快速点击导致额外网络抖动。",
+            )
+        if "precondition_timeout" in code:
+            return (
+                "前置条件连续不满足时，执行全页重采样并重建计划。",
+                "禁止在同一缺失前置条件下反复执行同一任务。",
+            )
+        return (
+            "切换到替代策略并重采样页面语义，再决定下一步。",
+            "禁止同语义动作在无状态变化时无限重复。",
+        )
+
+    def _record_failure_memory_case(
+        self,
+        *,
+        classification: str,
+        reason_code: str,
+        symptom: str,
+        root_cause: str,
+        evidence_snippet: str = "",
+        question_text: str = "",
+        action: str = "",
+        selector: str = "",
+        source_event: str = "",
+    ) -> None:
+        try:
+            strategy, guardrails = self._recommended_strategy_for_failure(
+                classification, reason_code
+            )
+            self._failure_memory.upsert_case(
+                page_scope=self._stable_page_scope(),
+                classification=classification or "unknown_blocked",
+                reason_code=reason_code or "unspecified",
+                symptom=(symptom or "")[:220],
+                root_cause=(root_cause or "")[:220],
+                successful_strategy=strategy,
+                guardrails=guardrails,
+                evidence_snippet=(evidence_snippet or "")[:320],
+                question_text=(question_text or "")[:220],
+                action=(action or "")[:80],
+                selector=(selector or "")[:120],
+                source_event=source_event or "runtime",
+                status="active",
+            )
+        except Exception:
+            # Failure memory is best-effort; never block runtime.
+            return
+
+    def _load_failure_memory_hints(
+        self,
+        *,
+        page_scope: str,
+        question_blocks: list[QuestionBlock],
+    ) -> str:
+        entries = []
+        seen: set[str] = set()
+        classification = (
+            self._last_submission_outcome.classification
+            if self._last_submission_outcome is not None
+            else ""
+        )
+        reason_code = (
+            self._last_submission_outcome.reason_code
+            if self._last_submission_outcome is not None
+            else ""
+        )
+        primary = self._failure_memory.query_similar(
+            page_scope=page_scope,
+            classification=classification,
+            reason_code=reason_code,
+            question_text="",
+            action="submit",
+            limit=2,
+        )
+        for item in primary:
+            if item.signature in seen:
+                continue
+            seen.add(item.signature)
+            entries.append(item)
+        for qb in question_blocks[:5]:
+            hits = self._failure_memory.query_similar(
+                page_scope=page_scope,
+                classification="",
+                reason_code="",
+                question_text=qb.question_text,
+                action="click",
+                limit=1,
+            )
+            for item in hits:
+                if item.signature in seen:
+                    continue
+                seen.add(item.signature)
+                entries.append(item)
+                if len(entries) >= 3:
+                    break
+            if len(entries) >= 3:
+                break
+        summary = self._failure_memory.format_hints_for_prompt(entries, max_items=3)
+        self._step_log(
+            "failure_memory_hints_loaded",
+            {
+                "step": self.step_count,
+                "scope": page_scope,
+                "hint_count": len(entries),
+                "signatures": [item.signature for item in entries[:5]],
+            },
+        )
+        return summary
+
+    def _should_query_failure_memory(
+        self,
+        *,
+        page_state: str,
+        question_blocks: list[QuestionBlock],
+        has_pending_macro_tasks: bool,
+    ) -> tuple[bool, str]:
+        """
+        只在“问题态”或“关键提交态”检索 Failure Memory。
+        普通稳定填表步骤默认不检索，降低延迟与提示噪音。
+        """
+        if self.consecutive_failures > 0 or self._same_task_failure_streak > 0:
+            return True, "failure_recovery"
+        if self._last_progression_block_reason:
+            return True, "progression_blocked"
+        if self._last_submission_outcome and (
+            self._last_submission_outcome.classification != "success_confirmed"
+        ):
+            return True, "post_submit_problem"
+        if any(block.has_error for block in question_blocks):
+            return True, "question_error_detected"
+        if (
+            page_state == "application_or_form_page"
+            and not has_pending_macro_tasks
+        ):
+            return True, "pre_submit_review"
+        return False, "stable_fill_path"
+
+    def _sync_failure_hints(
+        self, outcome: SubmissionOutcome, action: AgentAction | None = None
+    ) -> None:
         class_map = {
             "validation_error": "validation_error",
             "external_blocked": "external_blocked",
@@ -2712,6 +3706,18 @@ class BrowserAgent:
             self.failure_code_hint = None
             self.retry_count_hint = 0
             self.last_error_snippet_hint = None
+            return
+        self._record_failure_memory_case(
+            classification=outcome.classification,
+            reason_code=outcome.reason_code,
+            symptom=f"提交结果分类为 {outcome.classification}",
+            root_cause=outcome.reason_code or "submission_outcome_unknown",
+            evidence_snippet=outcome.evidence_snippet,
+            question_text=(action.target_question if action else ""),
+            action=(action.action if action else ""),
+            selector=(action.selector if action else ""),
+            source_event="submission_outcome_classified",
+        )
 
     def _build_submission_manual_reason(self, action: AgentAction) -> str:
         outcome = self._last_submission_outcome
@@ -2780,10 +3786,11 @@ class BrowserAgent:
         if any(
             token in lower
             for token in (
-                "captcha",
                 "verify you are human",
                 "security check",
                 "flagged as possible spam",
+                "suspicious activity",
+                "too many requests",
             )
         ):
             return True, "risk_or_challenge_keyword"
@@ -2963,17 +3970,73 @@ class BrowserAgent:
             ]
         )
 
+    def _task_execution_key(self, page_fingerprint: str, action: AgentAction) -> str:
+        semantic_key = self._semantic_action_key(page_fingerprint, action)
+        if semantic_key:
+            return semantic_key
+        selector = (action.selector or "").strip().lower()
+        question = (action.target_question or "").strip().lower()
+        return "|".join(
+            [
+                self._stable_page_scope(),
+                action.action or "",
+                selector,
+                question,
+            ]
+        )
+
+    def _maybe_get_progression_queue_action(
+        self, snapshot_map: dict[str, SnapshotItem]
+    ) -> AgentAction | None:
+        # 若页面没有可提交入口，或仍存在明确阻断，不生成提交动作。
+        submit_like: list[tuple[str, SnapshotItem]] = []
+        fallback_progression: list[tuple[str, SnapshotItem]] = []
+        for ref, item in snapshot_map.items():
+            if item.role not in ("button", "link"):
+                continue
+            label = (item.name or "").strip().lower()
+            if any(k in label for k in ("submit", "finish application", "complete application")):
+                submit_like.append((ref, item))
+            elif any(k in label for k in ("review", "continue", "apply")):
+                fallback_progression.append((ref, item))
+        if not submit_like and fallback_progression:
+            submit_like = fallback_progression
+        if not submit_like:
+            return None
+        blocked_reason = self._get_progression_block_reason()
+        if blocked_reason:
+            return None
+        chosen_ref, chosen_item = submit_like[0]
+        self._step_log(
+            "queue_task_selected",
+            {
+                "step": self.step_count,
+                "task_type": "progression_submit",
+                "ref": chosen_ref,
+                "selector": chosen_item.name,
+                "reason_code": "queue_progression_step",
+            },
+        )
+        return AgentAction(
+            action="click",
+            ref=chosen_ref,
+            selector=chosen_item.name,
+            element_type=chosen_item.role,
+            reason="[queue] macro tasks completed, try progression submit",
+        )
+
     def _normalized_action_intent(self, action: AgentAction) -> str | None:
         if action.action != "click":
             return None
-        label = self._normalize_answer_label(action.selector)
-        if not label and action.ref:
-            item = self._last_snapshot_map.get(action.ref)
-            if item:
-                label = self._normalize_answer_label(item.name)
-        if label in ("yes", "no"):
+        if self._has_question_binding(action):
+            raw_option = (action.selector or "").strip().lower()
+            if not raw_option and action.ref:
+                item = self._last_snapshot_map.get(action.ref)
+                if item:
+                    raw_option = (item.name or "").strip().lower()
+            label = self._normalize_answer_label(raw_option) or raw_option
             question = (action.target_question or "").strip().lower()
-            return f"answer::{question or 'unknown'}::{label}"
+            return f"answer::{question or 'unknown'}::{label or 'unknown_option'}"
         source_item = self._last_snapshot_map.get(action.ref or "")
         if self._is_progression_action(action, item=source_item):
             return "progression::submit_apply"
@@ -3132,52 +4195,229 @@ class BrowserAgent:
     def _find_question_block(self, task: MacroTask) -> QuestionBlock | None:
         if not task.question_text:
             return None
-        wanted = " ".join(task.question_text.lower().split())
-        for block in self._last_question_blocks:
-            current = " ".join((block.question_text or "").lower().split())
-            if current == wanted:
-                return block
-            if wanted and wanted in current:
-                return block
-            if current and current in wanted:
-                return block
+        return self._find_matching_question_block(
+            task.question_text, self._last_question_blocks
+        )
+
+    def _selected_expected_options(
+        self, task: MacroTask, selected_values: list[str]
+    ) -> list[str]:
+        matched: list[str] = []
+        for expected in task.expected_options:
+            if any(self._option_text_matches(expected, picked) for picked in selected_values):
+                matched.append(expected)
+        return matched
+
+    def _compute_question_multi_remaining(
+        self, task: MacroTask, block: QuestionBlock | None
+    ) -> tuple[list[str], list[str]]:
+        selected_values: list[str] = []
+        if block:
+            selected_values.extend([str(x) for x in block.selected_options if str(x).strip()])
+        selected_values.extend(self._collect_selected_options_for_question(task.question_text or ""))
+        selected_values.extend([str(x) for x in task.completed_options if str(x).strip()])
+        dedup_selected = list(dict.fromkeys(selected_values))
+        matched = self._selected_expected_options(task, dedup_selected)
+        if matched:
+            task.completed_options = list(dict.fromkeys(task.completed_options + matched))
+        remaining = [
+            expected
+            for expected in task.expected_options
+            if expected not in task.completed_options
+        ]
+        return remaining, dedup_selected
+
+    def _find_block_option_for_expected(
+        self, block: QuestionBlock, expected: str
+    ):
+        for opt in block.options:
+            if self._option_text_matches(opt.text, expected):
+                return opt
         return None
+
+    def _macro_upload_lock_key(self, task: MacroTask) -> str:
+        identity = self._macro_task_identity_key(task)
+        if not identity:
+            identity = f"file_upload|{(task.field_selector or '').strip().lower()}"
+        return f"{self._stable_page_scope()}|{identity}"
+
+    def _question_error_mentions(self, question_text: str | None) -> bool:
+        question = (question_text or "").strip().lower()
+        if not question:
+            return False
+        for snippet in self._last_progression_block_snippets:
+            text = str(snippet or "").strip().lower()
+            if not text:
+                continue
+            if question in text:
+                return True
+            if len(question) > 24 and question[:24] in text:
+                return True
+        return False
+
+    def _macro_upload_completed(self, task: MacroTask) -> bool:
+        """粗粒度上传完成判定：出现 Replace 或附件文件名信号即视为完成。"""
+        if self._macro_upload_lock_key(task) in self._upload_task_locks:
+            return True
+        wanted = " ".join((task.field_selector or "resume").lower().split())
+        for item in self._last_snapshot_map.values():
+            label = " ".join((item.name or "").lower().split())
+            if item.role == "button" and "replace" in label:
+                if "resume" in wanted or "cv" in wanted or "cover letter" in wanted:
+                    return True
+            if item.role in ("button", "textbox", "file_input") and any(
+                ext in label for ext in (".pdf", ".doc", ".docx")
+            ):
+                return True
+        return False
 
     def _macro_task_completed(
         self, task: MacroTask, snapshot_map: dict[str, SnapshotItem]
     ) -> bool:
         if task.status in ("done", "blocked"):
             return task.status == "done"
+        if task.task_type in ("field_fill", "field_fill_optional"):
+            target = None
+            if task.field_ref and task.field_ref in snapshot_map:
+                target = snapshot_map.get(task.field_ref)
+            if target is None and task.field_selector:
+                wanted = " ".join((task.field_selector or "").lower().split())
+                for item in snapshot_map.values():
+                    if item.role != "textbox":
+                        continue
+                    current = " ".join((item.name or "").lower().split())
+                    if current == wanted or (wanted and wanted in current):
+                        target = item
+                        break
+            if not target:
+                return False
+            return bool((target.value_hint or "").strip())
         if task.task_type == "combobox_select":
             options_open = any(item.role == "option" for item in snapshot_map.values())
             if options_open:
                 return False
             # combobox 任务一旦进入执行态且下拉已关闭，视为本轮完成
             return task.status == "in_progress"
-        block = self._find_question_block(task)
-        if not block:
+        if task.task_type == "file_upload":
+            return self._macro_upload_completed(task)
+        if task.task_type == "manual_required":
             return False
-        selected = {" ".join(x.lower().split()) for x in block.selected_options}
-        expected = {" ".join(x.lower().split()) for x in task.expected_options}
-        return bool(expected) and expected.issubset(selected)
+        block = self._find_question_block(task)
+        if not block and not task.question_text:
+            return False
+        if self._question_error_mentions(task.question_text):
+            return False
+        selected_values: list[str] = []
+        if block:
+            selected_values.extend(
+                [str(x) for x in block.selected_options if str(x).strip()]
+            )
+        selected_values.extend(
+            self._collect_selected_options_for_question(task.question_text or "")
+        )
+        selected_values.extend([str(x) for x in task.completed_options if str(x).strip()])
+        selected_values = list(dict.fromkeys(selected_values))
+        matched = self._selected_expected_options(task, selected_values)
+        if matched:
+            task.completed_options = list(dict.fromkeys(task.completed_options + matched))
+        if task.task_type == "question_single":
+            verified = all(
+                self._verify_question_option_state(task.question_text or "", expected)
+                for expected in task.expected_options
+                if (expected or "").strip()
+            )
+            return bool(task.expected_options) and bool(verified)
+        if task.task_type == "inference_required":
+            if task.expected_options:
+                return len(task.completed_options) >= len(task.expected_options)
+            return bool(selected_values)
+        return bool(task.expected_options) and len(task.completed_options) >= len(
+            task.expected_options
+        )
 
     def _macro_task_precondition_met(
         self, task: MacroTask, snapshot_map: dict[str, SnapshotItem]
     ) -> bool:
+        if task.task_type in ("field_fill", "field_fill_optional"):
+            if task.field_ref and task.field_ref in snapshot_map:
+                item = snapshot_map.get(task.field_ref)
+                if item and item.role == "textbox":
+                    return not bool((item.value_hint or "").strip())
+            return any(
+                item.role == "textbox"
+                and " ".join((item.name or "").lower().split())
+                == " ".join((task.field_selector or "").lower().split())
+                and not bool((item.value_hint or "").strip())
+                for item in snapshot_map.values()
+            )
         if task.task_type == "combobox_select":
             if task.field_ref and task.field_ref in snapshot_map:
                 return True
             return any(item.role == "combobox" for item in snapshot_map.values())
+        if task.task_type == "file_upload":
+            if self._macro_upload_completed(task):
+                return False
+            if task.field_ref and task.field_ref in snapshot_map:
+                return True
+            return any(
+                (item.role == "file_input")
+                or ((item.input_type or "").lower() == "file")
+                for item in snapshot_map.values()
+            )
+        if task.task_type == "manual_required":
+            return True
         block = self._find_question_block(task)
+        if task.task_type == "inference_required":
+            return block is not None and bool(task.question_text)
         return block is not None and bool(task.expected_options)
 
     def _build_macro_action_for_task(
         self, task: MacroTask, snapshot_map: dict[str, SnapshotItem]
     ) -> AgentAction | None:
         reason_prefix = f"[macro:{task.task_id}] "
+        if task.task_type in ("field_fill", "field_fill_optional"):
+            value = (task.target_value or "").strip()
+            if not value:
+                return None
+            field_ref = task.field_ref
+            selector = task.field_selector or "text field"
+            if not field_ref:
+                wanted = " ".join(selector.lower().split())
+                for item in snapshot_map.values():
+                    current = " ".join((item.name or "").lower().split())
+                    if item.role == "textbox" and (
+                        current == wanted or (wanted and wanted in current)
+                    ):
+                        field_ref = item.ref
+                        break
+            if not field_ref:
+                return None
+            return AgentAction(
+                action="fill",
+                ref=field_ref,
+                selector=selector,
+                value=value,
+                element_type="textbox",
+                reason=reason_prefix + "fill field from profile mapping",
+            )
         if task.task_type == "combobox_select":
             options = [it for it in snapshot_map.values() if it.role == "option"]
             target = (task.target_value or "").strip()
+            combo_ref = task.field_ref
+            if not combo_ref or combo_ref not in snapshot_map:
+                selector_norm = " ".join((task.field_selector or "").lower().split())
+                for item in snapshot_map.values():
+                    if item.role != "combobox":
+                        continue
+                    name_norm = " ".join((item.name or "").lower().split())
+                    if (
+                        not selector_norm
+                        or name_norm == selector_norm
+                        or selector_norm in name_norm
+                    ):
+                        combo_ref = item.ref
+                        break
+            task.field_ref = combo_ref
             if options:
                 target_norm = target.lower()
                 chosen = None
@@ -3203,28 +4443,110 @@ class BrowserAgent:
             selector = task.field_selector or "Location"
             return AgentAction(
                 action="type",
-                ref=task.field_ref,
+                ref=combo_ref,
                 selector=selector,
                 value=target,
                 element_type="combobox",
                 reason=reason_prefix + "type target value into combobox",
             )
+        if task.task_type == "file_upload":
+            selector = (task.field_selector or "Resume").strip()
+            return AgentAction(
+                action="upload",
+                ref=task.field_ref,
+                selector=selector,
+                value=task.target_value,
+                element_type="file_input",
+                reason=reason_prefix + "upload required file",
+            )
+        if task.task_type == "manual_required":
+            return None
+        if task.task_type == "inference_required":
+            block = self._find_question_block(task)
+            if not block:
+                return None
+            inferred = self._infer_required_question_answers(task, block)
+            if not inferred:
+                return None
+            task.expected_options = inferred
+            for expected in inferred:
+                if expected in task.completed_options:
+                    continue
+                if self._verify_question_option_state(block.question_text, expected):
+                    task.completed_options = list(
+                        dict.fromkeys(task.completed_options + [expected])
+                    )
+                    continue
+                opt = self._find_block_option_for_expected(block, expected)
+                if not opt:
+                    continue
+                task.last_attempt_option = opt.text
+                return AgentAction(
+                    action="click",
+                    ref=opt.ref_id,
+                    selector=opt.text,
+                    target_question=block.question_text,
+                    element_type=opt.role,
+                    reason=reason_prefix
+                    + "inference_required mapped required question to option",
+                )
+            return None
 
         block = self._find_question_block(task)
         if not block or not task.expected_options:
             return None
-        selected = {" ".join(x.lower().split()) for x in block.selected_options}
-        for expected in task.expected_options:
-            expected_norm = " ".join(expected.lower().split())
-            if expected_norm in selected:
+        remaining = list(task.expected_options)
+        if task.task_type == "question_multi":
+            remaining, selected_values = self._compute_question_multi_remaining(task, block)
+            self._step_log(
+                "question_multi_progress",
+                {
+                    "step": self.step_count,
+                    "task_id": task.task_id,
+                    "question_text": block.question_text[:180],
+                    "selected_count": len(task.completed_options),
+                    "expected_count": len(task.expected_options),
+                    "selected_options": selected_values[:8],
+                    "remaining_options": remaining[:8],
+                },
+            )
+        else:
+            selected_values = self._collect_selected_options_for_question(block.question_text)
+            matched = self._selected_expected_options(task, selected_values)
+            if matched:
+                task.completed_options = list(
+                    dict.fromkeys(task.completed_options + matched)
+                )
+            remaining = [
+                expected
+                for expected in task.expected_options
+                if expected not in task.completed_options
+            ]
+        if not remaining:
+            return None
+        if task.task_type == "question_multi" and task.last_attempt_option:
+            head = [
+                x
+                for x in remaining
+                if not self._option_text_matches(x, task.last_attempt_option)
+            ]
+            tail = [
+                x
+                for x in remaining
+                if self._option_text_matches(x, task.last_attempt_option)
+            ]
+            if head:
+                remaining = head + tail
+        for expected in remaining:
+            if self._verify_question_option_state(block.question_text, expected):
+                task.completed_options = list(
+                    dict.fromkeys(task.completed_options + [expected])
+                )
                 continue
-            target_opt = None
-            for opt in block.options:
-                if " ".join(opt.text.lower().split()) == expected_norm:
-                    target_opt = opt
-                    break
+            target_opt = self._find_block_option_for_expected(block, expected)
             if target_opt is None:
                 continue
+            task.last_attempt_option = target_opt.text
             return AgentAction(
                 action="click",
                 ref=target_opt.ref_id,
@@ -3235,6 +4557,427 @@ class BrowserAgent:
             )
         return None
 
+    def _infer_required_question_answers(
+        self,
+        task: MacroTask,
+        block: QuestionBlock,
+    ) -> list[str]:
+        """必答未映射问题：先规则推断，失败后 LLM 结构化推断。"""
+        options = [opt.text for opt in block.options if (opt.text or "").strip()]
+        if not options:
+            return []
+        question = (block.question_text or task.question_text or "").strip()
+        lower_q = " ".join(question.lower().split())
+
+        def _match_option(candidate: str) -> str:
+            target = " ".join((candidate or "").lower().split())
+            if not target:
+                return ""
+            for option in options:
+                opt_norm = " ".join((option or "").lower().split())
+                if opt_norm == target:
+                    return option
+            for option in options:
+                opt_norm = " ".join((option or "").lower().split())
+                if target in opt_norm or opt_norm in target:
+                    return option
+            return ""
+
+        work_auth = self._user_profile.get("work_authorization", {})
+        if isinstance(work_auth, dict):
+            if "visa sponsorship" in lower_q:
+                val = work_auth.get("require_visa_sponsorship")
+                if isinstance(val, bool):
+                    choice = "Yes" if val else "No"
+                    hit = _match_option(choice)
+                    if hit:
+                        return [hit]
+            if (
+                "authorized to work" in lower_q
+                or "legally authorized" in lower_q
+                or "employment authorized" in lower_q
+            ):
+                val = work_auth.get("authorized_to_work_in_us")
+                if isinstance(val, bool):
+                    choice = "Yes" if val else "No"
+                    hit = _match_option(choice)
+                    if hit:
+                        return [hit]
+
+        if not self.client:
+            return []
+
+        profile_text = json.dumps(self._user_profile, ensure_ascii=False)[:3000]
+        options_text = "\n".join(f"- {opt}" for opt in options[:12])
+        prompt = (
+            "Choose the best answer option(s) for a required job-application question.\n"
+            "Return strict JSON only: {\"answers\":[\"...\"],\"confidence\":0.0,\"reason\":\"...\"}\n"
+            "Question:\n"
+            f"{question}\n"
+            "Options:\n"
+            f"{options_text}\n"
+            "Candidate profile summary JSON:\n"
+            f"{profile_text}\n"
+            "Rules: never return options not in the list."
+        )
+        llm_result = run_chat_with_fallback(
+            client=self.client,
+            fallback_models=self.fallback_models,
+            start_model_index=self.model_index,
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            temperature=0.1,
+            top_p=0.8,
+            max_tokens=220,
+            on_log=lambda lvl, msg: self._log(msg, lvl),
+        )
+        if not llm_result.ok:
+            return []
+        self.model_index = llm_result.model_index
+        self.model = llm_result.model
+        parsed = planner_safe_parse_json(llm_result.raw)
+        if not isinstance(parsed, dict):
+            return []
+        raw_answers = parsed.get("answers") or []
+        if not isinstance(raw_answers, list):
+            return []
+        resolved: list[str] = []
+        for ans in raw_answers:
+            hit = _match_option(str(ans))
+            if hit and hit not in resolved:
+                resolved.append(hit)
+        return resolved[:4]
+
+    def _normalize_audit_text(self, text: str | None) -> str:
+        value = (text or "").strip().lower()
+        value = re.sub(r"[\s\u00a0]+", " ", value)
+        value = re.sub(r"[^\w\s]", "", value)
+        return value.strip()
+
+    def _normalize_audit_semantic(self, text: str | None) -> str:
+        stop_words = {
+            "why",
+            "are",
+            "you",
+            "interested",
+            "in",
+            "working",
+            "at",
+            "for",
+            "this",
+            "role",
+            "position",
+            "company",
+            "job",
+            "tell",
+            "us",
+            "about",
+            "your",
+            "the",
+        }
+        normalized = self._normalize_audit_text(text)
+        if not normalized:
+            return ""
+        kept = [tok for tok in normalized.split() if tok not in stop_words]
+        return " ".join(kept).strip()
+
+    def _question_similarity_score(self, left: str | None, right: str | None) -> float:
+        left_exact = self._normalize_audit_text(left)
+        right_exact = self._normalize_audit_text(right)
+        if not left_exact or not right_exact:
+            return 0.0
+        if left_exact == right_exact:
+            return 1.0
+        if left_exact in right_exact or right_exact in left_exact:
+            return 0.92
+        left_sem = self._normalize_audit_semantic(left)
+        right_sem = self._normalize_audit_semantic(right)
+        if left_sem and right_sem:
+            if left_sem == right_sem:
+                return 0.9
+            left_set = set(left_sem.split())
+            right_set = set(right_sem.split())
+            if left_set and right_set:
+                inter = len(left_set & right_set)
+                union = len(left_set | right_set)
+                if union > 0:
+                    return inter / union
+        return 0.0
+
+    def _question_covered_by_tasks(
+        self, tasks: list[MacroTask], question_text: str
+    ) -> bool:
+        for task in tasks:
+            for raw in (task.question_text, task.field_selector):
+                if self._question_similarity_score(raw, question_text) >= 0.72:
+                    return True
+        return False
+
+    def _find_matching_question_block(
+        self, question_text: str, question_blocks: list[QuestionBlock]
+    ) -> QuestionBlock | None:
+        best: QuestionBlock | None = None
+        best_score = 0.0
+        for block in question_blocks:
+            score = self._question_similarity_score(question_text, block.question_text)
+            if score > best_score:
+                best_score = score
+                best = block
+        if best and best_score >= 0.72:
+            return best
+        return None
+
+    def _dedupe_visual_augmentation(
+        self,
+        existing_tasks: list[MacroTask],
+        audit_questions: list[str],
+    ) -> tuple[list[str], int, list[str]]:
+        existing_texts: list[str] = []
+        for task in existing_tasks:
+            for raw in (task.question_text, task.field_selector):
+                text = str(raw or "").strip()
+                if text:
+                    existing_texts.append(text)
+
+        kept: list[str] = []
+        dropped = 0
+        reason_codes: list[str] = []
+        for question in audit_questions:
+            candidate = str(question or "").strip()
+            if not candidate:
+                dropped += 1
+                reason_codes.append("empty_question")
+                continue
+            if any(
+                self._question_similarity_score(candidate, existing) >= 0.72
+                for existing in existing_texts
+            ):
+                dropped += 1
+                reason_codes.append("duplicate_existing_task")
+                continue
+            kept.append(candidate)
+            existing_texts.append(candidate)
+        return kept, dropped, sorted(set(reason_codes))
+
+    def _is_location_like_question(self, question_text: str | None) -> bool:
+        lowered = self._normalize_audit_text(question_text)
+        if not lowered:
+            return False
+        return (
+            lowered in ("location", "start typing")
+            or "where are you located" in lowered
+            or "current location" in lowered
+            or "location preference" in lowered
+        )
+
+    def _enforce_macro_plan_completeness(
+        self,
+        *,
+        tasks: list[MacroTask],
+        question_blocks: list[QuestionBlock],
+        audit: VisualAuditResult,
+    ) -> tuple[list[MacroTask], dict]:
+        if not question_blocks and not audit.required_questions:
+            return tasks, {
+                "missing_required_questions": [],
+                "added_required_questions": 0,
+                "added_unmapped_questions": 0,
+                "dropped_questions": 0,
+                "coverage_ok": True,
+            }
+
+        has_location_task = any(t.task_type == "combobox_select" for t in tasks)
+        next_idx = len(tasks) + 1
+        added_required = 0
+        added_unmapped = 0
+        dropped = 0
+        missing_required: list[str] = []
+
+        def _append_inference_task(
+            question_text: str, options: list[str], *, required: bool, reason: str
+        ) -> None:
+            nonlocal next_idx, added_required, added_unmapped
+            tasks.append(
+                MacroTask(
+                    task_id=f"t{next_idx}",
+                    task_type="inference_required",
+                    title="Infer answer for unmapped question",
+                    question_text=question_text,
+                    expected_options=options[:8],
+                    mapping_reason=reason,
+                    precondition="question_block_present",
+                    postcondition=(
+                        "required_question_answered" if required else "question_answered"
+                    ),
+                    required=required,
+                )
+            )
+            next_idx += 1
+            if required:
+                added_required += 1
+            else:
+                added_unmapped += 1
+
+        # 1) 以语义块为主，保证可交互问题尽量都有执行任务。
+        for qb in question_blocks:
+            if len(qb.options) < 2:
+                continue
+            if has_location_task and self._is_location_like_question(qb.question_text):
+                continue
+            if self._question_covered_by_tasks(tasks, qb.question_text):
+                continue
+            options = [opt.text for opt in qb.options if opt.text]
+            if len(options) < 2:
+                dropped += 1
+                continue
+            required = bool(qb.required or qb.has_error)
+            reason = (
+                "plan_completeness_missing_required_question"
+                if required
+                else "plan_completeness_unmapped_question"
+            )
+            _append_inference_task(
+                qb.question_text,
+                options,
+                required=required,
+                reason=reason,
+            )
+
+        # 2) 对视觉审计标记为必答但语义块里未能匹配的问题，只记录缺口，不再盲目创建幻影任务。
+        for audit_question in audit.required_questions:
+            if self._question_covered_by_tasks(tasks, audit_question):
+                continue
+            block = self._find_matching_question_block(audit_question, question_blocks)
+            if block and len(block.options) >= 2:
+                _append_inference_task(
+                    block.question_text,
+                    [opt.text for opt in block.options if opt.text],
+                    required=True,
+                    reason="plan_completeness_missing_required_question",
+                )
+            else:
+                missing_required.append(str(audit_question).strip())
+
+        coverage_ok = len(missing_required) == 0
+        return tasks, {
+            "missing_required_questions": missing_required[:8],
+            "added_required_questions": added_required,
+            "added_unmapped_questions": added_unmapped,
+            "dropped_questions": dropped,
+            "coverage_ok": coverage_ok,
+        }
+
+    def _augment_macro_tasks_with_visual_audit(
+        self,
+        *,
+        tasks: list[MacroTask],
+        audit: VisualAuditResult,
+        snapshot_map: dict[str, SnapshotItem],
+        question_blocks: list[QuestionBlock],
+    ) -> list[MacroTask]:
+        normalized_questions = {
+            self._normalize_audit_text(t.question_text or "")
+            for t in tasks
+            if (t.question_text or "").strip()
+        }
+        next_idx = len(tasks) + 1
+        added = 0
+        dedup_questions, dedup_dropped_count, reason_codes = (
+            self._dedupe_visual_augmentation(tasks, audit.required_questions)
+        )
+        for question in dedup_questions:
+            q_norm = self._normalize_audit_text(question)
+            if not q_norm or q_norm in normalized_questions:
+                continue
+            matched_block = self._find_matching_question_block(question, question_blocks)
+            if not matched_block:
+                dedup_dropped_count += 1
+                reason_codes.append("audit_question_not_in_semantic_blocks")
+                continue
+            if self._question_covered_by_tasks(tasks, matched_block.question_text):
+                dedup_dropped_count += 1
+                reason_codes.append("duplicate_existing_task")
+                continue
+            inferred_options = [opt.text for opt in matched_block.options if opt.text][:8]
+            if len(inferred_options) < 2:
+                dedup_dropped_count += 1
+                reason_codes.append("audit_question_missing_options")
+                continue
+            tasks.append(
+                MacroTask(
+                    task_id=f"t{next_idx}",
+                    task_type="inference_required",
+                    title="Infer answer for required question (visual audit)",
+                    question_text=matched_block.question_text,
+                    expected_options=inferred_options,
+                    mapping_reason="visual_required_question_missing",
+                    precondition="question_block_present",
+                    postcondition="required_question_answered",
+                    required=True,
+                )
+            )
+            normalized_questions.add(self._normalize_audit_text(matched_block.question_text))
+            next_idx += 1
+            added += 1
+
+        has_upload_task = any(t.task_type == "file_upload" for t in tasks)
+        resume_upload_required = any(
+            ("resume" in (u or "").lower()) or ("cv" in (u or "").lower())
+            for u in audit.required_uploads
+        )
+        if resume_upload_required and not has_upload_task:
+            fallback_ref = None
+            fallback_label = "Resume"
+            for item in snapshot_map.values():
+                if item.role == "file_input" or (item.input_type or "").lower() == "file":
+                    fallback_ref = item.ref
+                    fallback_label = item.name or "Resume"
+                    break
+            if fallback_ref or any(
+                item.role == "button" and "upload" in (item.name or "").lower()
+                for item in snapshot_map.values()
+            ):
+                tasks.append(
+                    MacroTask(
+                        task_id=f"t{next_idx}",
+                        task_type="file_upload",
+                        title="Upload required resume (visual audit补全)",
+                        field_ref=fallback_ref,
+                        field_selector=fallback_label,
+                        target_value=self.preferred_resume_path,
+                        mapping_reason="visual_required_resume_upload_missing",
+                        precondition="resume_upload_needed",
+                        postcondition="file_uploaded",
+                    )
+                )
+                next_idx += 1
+                added += 1
+
+        if added > 0:
+            self._step_log(
+                "execution_queue_augmented_by_visual_audit",
+                {
+                    "step": self.step_count,
+                    "scope": self._stable_page_scope(),
+                    "added_task_count": added,
+                    "dedup_dropped_count": dedup_dropped_count,
+                    "reason_codes": reason_codes[:6],
+                    "total_task_count": len(tasks),
+                },
+            )
+        elif dedup_dropped_count > 0:
+            self._step_log(
+                "execution_queue_augmented_by_visual_audit",
+                {
+                    "step": self.step_count,
+                    "scope": self._stable_page_scope(),
+                    "added_task_count": 0,
+                    "dedup_dropped_count": dedup_dropped_count,
+                    "reason_codes": reason_codes[:6],
+                    "total_task_count": len(tasks),
+                },
+            )
+        return tasks
+
     def _maybe_get_macro_action(
         self,
         *,
@@ -3242,17 +4985,73 @@ class BrowserAgent:
         page_fingerprint: str,
     ) -> AgentAction | None:
         scope = self._stable_page_scope()
+        self._macro_manual_block_reason = None
+        if scope in self._macro_disabled_scopes:
+            return None
         if scope != self._macro_scope:
             self._macro_scope = scope
             self._macro_tasks = []
             self._active_macro_task_id = None
 
         if not self._macro_tasks:
+            audit = self._run_scope_visual_audit(
+                scope=scope,
+                snapshot_map=snapshot_map,
+                question_blocks=self._last_question_blocks,
+                force=self._force_visual_audit_next_plan,
+            )
+            self._force_visual_audit_next_plan = False
             self._macro_tasks = build_macro_tasks(
                 profile=self._user_profile,
                 snapshot_map=snapshot_map,
                 question_blocks=self._last_question_blocks,
+                preferred_resume_path=self.preferred_resume_path,
             )
+            self._macro_tasks = self._augment_macro_tasks_with_visual_audit(
+                tasks=self._macro_tasks,
+                audit=audit,
+                snapshot_map=snapshot_map,
+                question_blocks=self._last_question_blocks,
+            )
+            self._macro_tasks, coverage = self._enforce_macro_plan_completeness(
+                tasks=self._macro_tasks,
+                question_blocks=self._last_question_blocks,
+                audit=audit,
+            )
+            self._step_log(
+                "plan_completeness_checked",
+                {
+                    "step": self.step_count,
+                    "scope": scope,
+                    "coverage_ok": coverage["coverage_ok"],
+                    "added_required_questions": coverage["added_required_questions"],
+                    "added_unmapped_questions": coverage["added_unmapped_questions"],
+                    "dropped_questions": coverage["dropped_questions"],
+                    "missing_required_questions": coverage["missing_required_questions"],
+                },
+            )
+            if not coverage["coverage_ok"]:
+                self._force_visual_audit_next_plan = True
+            self._last_queue_plan = [
+                QueueTaskView(
+                    task_id=t.task_id,
+                    task_type=t.task_type,
+                    label=t.question_text or t.field_selector or t.title,
+                    status=t.status,
+                    action=(
+                        "type"
+                        if t.task_type == "combobox_select"
+                        else "upload"
+                        if t.task_type == "file_upload"
+                        else "fill"
+                        if t.task_type in ("field_fill", "field_fill_optional")
+                        else "click"
+                    ),
+                    ref=t.field_ref,
+                    target_question=t.question_text,
+                )
+                for t in self._macro_tasks
+            ]
             if self._macro_tasks:
                 self._step_log(
                     "macro_plan_built",
@@ -3272,14 +5071,124 @@ class BrowserAgent:
                         "task_count": len(self._macro_tasks),
                     },
                 )
+                self._step_log(
+                    "execution_queue_built",
+                    {
+                        "step": self.step_count,
+                        "scope": scope,
+                        "task_count": len(self._last_queue_plan),
+                        "tasks": [
+                            {
+                                "task_id": item.task_id,
+                                "task_type": item.task_type,
+                                "action": item.action,
+                                "label": item.label[:120],
+                                "ref": item.ref,
+                                "target_question": item.target_question,
+                            }
+                            for item in self._last_queue_plan[:12]
+                        ],
+                    },
+                )
+        else:
+            refreshed_tasks = build_macro_tasks(
+                profile=self._user_profile,
+                snapshot_map=snapshot_map,
+                question_blocks=self._last_question_blocks,
+                preferred_resume_path=self.preferred_resume_path,
+            )
+            existing_keys = {
+                self._macro_task_identity_key(t)
+                for t in self._macro_tasks
+                if self._macro_task_identity_key(t)
+            }
+            appended = 0
+            for new_task in refreshed_tasks:
+                key = self._macro_task_identity_key(new_task)
+                if not key or key in existing_keys:
+                    continue
+                if any(t.status == "done" and self._macro_task_identity_key(t) == key for t in self._macro_tasks):
+                    continue
+                new_task.task_id = f"t{len(self._macro_tasks) + 1}"
+                self._macro_tasks.append(new_task)
+                existing_keys.add(key)
+                appended += 1
+            if appended > 0:
+                self._step_log(
+                    "execution_queue_augmented",
+                    {
+                        "step": self.step_count,
+                        "scope": scope,
+                        "added_task_count": appended,
+                        "total_task_count": len(self._macro_tasks),
+                        "tasks": summarize_macro_tasks(self._macro_tasks),
+                    },
+                )
+            cached_audit = self._scope_visual_audits.get(scope) or VisualAuditResult(
+                visual_summary="",
+                required_fields=[],
+                required_questions=[],
+                required_uploads=[],
+                source="heuristic",
+            )
+            self._macro_tasks, coverage = self._enforce_macro_plan_completeness(
+                tasks=self._macro_tasks,
+                question_blocks=self._last_question_blocks,
+                audit=cached_audit,
+            )
+            self._step_log(
+                "plan_completeness_checked",
+                {
+                    "step": self.step_count,
+                    "scope": scope,
+                    "coverage_ok": coverage["coverage_ok"],
+                    "added_required_questions": coverage["added_required_questions"],
+                    "added_unmapped_questions": coverage["added_unmapped_questions"],
+                    "dropped_questions": coverage["dropped_questions"],
+                    "missing_required_questions": coverage["missing_required_questions"],
+                },
+            )
 
         for task in self._macro_tasks:
             if self._macro_task_completed(task, snapshot_map):
+                if task.status != "done":
+                    self._step_log(
+                        "macro_task_completion_decision",
+                        {
+                            "step": self.step_count,
+                            "task_id": task.task_id,
+                            "task_type": task.task_type,
+                            "decision": "done",
+                            "question_text": task.question_text,
+                            "field_selector": task.field_selector,
+                            "completed_options": task.completed_options[:6],
+                        },
+                    )
                 task.status = "done"
+                task.wait_count = 0
                 continue
             if task.status == "blocked":
                 continue
+            if task.task_type == "manual_required":
+                self._macro_manual_block_reason = (
+                    task.mapping_reason
+                    or task.field_selector
+                    or task.title
+                    or "required_attachment_not_supported"
+                )
+                self._step_log(
+                    "macro_manual_required_detected",
+                    {
+                        "step": self.step_count,
+                        "task_id": task.task_id,
+                        "task_type": task.task_type,
+                        "reason": self._macro_manual_block_reason,
+                        "field_selector": task.field_selector,
+                    },
+                )
+                return None
             if not self._macro_task_precondition_met(task, snapshot_map):
+                task.wait_count += 1
                 self._step_log(
                     "macro_task_waiting_precondition",
                     {
@@ -3287,14 +5196,44 @@ class BrowserAgent:
                         "task_id": task.task_id,
                         "task_type": task.task_type,
                         "precondition": task.precondition,
+                        "wait_count": task.wait_count,
+                        "wait_limit": self._macro_precondition_wait_limit,
                     },
                 )
+                if task.wait_count >= self._macro_precondition_wait_limit:
+                    task.status = "blocked"
+                    self._step_log(
+                        "macro_task_blocked",
+                        {
+                            "step": self.step_count,
+                            "task_id": task.task_id,
+                            "task_type": task.task_type,
+                            "reason": "precondition_timeout",
+                            "precondition": task.precondition,
+                            "wait_count": task.wait_count,
+                            "wait_limit": self._macro_precondition_wait_limit,
+                        },
+                    )
+                    self._record_failure_memory_case(
+                        classification="unknown_blocked",
+                        reason_code="precondition_timeout",
+                        symptom="宏任务前置条件长期不满足，任务被阻断",
+                        root_cause=task.precondition or "question_block_missing",
+                        question_text=task.question_text or "",
+                        action=task.task_type,
+                        selector=task.field_selector or task.question_text or "",
+                        source_event="macro_task_blocked",
+                    )
                 continue
             action = self._build_macro_action_for_task(task, snapshot_map)
             if action is None:
-                task.status = "blocked"
+                if self._macro_task_completed(task, snapshot_map):
+                    task.status = "done"
+                else:
+                    task.status = "blocked"
                 continue
             task.status = "in_progress"
+            task.wait_count = 0
             self._active_macro_task_id = task.task_id
             self._step_log(
                 "macro_task_selected",
@@ -3324,6 +5263,24 @@ class BrowserAgent:
             return action
         return None
 
+    def _macro_task_identity_key(self, task: MacroTask) -> str:
+        if task.task_type == "combobox_select":
+            return f"combobox|{(task.field_selector or '').strip().lower()}|{(task.target_value or '').strip().lower()}"
+        if task.task_type in ("field_fill", "field_fill_optional"):
+            return f"field_fill|{(task.field_selector or '').strip().lower()}"
+        if task.task_type == "file_upload":
+            return f"file_upload|{(task.field_selector or '').strip().lower()}"
+        if task.task_type == "manual_required":
+            return f"manual_required|{(task.field_selector or task.mapping_reason or task.title or '').strip().lower()}"
+        if task.task_type == "inference_required":
+            q_key = self._normalize_audit_semantic(task.question_text) or self._normalize_audit_text(task.question_text)
+            return f"question_infer|{q_key}"
+        if task.task_type in ("question_single", "question_multi"):
+            opts = "|".join(sorted(x.strip().lower() for x in task.expected_options if x.strip()))
+            q_key = self._normalize_audit_semantic(task.question_text) or self._normalize_audit_text(task.question_text)
+            return f"question|{q_key}|{opts}"
+        return ""
+
     def _on_macro_action_result(self, action: AgentAction, success: bool) -> None:
         reason = action.reason or ""
         if not reason.startswith("[macro:"):
@@ -3335,6 +5292,36 @@ class BrowserAgent:
             if task.task_id != task_id:
                 continue
             if success:
+                if task.task_type == "file_upload":
+                    lock_key = self._macro_upload_lock_key(task)
+                    self._upload_task_locks.add(lock_key)
+                    task.status = "done"
+                    task.retry_count = 0
+                    task.wait_count = 0
+                    self._step_log(
+                        "upload_task_locked",
+                        {
+                            "step": self.step_count,
+                            "task_id": task.task_id,
+                            "task_type": task.task_type,
+                            "lock_key": lock_key,
+                            "selector": action.selector,
+                            "ref": action.ref,
+                        },
+                    )
+                    return
+                if (
+                    task.task_type in ("question_single", "question_multi", "inference_required")
+                    and action.selector
+                ):
+                    if any(
+                        self._option_text_matches(done, action.selector)
+                        for done in task.completed_options
+                    ):
+                        pass
+                    else:
+                        task.completed_options.append(action.selector)
+                task.last_attempt_option = None
                 # combobox type 后通常还需点 option，保留 in_progress；
                 # combobox click/问题点击成功后交由下一轮状态检测判定是否 done。
                 if task.task_type == "combobox_select" and action.action == "click":
@@ -3342,6 +5329,7 @@ class BrowserAgent:
                 else:
                     task.status = "in_progress"
                 task.retry_count = 0
+                task.wait_count = 0
             else:
                 task.retry_count += 1
                 if task.retry_count >= self._macro_retry_limit:
@@ -3356,9 +5344,31 @@ class BrowserAgent:
                             "retry_count": task.retry_count,
                         },
                     )
+                    self._record_failure_memory_case(
+                        classification="unknown_blocked",
+                        reason_code="macro_retry_limit_exceeded",
+                        symptom="宏任务连续执行失败达到上限并被阻断",
+                        root_cause=task.mapping_reason or task.title,
+                        question_text=task.question_text or "",
+                        action=task.task_type,
+                        selector=action.selector or task.field_selector or "",
+                        source_event="macro_task_blocked",
+                    )
             break
 
     def _log_finalized(self, status: str, reason: str) -> None:
+        if status == "manual_required":
+            self._record_failure_memory_case(
+                classification=self.last_outcome_class_hint or "unknown_blocked",
+                reason_code=self.failure_code_hint or reason or "manual_required",
+                symptom="流程最终转人工处理",
+                root_cause=reason or self.manual_reason_hint or "manual_required",
+                evidence_snippet=self.last_error_snippet_hint or "",
+                question_text="",
+                action="finalize",
+                selector="",
+                source_event="finalized",
+            )
         self._step_log(
             "finalized",
             {
@@ -3414,9 +5424,22 @@ class BrowserAgent:
         - 仅允许白名单目录内文件
         - 上传失败可重试并尝试候选文件回退
         """
-        if not self._last_upload_signals:
-            self._log("⚠ 页面无上传信号，跳过 upload 动作", "warn")
-            return False
+        has_runtime_signal = bool(self._last_upload_signals)
+        if not has_runtime_signal:
+            # 兜底：即使文本信号不足，只要 DOM 能定位 file input 也继续上传
+            fallback_locator = locator if locator is not None else self._locate_file_input(action.selector)
+            if fallback_locator is None:
+                self._log("⚠ 页面无上传信号，且未定位到 file input，跳过 upload 动作", "warn")
+                return False
+            locator = fallback_locator
+            self._step_log(
+                "upload_signal_dom_override",
+                {
+                    "step": self.step_count,
+                    "selector": action.selector,
+                    "reason": "runtime_signal_empty_but_file_input_present",
+                },
+            )
 
         ordered_candidates = resolve_upload_candidate(
             action.value,
@@ -3515,6 +5538,7 @@ class BrowserAgent:
             self.page.reload(wait_until="domcontentloaded", timeout=30000)
             self.page.wait_for_timeout(1200)
             self.refresh_attempts += 1
+            self._force_visual_audit_next_plan = True
             # 刷新后清理缓存，避免沿用旧页面动作计划。
             self._state_cache_by_fingerprint.clear()
             self._action_fail_counts.clear()
@@ -3523,6 +5547,14 @@ class BrowserAgent:
             self._semantic_fail_counts.clear()
             self._error_gate_cache.clear()
             self._last_observed_fingerprint = ""
+            self._macro_tasks = []
+            self._active_macro_task_id = None
+            self._macro_scope = ""
+            self._upload_task_locks.clear()
+            self._macro_disabled_scopes.clear()
+            self._last_queue_plan = []
+            self._same_task_failure_streak = 0
+            self._last_failed_task_key = ""
             self.history.append(
                 f"刷新页面重试({self.refresh_attempts}/{self.max_refresh_attempts})"
             )
@@ -3533,6 +5565,40 @@ class BrowserAgent:
             if self.refresh_attempts >= self.max_refresh_attempts:
                 self.refresh_exhausted = True
             return False
+
+    def _is_llm_refusal_response(self, raw: str) -> bool:
+        lower = (raw or "").strip().lower()
+        if not lower:
+            return False
+        refusal_tokens = (
+            "i'm unable to assist with this request",
+            "i am unable to assist with this request",
+            "unable to assist with this request",
+            "i can't assist with this request",
+            "i cannot assist with this request",
+            "can't help with this request",
+            "cannot help with this request",
+            "sorry, i can't help with that",
+            "对不起，我不能",
+            "无法协助",
+            "无法帮助",
+        )
+        return any(token in lower for token in refusal_tokens)
+
+    def _looks_like_external_blocked_text(self, text: str) -> bool:
+        lower = (text or "").lower()
+        blocked_tokens = (
+            "flagged as possible spam",
+            "couldn't submit your application",
+            "submission was flagged",
+            "suspicious activity",
+            "too many requests",
+            "rate limit",
+            "try again later",
+            "verify you are human",
+            "security check",
+        )
+        return any(token in lower for token in blocked_tokens)
 
     def _looks_like_completion_text(self, lower_text: str) -> bool:
         return oc_looks_like_completion_text(lower_text)
