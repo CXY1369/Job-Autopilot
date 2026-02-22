@@ -182,7 +182,9 @@ def _build_question_blocks_from_visible_text(
             )
         if len(option_hits) < 2:
             continue
-        option_key = tuple(sorted(_normalize_text(opt.text).lower() for opt in option_hits))
+        option_key = tuple(
+            sorted(_normalize_text(opt.text).lower() for opt in option_hits)
+        )
         signature = (_normalize_text(line).lower(), option_key)
         if signature in seen:
             continue

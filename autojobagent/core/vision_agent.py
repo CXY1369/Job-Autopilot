@@ -965,9 +965,7 @@ class BrowserAgent:
         scope_now = self._stable_page_scope()
         cached_audit = self._scope_visual_audits.get(scope_now)
         self._latest_visual_summary = (
-            cached_audit.visual_summary
-            if cached_audit
-            else "尚未执行页面截图交叉审计"
+            cached_audit.visual_summary if cached_audit else "尚未执行页面截图交叉审计"
         )
         # region agent log
         append_debug_log(
@@ -1178,8 +1176,7 @@ class BrowserAgent:
                     },
                 )
                 self.history.append(
-                    "宏任务队列全部阻断，切换到 LLM 修复模式："
-                    f"{blocked_summary}"
+                    f"宏任务队列全部阻断，切换到 LLM 修复模式：{blocked_summary}"
                 )
                 self._macro_disabled_scopes.add(self._stable_page_scope())
                 self._macro_tasks = []
@@ -1785,7 +1782,9 @@ class BrowserAgent:
         if self._is_progression_action(action, item=source_item):
             return True
         if self._has_question_binding(action) and action.selector:
-            if self._verify_question_option_state(action.target_question or "", action.selector):
+            if self._verify_question_option_state(
+                action.target_question or "", action.selector
+            ):
                 return True
         try:
             after_url = self.page.url or ""
@@ -1996,7 +1995,9 @@ class BrowserAgent:
             if fallback_questions:
                 required_questions = fallback_questions[:4]
         fields_part = ", ".join(required_fields[:6]) if required_fields else "无"
-        questions_part = ", ".join(required_questions[:4]) if required_questions else "无"
+        questions_part = (
+            ", ".join(required_questions[:4]) if required_questions else "无"
+        )
         return f"字段[{fields_part}]；问题[{questions_part}]"
 
     def _heuristic_visual_audit(
@@ -2082,7 +2083,9 @@ class BrowserAgent:
                         {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"},
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{screenshot_b64}"
+                            },
                         },
                     ],
                 }
@@ -2118,12 +2121,19 @@ class BrowserAgent:
                         for x in (parsed.get("required_uploads") or [])
                         if str(x).strip()
                     ][:8]
-                    if visual_summary or required_fields or required_questions or required_uploads:
+                    if (
+                        visual_summary
+                        or required_fields
+                        or required_questions
+                        or required_uploads
+                    ):
                         merged_fields = list(
                             dict.fromkeys(result.required_fields + required_fields)
                         )
                         merged_questions = list(
-                            dict.fromkeys(result.required_questions + required_questions)
+                            dict.fromkeys(
+                                result.required_questions + required_questions
+                            )
                         )
                         merged_uploads = list(
                             dict.fromkeys(result.required_uploads + required_uploads)
@@ -2936,16 +2946,18 @@ class BrowserAgent:
             and inspected.get("option_found")
             and inspected.get("option_selected")
         )
-        verify_reason = "option_selected_verified" if verified else "option_not_selected"
+        verify_reason = (
+            "option_selected_verified" if verified else "option_not_selected"
+        )
         self._step_log(
             "answer_binding_attempt",
             {
                 "step": self.step_count,
                 "classification": "validation_error",
                 "reason_code": "answer_binding",
-                "evidence_snippet": str(
-                    f"{payload.get('reason', '')}|{verify_reason}"
-                )[:220],
+                "evidence_snippet": str(f"{payload.get('reason', '')}|{verify_reason}")[
+                    :220
+                ],
                 "question": question,
                 "answer": option,
                 "ok": bool(verified),
@@ -3680,10 +3692,7 @@ class BrowserAgent:
             return True, "post_submit_problem"
         if any(block.has_error for block in question_blocks):
             return True, "question_error_detected"
-        if (
-            page_state == "application_or_form_page"
-            and not has_pending_macro_tasks
-        ):
+        if page_state == "application_or_form_page" and not has_pending_macro_tasks:
             return True, "pre_submit_review"
         return False, "stable_fill_path"
 
@@ -3995,7 +4004,10 @@ class BrowserAgent:
             if item.role not in ("button", "link"):
                 continue
             label = (item.name or "").strip().lower()
-            if any(k in label for k in ("submit", "finish application", "complete application")):
+            if any(
+                k in label
+                for k in ("submit", "finish application", "complete application")
+            ):
                 submit_like.append((ref, item))
             elif any(k in label for k in ("review", "continue", "apply")):
                 fallback_progression.append((ref, item))
@@ -4204,7 +4216,10 @@ class BrowserAgent:
     ) -> list[str]:
         matched: list[str] = []
         for expected in task.expected_options:
-            if any(self._option_text_matches(expected, picked) for picked in selected_values):
+            if any(
+                self._option_text_matches(expected, picked)
+                for picked in selected_values
+            ):
                 matched.append(expected)
         return matched
 
@@ -4213,13 +4228,21 @@ class BrowserAgent:
     ) -> tuple[list[str], list[str]]:
         selected_values: list[str] = []
         if block:
-            selected_values.extend([str(x) for x in block.selected_options if str(x).strip()])
-        selected_values.extend(self._collect_selected_options_for_question(task.question_text or ""))
-        selected_values.extend([str(x) for x in task.completed_options if str(x).strip()])
+            selected_values.extend(
+                [str(x) for x in block.selected_options if str(x).strip()]
+            )
+        selected_values.extend(
+            self._collect_selected_options_for_question(task.question_text or "")
+        )
+        selected_values.extend(
+            [str(x) for x in task.completed_options if str(x).strip()]
+        )
         dedup_selected = list(dict.fromkeys(selected_values))
         matched = self._selected_expected_options(task, dedup_selected)
         if matched:
-            task.completed_options = list(dict.fromkeys(task.completed_options + matched))
+            task.completed_options = list(
+                dict.fromkeys(task.completed_options + matched)
+            )
         remaining = [
             expected
             for expected in task.expected_options
@@ -4227,9 +4250,7 @@ class BrowserAgent:
         ]
         return remaining, dedup_selected
 
-    def _find_block_option_for_expected(
-        self, block: QuestionBlock, expected: str
-    ):
+    def _find_block_option_for_expected(self, block: QuestionBlock, expected: str):
         for opt in block.options:
             if self._option_text_matches(opt.text, expected):
                 return opt
@@ -4315,11 +4336,15 @@ class BrowserAgent:
         selected_values.extend(
             self._collect_selected_options_for_question(task.question_text or "")
         )
-        selected_values.extend([str(x) for x in task.completed_options if str(x).strip()])
+        selected_values.extend(
+            [str(x) for x in task.completed_options if str(x).strip()]
+        )
         selected_values = list(dict.fromkeys(selected_values))
         matched = self._selected_expected_options(task, selected_values)
         if matched:
-            task.completed_options = list(dict.fromkeys(task.completed_options + matched))
+            task.completed_options = list(
+                dict.fromkeys(task.completed_options + matched)
+            )
         if task.task_type == "question_single":
             verified = all(
                 self._verify_question_option_state(task.question_text or "", expected)
@@ -4497,7 +4522,9 @@ class BrowserAgent:
             return None
         remaining = list(task.expected_options)
         if task.task_type == "question_multi":
-            remaining, selected_values = self._compute_question_multi_remaining(task, block)
+            remaining, selected_values = self._compute_question_multi_remaining(
+                task, block
+            )
             self._step_log(
                 "question_multi_progress",
                 {
@@ -4511,7 +4538,9 @@ class BrowserAgent:
                 },
             )
         else:
-            selected_values = self._collect_selected_options_for_question(block.question_text)
+            selected_values = self._collect_selected_options_for_question(
+                block.question_text
+            )
             matched = self._selected_expected_options(task, selected_values)
             if matched:
                 task.completed_options = list(
@@ -4611,7 +4640,7 @@ class BrowserAgent:
         options_text = "\n".join(f"- {opt}" for opt in options[:12])
         prompt = (
             "Choose the best answer option(s) for a required job-application question.\n"
-            "Return strict JSON only: {\"answers\":[\"...\"],\"confidence\":0.0,\"reason\":\"...\"}\n"
+            'Return strict JSON only: {"answers":["..."],"confidence":0.0,"reason":"..."}\n'
             "Question:\n"
             f"{question}\n"
             "Options:\n"
@@ -4806,7 +4835,9 @@ class BrowserAgent:
                     mapping_reason=reason,
                     precondition="question_block_present",
                     postcondition=(
-                        "required_question_answered" if required else "question_answered"
+                        "required_question_answered"
+                        if required
+                        else "question_answered"
                     ),
                     required=required,
                 )
@@ -4888,7 +4919,9 @@ class BrowserAgent:
             q_norm = self._normalize_audit_text(question)
             if not q_norm or q_norm in normalized_questions:
                 continue
-            matched_block = self._find_matching_question_block(question, question_blocks)
+            matched_block = self._find_matching_question_block(
+                question, question_blocks
+            )
             if not matched_block:
                 dedup_dropped_count += 1
                 reason_codes.append("audit_question_not_in_semantic_blocks")
@@ -4897,7 +4930,9 @@ class BrowserAgent:
                 dedup_dropped_count += 1
                 reason_codes.append("duplicate_existing_task")
                 continue
-            inferred_options = [opt.text for opt in matched_block.options if opt.text][:8]
+            inferred_options = [opt.text for opt in matched_block.options if opt.text][
+                :8
+            ]
             if len(inferred_options) < 2:
                 dedup_dropped_count += 1
                 reason_codes.append("audit_question_missing_options")
@@ -4915,7 +4950,9 @@ class BrowserAgent:
                     required=True,
                 )
             )
-            normalized_questions.add(self._normalize_audit_text(matched_block.question_text))
+            normalized_questions.add(
+                self._normalize_audit_text(matched_block.question_text)
+            )
             next_idx += 1
             added += 1
 
@@ -4928,7 +4965,10 @@ class BrowserAgent:
             fallback_ref = None
             fallback_label = "Resume"
             for item in snapshot_map.values():
-                if item.role == "file_input" or (item.input_type or "").lower() == "file":
+                if (
+                    item.role == "file_input"
+                    or (item.input_type or "").lower() == "file"
+                ):
                     fallback_ref = item.ref
                     fallback_label = item.name or "Resume"
                     break
@@ -5027,7 +5067,9 @@ class BrowserAgent:
                     "added_required_questions": coverage["added_required_questions"],
                     "added_unmapped_questions": coverage["added_unmapped_questions"],
                     "dropped_questions": coverage["dropped_questions"],
-                    "missing_required_questions": coverage["missing_required_questions"],
+                    "missing_required_questions": coverage[
+                        "missing_required_questions"
+                    ],
                 },
             )
             if not coverage["coverage_ok"]:
@@ -5107,7 +5149,10 @@ class BrowserAgent:
                 key = self._macro_task_identity_key(new_task)
                 if not key or key in existing_keys:
                     continue
-                if any(t.status == "done" and self._macro_task_identity_key(t) == key for t in self._macro_tasks):
+                if any(
+                    t.status == "done" and self._macro_task_identity_key(t) == key
+                    for t in self._macro_tasks
+                ):
                     continue
                 new_task.task_id = f"t{len(self._macro_tasks) + 1}"
                 self._macro_tasks.append(new_task)
@@ -5145,7 +5190,9 @@ class BrowserAgent:
                     "added_required_questions": coverage["added_required_questions"],
                     "added_unmapped_questions": coverage["added_unmapped_questions"],
                     "dropped_questions": coverage["dropped_questions"],
-                    "missing_required_questions": coverage["missing_required_questions"],
+                    "missing_required_questions": coverage[
+                        "missing_required_questions"
+                    ],
                 },
             )
 
@@ -5273,11 +5320,17 @@ class BrowserAgent:
         if task.task_type == "manual_required":
             return f"manual_required|{(task.field_selector or task.mapping_reason or task.title or '').strip().lower()}"
         if task.task_type == "inference_required":
-            q_key = self._normalize_audit_semantic(task.question_text) or self._normalize_audit_text(task.question_text)
+            q_key = self._normalize_audit_semantic(
+                task.question_text
+            ) or self._normalize_audit_text(task.question_text)
             return f"question_infer|{q_key}"
         if task.task_type in ("question_single", "question_multi"):
-            opts = "|".join(sorted(x.strip().lower() for x in task.expected_options if x.strip()))
-            q_key = self._normalize_audit_semantic(task.question_text) or self._normalize_audit_text(task.question_text)
+            opts = "|".join(
+                sorted(x.strip().lower() for x in task.expected_options if x.strip())
+            )
+            q_key = self._normalize_audit_semantic(
+                task.question_text
+            ) or self._normalize_audit_text(task.question_text)
             return f"question|{q_key}|{opts}"
         return ""
 
@@ -5311,7 +5364,8 @@ class BrowserAgent:
                     )
                     return
                 if (
-                    task.task_type in ("question_single", "question_multi", "inference_required")
+                    task.task_type
+                    in ("question_single", "question_multi", "inference_required")
                     and action.selector
                 ):
                     if any(
@@ -5427,9 +5481,15 @@ class BrowserAgent:
         has_runtime_signal = bool(self._last_upload_signals)
         if not has_runtime_signal:
             # 兜底：即使文本信号不足，只要 DOM 能定位 file input 也继续上传
-            fallback_locator = locator if locator is not None else self._locate_file_input(action.selector)
+            fallback_locator = (
+                locator
+                if locator is not None
+                else self._locate_file_input(action.selector)
+            )
             if fallback_locator is None:
-                self._log("⚠ 页面无上传信号，且未定位到 file input，跳过 upload 动作", "warn")
+                self._log(
+                    "⚠ 页面无上传信号，且未定位到 file input，跳过 upload 动作", "warn"
+                )
                 return False
             locator = fallback_locator
             self._step_log(

@@ -159,9 +159,7 @@ def test_build_question_blocks_uses_fallback_probe_when_primary_is_incomplete():
             ]
 
     snapshot_map = {
-        "e1": SnapshotItem(
-            ref="e1", role="checkbox", name="Boston (Cambridge)", nth=0
-        ),
+        "e1": SnapshotItem(ref="e1", role="checkbox", name="Boston (Cambridge)", nth=0),
         "e2": SnapshotItem(ref="e2", role="checkbox", name="San Francisco", nth=0),
         "e6": SnapshotItem(ref="e6", role="button", name="Yes", nth=0),
         "e7": SnapshotItem(ref="e7", role="button", name="No", nth=0),
@@ -194,7 +192,9 @@ Do you, now or in the future, require visa sponsorship to work in the United Sta
 Yes
 No
 """
-    blocks = build_question_blocks(_SparsePage(), snapshot_map, visible_text=visible_text)
+    blocks = build_question_blocks(
+        _SparsePage(), snapshot_map, visible_text=visible_text
+    )
     assert len(blocks) == 2
     assert "authorized to work" in blocks[0].question_text.lower()
     assert len(blocks[0].options) == 2

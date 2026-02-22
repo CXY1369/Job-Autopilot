@@ -57,9 +57,13 @@ def verify_ref_action_effect(
             if item.role in ("checkbox", "radio"):
                 return locator.is_checked()
             if getattr(action, "target_question", None):
-                option_text = str(getattr(action, "selector", "") or item.name or "").strip()
+                option_text = str(
+                    getattr(action, "selector", "") or item.name or ""
+                ).strip()
                 if verify_question_option_state and option_text:
-                    if verify_question_option_state(action.target_question, option_text):
+                    if verify_question_option_state(
+                        action.target_question, option_text
+                    ):
                         return True
                 if is_answer_click_action(action, item):
                     expected = normalize_answer_label(action.selector or item.name)

@@ -477,7 +477,9 @@ def _resolve_text_field_mapping(
         if value:
             return value, "personal.website"
     if "location" in lower:
-        value = _pick(("location", "full_location")) or _pick(("location", "current_city"))
+        value = _pick(("location", "full_location")) or _pick(
+            ("location", "current_city")
+        )
         if value:
             return value, "location.full_location"
     if any(k in lower for k in ("why", "interested", "motivation", "cover letter")):
@@ -916,7 +918,11 @@ def summarize_macro_tasks(tasks: list[MacroTask]) -> list[str]:
             )
         elif task.task_type == "inference_required":
             reason = f" [{task.mapping_reason}]" if task.mapping_reason else ""
-            options = ", ".join(task.expected_options[:4]) if task.expected_options else "auto-infer"
+            options = (
+                ", ".join(task.expected_options[:4])
+                if task.expected_options
+                else "auto-infer"
+            )
             out.append(
                 f"{task.task_id}:{status}: infer {task.question_text or task.title} -> {options}{reason}"
             )

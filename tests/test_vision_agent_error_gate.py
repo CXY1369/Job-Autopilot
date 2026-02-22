@@ -77,8 +77,13 @@ class _QuestionStatePage:
         expected = str(payload.get("expected") or "")
         selected = list(self._selected_by_question.get(question, []))
         expected_lower = expected.lower().strip()
-        option_found = True if not expected_lower else any(
-            expected_lower in s.lower() or s.lower() in expected_lower for s in selected
+        option_found = (
+            True
+            if not expected_lower
+            else any(
+                expected_lower in s.lower() or s.lower() in expected_lower
+                for s in selected
+            )
         )
         return {
             "matched": bool(question),
@@ -542,7 +547,9 @@ def test_submission_external_blocked_immediately_refreshes(monkeypatch):
         lambda trigger="unknown": refresh_triggers.append(trigger) or True,
     )
     paced: list[str] = []
-    monkeypatch.setattr(agent, "_apply_humanized_retry_pacing", lambda: paced.append("p"))
+    monkeypatch.setattr(
+        agent, "_apply_humanized_retry_pacing", lambda: paced.append("p")
+    )
     result = agent._handle_submission_outcome(action, False)
     assert result == (False, False)
     assert refresh_triggers == ["external_blocked_immediate_restart"]
@@ -669,7 +676,9 @@ def test_macro_task_completed_question_single_requires_target_option_state(monke
         "_load_settings",
         lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
     )
-    agent = BrowserAgent(page=_ObservePage("app", "https://jobs.ashbyhq.com/suno"), job=_DummyJob())
+    agent = BrowserAgent(
+        page=_ObservePage("app", "https://jobs.ashbyhq.com/suno"), job=_DummyJob()
+    )
     task = MacroTask(
         task_id="t8",
         task_type="question_single",
@@ -715,7 +724,9 @@ def test_file_upload_task_is_locked_done_after_success(monkeypatch):
         lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
     )
     agent = BrowserAgent(
-        page=_ObservePage("application page", "https://jobs.ashbyhq.com/suno/role/application"),
+        page=_ObservePage(
+            "application page", "https://jobs.ashbyhq.com/suno/role/application"
+        ),
         job=_DummyJob(),
     )
     task = MacroTask(
@@ -743,19 +754,30 @@ def test_execute_ref_upload_logs_action_verified(monkeypatch):
         lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
     )
     agent = BrowserAgent(
-        page=_ObservePage("application page", "https://jobs.ashbyhq.com/suno/role/application"),
+        page=_ObservePage(
+            "application page", "https://jobs.ashbyhq.com/suno/role/application"
+        ),
         job=_DummyJob(),
     )
     events: list[tuple[str, dict]] = []
-    monkeypatch.setattr(agent, "_step_log", lambda event, payload: events.append((event, payload)))
+    monkeypatch.setattr(
+        agent, "_step_log", lambda event, payload: events.append((event, payload))
+    )
     agent._last_snapshot_map = {
-        "e1": SnapshotItem(ref="e1", role="file_input", name="Resume", nth=0, input_type="file")
+        "e1": SnapshotItem(
+            ref="e1", role="file_input", name="Resume", nth=0, input_type="file"
+        )
     }
     monkeypatch.setattr(agent, "_locator_from_snapshot_item", lambda _item: object())
     monkeypatch.setattr(agent, "_do_upload", lambda _action, locator=None: True)
-    ok = agent._execute_ref_action(AgentAction(action="upload", ref="e1", selector="Resume"))
+    ok = agent._execute_ref_action(
+        AgentAction(action="upload", ref="e1", selector="Resume")
+    )
     assert ok is True
-    assert any(event == "action_verified" and payload.get("action") == "upload" for event, payload in events)
+    assert any(
+        event == "action_verified" and payload.get("action") == "upload"
+        for event, payload in events
+    )
 
 
 def test_visual_augmentation_dedup_drops_duplicate_optional_prompt(monkeypatch):
@@ -1361,7 +1383,9 @@ def test_sync_failure_hints_records_failure_memory(monkeypatch, tmp_path):
         lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
     )
     agent = BrowserAgent(
-        page=_ObservePage("application", "https://jobs.ashbyhq.com/suno/role/application"),
+        page=_ObservePage(
+            "application", "https://jobs.ashbyhq.com/suno/role/application"
+        ),
         job=_DummyJob(),
     )
     agent._failure_memory = FailureMemoryStore(path=tmp_path / "failure_memory.ndjson")
@@ -1390,7 +1414,9 @@ def test_load_failure_memory_hints_returns_promptable_summary(monkeypatch, tmp_p
         lambda _self: {"llm": {"fallback_models": ["gpt-4o"]}},
     )
     agent = BrowserAgent(
-        page=_ObservePage("application", "https://jobs.ashbyhq.com/suno/role/application"),
+        page=_ObservePage(
+            "application", "https://jobs.ashbyhq.com/suno/role/application"
+        ),
         job=_DummyJob(),
     )
     agent._failure_memory = FailureMemoryStore(path=tmp_path / "failure_memory.ndjson")

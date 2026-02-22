@@ -317,4 +317,3 @@ class FailureMemoryStore:
                 f"护栏: {item.guardrails or '禁止无限重复同一动作'}"
             )
         return "\n".join(lines)
-

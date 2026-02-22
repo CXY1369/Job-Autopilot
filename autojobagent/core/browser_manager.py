@@ -140,7 +140,8 @@ class BrowserManager:
         if msg_type != "warning":
             return False
         return (
-            "was preloaded using link preload but not used within a few seconds" in lower
+            "was preloaded using link preload but not used within a few seconds"
+            in lower
             and "window's load event" in lower
         )
 

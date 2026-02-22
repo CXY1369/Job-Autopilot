@@ -156,11 +156,19 @@ def test_macro_tasks_include_required_profile_field_fills():
             input_type="text",
         ),
     }
-    tasks = build_macro_tasks(profile=profile, snapshot_map=snapshot_map, question_blocks=[])
+    tasks = build_macro_tasks(
+        profile=profile, snapshot_map=snapshot_map, question_blocks=[]
+    )
     fill_tasks = [t for t in tasks if t.task_type == "field_fill"]
     assert len(fill_tasks) == 3
-    assert any(t.field_selector == "Name" and t.target_value == "Xingyu Chen" for t in fill_tasks)
-    assert any(t.field_selector == "Email" and t.target_value == "cxy1368@gmail.com" for t in fill_tasks)
+    assert any(
+        t.field_selector == "Name" and t.target_value == "Xingyu Chen"
+        for t in fill_tasks
+    )
+    assert any(
+        t.field_selector == "Email" and t.target_value == "cxy1368@gmail.com"
+        for t in fill_tasks
+    )
     assert any(
         t.field_selector == "LinkedIn Profile"
         and t.target_value == "https://linkedin.com/in/xingyuchen123/"
@@ -192,7 +200,9 @@ def test_macro_tasks_include_resume_upload_and_optional_motivation_fill():
             input_type="text",
         ),
     }
-    tasks = build_macro_tasks(profile=profile, snapshot_map=snapshot_map, question_blocks=[])
+    tasks = build_macro_tasks(
+        profile=profile, snapshot_map=snapshot_map, question_blocks=[]
+    )
     assert any(
         t.task_type == "file_upload"
         and t.field_selector == "Resume"
@@ -244,7 +254,9 @@ def test_macro_tasks_mark_required_non_resume_upload_as_manual_required():
             input_type="file",
         )
     }
-    tasks = build_macro_tasks(profile=profile, snapshot_map=snapshot_map, question_blocks=[])
+    tasks = build_macro_tasks(
+        profile=profile, snapshot_map=snapshot_map, question_blocks=[]
+    )
     assert any(
         t.task_type == "manual_required"
         and t.mapping_reason == "required_non_resume_upload"
@@ -285,7 +297,9 @@ def test_macro_tasks_map_experience_prompt_to_generated_summary():
             input_type="text",
         )
     }
-    tasks = build_macro_tasks(profile=profile, snapshot_map=snapshot_map, question_blocks=[])
+    tasks = build_macro_tasks(
+        profile=profile, snapshot_map=snapshot_map, question_blocks=[]
+    )
     assert len(tasks) == 1
     assert tasks[0].task_type == "field_fill"
     assert tasks[0].mapping_reason == "common_answers.experience_summary"
